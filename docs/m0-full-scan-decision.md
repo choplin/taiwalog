@@ -1,7 +1,7 @@
 # M0 sequential full-scan feasibility record
 
-Status: proposed for M0 human review. Stable five-run confirmation supports
-the recommendation below.
+Status: accepted. Scan-time measurements below are feasibility evidence and
+diagnostic baselines, not MVP acceptance targets.
 
 ## Method
 
@@ -69,8 +69,10 @@ Peak RSS below is maximum resident-set size in bytes.
 
 The stable median scan time is 4,786 ms, stable worst scan time is 4,913 ms,
 and stable median peak RSS is 15,876,096 bytes (about 15.1 MiB). The largest
-observed peak RSS was 16,498,688 bytes (about 15.7 MiB). All are beneath the
-proposed 5 s, 10 s, and 512 MiB limits.
+observed peak RSS was 16,498,688 bytes (about 15.7 MiB). These values are
+retained as reference measurements for detecting regressions. Scan time is not
+a release gate; the 512 MiB peak-memory ceiling remains a resource-safety
+guard.
 
 ## Initial unstable observations
 
@@ -82,19 +84,20 @@ harness itself does not mutate provider sources.
 
 ## Recommendation
 
-Recommend adopting sequential full scan for MVP startup and manual refresh,
-with no checkpoint framework, parallel provider lanes, or generic incremental
-layer.
+Adopt sequential full scan for MVP startup and manual refresh, with no
+checkpoint framework, parallel provider lanes, or generic incremental layer.
+The MVP has no scan-latency target. Timing measurements remain useful
+diagnostics, but do not determine milestone acceptance while the product goal
+is cross-agent session browsing.
 
-The stable samples meet the M0 acceptance limits: median scan at or below
-5 seconds, worst scan at or below 10 seconds, peak RSS at or below 512 MiB,
-and immutable sources across all six providers.
+Provider-owned sources remaining immutable and peak memory remaining below
+512 MiB are still required correctness and resource-safety properties.
 
 Gemini's fixture coverage proves the supported visible-conversation format,
 but the stable real-data source produced zero browseable sessions. Reconfirm
 real-data Gemini coverage at the M2 gate before treating it as proven end-user
 coverage.
 
-If a later stable measurement exceeds a limit, revisit only minimal
-source-level change detection for the provider(s) responsible. Do not
-introduce generic checkpointing or parallel lanes without a new decision.
+Revisit source-level change detection or parallel provider lanes only when
+observed user experience makes that work valuable, not merely because a
+diagnostic measurement changes.
