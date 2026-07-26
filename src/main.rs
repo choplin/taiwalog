@@ -90,6 +90,17 @@ async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         println!("Sources partial: {}", summary.sources_partial);
         println!("Sources failed: {}", summary.sources_failed);
         println!("Sessions available: {}", summary.sessions_available);
+        for provider in &summary.provider_summaries {
+            println!(
+                "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, sessions={}",
+                provider.provider,
+                provider.candidate_sources,
+                provider.refreshed_sources,
+                provider.partial_sources,
+                provider.failed_sources,
+                provider.sessions_available
+            );
+        }
         println!("Scan result: {}", summary.message);
     }
     Ok(())

@@ -2,8 +2,8 @@
 
 Agentlog is a local browser for session history produced by AI coding agents.
 This first durable shell owns a small SQLite catalog and imports Codex, Claude
-Code, OpenCode, Gemini CLI, and Cursor session history. It never creates,
-changes, or deletes provider-owned logs.
+Code, OpenCode, Gemini CLI, Cursor, and Kimi Code session history. It never
+creates, changes, or deletes provider-owned logs.
 
 ## Requirements
 
@@ -45,13 +45,18 @@ discovery uses `providers.opencode_root`, then `XDG_DATA_HOME/opencode`, then
 `~/.local/share/opencode` and the macOS Application Support fallback. OpenCode
 is read through a bounded private snapshot of its SQLite database and WAL, so
 SQLite never opens the provider-owned files. Gemini CLI discovery uses
-`providers.gemini_root`, then `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini`; it scans
-JSONL files below `tmp` and uses the native `sessionId` as the session identity.
+`providers.gemini_root`, then `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini`; it
+scans JSONL files below `tmp` and uses the native `sessionId` as the session
+identity.
 Cursor discovery uses `providers.cursor_root`, then `~/.cursor`; it scans JSONL
 files below `projects`, including UUID- or otherwise arbitrarily named files,
-and uses the containing directory as the native session identity. The optional
-config can override these read-only roots. It cannot configure enrichment, ctx,
-UI settings, retention, or an external database:
+and uses the containing directory as the native session identity. Kimi Code
+discovery uses `providers.kimi_root`, then `KIMI_CODE_HOME`, then
+`~/.kimi-code`. It verifies each `sessions/*/*/agents/*/wire.jsonl` source
+against the provider session index and session state before importing its
+provider-native session ID. The optional config can override these read-only
+roots. It cannot configure enrichment, ctx, UI settings, retention, or an
+external database:
 
 ```toml
 [providers]
@@ -60,12 +65,14 @@ claude_root = "/absolute/path/to/claude/config"
 opencode_root = "/absolute/path/to/opencode/data"
 gemini_root = "/absolute/path/to/gemini/config"
 cursor_root = "/absolute/path/to/cursor/config"
+kimi_root = "/absolute/path/to/kimi-code/config"
 ```
 
 `scan` creates fresh schema v1 and scans current Codex session JSONL, legacy
-`history.jsonl`, Claude Code project/subagent JSONL, and the supported OpenCode
-SQLite catalog, Gemini CLI session JSONL, and Cursor transcript JSONL. Each
-source is replaced atomically after a successful read. A
+`history.jsonl`, Claude Code project/subagent JSONL, the supported OpenCode
+SQLite catalog, Gemini CLI session JSONL, Cursor transcript JSONL, and Kimi
+Code session-indexed agent wire JSONL. Each source is replaced atomically after
+a successful read. A
 source-level failure records a diagnostic while retaining that source's
 last-good session snapshot; it does not block other sources. Malformed,
 unsupported, or oversized sources are failures and preserve the last-good
@@ -75,14 +82,14 @@ user/assistant text and tool names/statuses; hidden reasoning, tool
 inputs/outputs, raw diffs, images, binary attachments, and recognized injected
 user/control records are excluded.
 
-Every JSONL collector has a 64 MiB source bound. Gemini, Claude, and Cursor
-have a 4 MiB record bound; Codex has a 1 MiB record bound. Gemini, Claude, and
-Cursor bound visible text to 128 KiB per item, 2 MiB per source, and 2,000
-catalog items per source. Valid sources exceeding a selection bound are marked
-`partial`; the limits are safety boundaries and do not express a scan-speed
-target. Claude's 4 MiB record ceiling is the smallest whole-MiB bound above the
-observed 3.14 MiB local maximum, while its 64 MiB source limit remains above the
-observed 16.9 MiB maximum.
+Every JSONL collector has a 64 MiB source bound. Gemini, Claude, Cursor, and
+Kimi have a 4 MiB record bound; Codex has a 1 MiB record bound. Gemini, Claude,
+Cursor, and Kimi bound visible text to 128 KiB per item, 2 MiB per source, and
+2,000 catalog items per source. Valid sources exceeding a selection bound are
+marked `partial`; the limits are safety boundaries and do not express a
+scan-speed target. Claude's 4 MiB record ceiling is the smallest whole-MiB bound
+above the observed 3.14 MiB local maximum, while its 64 MiB source limit remains
+above the observed 16.9 MiB maximum.
 
 OpenCode snapshots are bounded to 128 MiB for the provider database, WAL, and
 SHM file set, 64 MiB of joined transcript JSON, and 100,000 joined rows. Its

@@ -168,6 +168,24 @@ impl AppPaths {
     pub fn cursor_root(&self) -> Result<PathBuf, PathError> {
         resolve_cursor_root(self.provider_roots.cursor_root(), env::var_os("HOME"))
     }
+
+    /// Returns the read-only Kimi Code configuration root.
+    ///
+    /// The precedence is explicit config, `KIMI_CODE_HOME`, then
+    /// `~/.kimi-code`. Agentlog's `--home` setting never changes this
+    /// provider-owned location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured or environment root exists and the
+    /// operating-system home directory is unavailable.
+    pub fn kimi_root(&self) -> Result<PathBuf, PathError> {
+        resolve_kimi_root(
+            self.provider_roots.kimi_root(),
+            env::var_os("KIMI_CODE_HOME"),
+            env::var_os("HOME"),
+        )
+    }
 }
 
 fn resolve_codex_root(
@@ -291,6 +309,29 @@ fn resolve_cursor_root(
 fn validate_cursor_root(root: PathBuf) -> Result<PathBuf, PathError> {
     if root.as_os_str().is_empty() || !root.is_absolute() {
         return Err(PathError::InvalidCursorRoot { path: root });
+    }
+    Ok(root)
+}
+fn resolve_kimi_root(
+    configured: Option<&Path>,
+    kimi_code_home: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(root) = configured {
+        return validate_kimi_root(root.to_path_buf());
+    }
+    if let Some(root) = kimi_code_home {
+        return validate_kimi_root(PathBuf::from(root));
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::KimiHomeUnavailable)?;
+    validate_kimi_root(home.join(".kimi-code"))
+}
+fn validate_kimi_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidKimiRoot { path: root });
     }
     Ok(root)
 }
@@ -437,6 +478,10 @@ pub enum PathError {
     CursorHomeUnavailable,
     #[error("Cursor root must be a nonempty absolute path, got {path}")]
     InvalidCursorRoot { path: PathBuf },
+    #[error("cannot resolve the default Kimi root because KIMI_CODE_HOME and HOME are unavailable")]
+    KimiHomeUnavailable,
+    #[error("Kimi root must be a nonempty absolute path, got {path}")]
+    InvalidKimiRoot { path: PathBuf },
     #[error("cannot read Agentlog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -471,7 +516,7 @@ mod tests {
 
     use super::{
         AppPaths, resolve_claude_root, resolve_codex_root, resolve_cursor_root,
-        resolve_gemini_root, resolve_opencode_roots,
+        resolve_gemini_root, resolve_kimi_root, resolve_opencode_roots,
     };
 
     #[test]
@@ -689,5 +734,32 @@ mod tests {
             Path::new("/Users/example/.cursor")
         );
         assert!(resolve_cursor_root(Some(Path::new("relative/cursor")), None).is_err());
+    }
+
+    #[test]
+    fn kimi_root_precedence_and_relative_values_are_rejected() {
+        assert_eq!(
+            resolve_kimi_root(
+                Some(Path::new("/configured/kimi")),
+                Some(OsString::from("/environment/kimi")),
+                Some(OsString::from("/Users/example"))
+            )
+            .expect("configured"),
+            Path::new("/configured/kimi")
+        );
+        assert_eq!(
+            resolve_kimi_root(
+                None,
+                Some(OsString::from("/environment/kimi")),
+                Some(OsString::from("/Users/example"))
+            )
+            .expect("environment"),
+            Path::new("/environment/kimi")
+        );
+        assert_eq!(
+            resolve_kimi_root(None, None, Some(OsString::from("/Users/example"))).expect("default"),
+            Path::new("/Users/example/.kimi-code")
+        );
+        assert!(resolve_kimi_root(None, Some(OsString::from("relative/kimi")), None).is_err());
     }
 }
