@@ -1,0 +1,29 @@
+[package]
+name = "agentlog"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "M0 read-only full-scan feasibility harness for Agentlog"
+
+[[bin]]
+name = "full-scan-feasibility"
+path = "src/bin/full_scan_feasibility.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+futures-util = "0.3"
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3.24"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
