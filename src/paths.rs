@@ -1,7 +1,9 @@
 //! Agentlog-owned paths and the deliberately small local configuration file.
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -77,6 +79,48 @@ impl AppPaths {
     pub fn provider_roots(&self) -> &ProviderRoots {
         &self.provider_roots
     }
+
+    /// Returns the read-only Codex root. Agentlog's `--home` setting never
+    /// changes this provider-owned location.
+    ///
+    /// The precedence is explicit config, `CODEX_HOME`, then `~/.codex`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when no configured or environment root exists and
+    /// the operating-system home directory is unavailable.
+    pub fn codex_root(&self) -> Result<PathBuf, PathError> {
+        resolve_codex_root(
+            self.provider_roots.codex_root(),
+            env::var_os("CODEX_HOME"),
+            env::var_os("HOME"),
+        )
+    }
+}
+
+fn resolve_codex_root(
+    configured: Option<&Path>,
+    codex_home: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(root) = configured {
+        return validate_codex_root(root.to_path_buf());
+    }
+    if let Some(root) = codex_home {
+        return validate_codex_root(PathBuf::from(root));
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::CodexHomeUnavailable)?;
+    validate_codex_root(home.join(".codex"))
+}
+
+fn validate_codex_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidCodexRoot { path: root });
+    }
+    Ok(root)
 }
 
 fn default_home() -> Result<PathBuf, PathError> {
@@ -193,6 +237,12 @@ pub enum PathError {
     EmptyHome,
     #[error("cannot resolve the default Agentlog home because HOME is unavailable")]
     HomeUnavailable,
+    #[error(
+        "cannot resolve the default Codex root because neither CODEX_HOME nor HOME is available"
+    )]
+    CodexHomeUnavailable,
+    #[error("Codex root must be a nonempty absolute path, got {path}")]
+    InvalidCodexRoot { path: PathBuf },
     #[error("cannot read Agentlog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -217,11 +267,11 @@ pub enum PathError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{ffi::OsString, fs, path::Path};
 
     use tempfile::TempDir;
 
-    use super::AppPaths;
+    use super::{AppPaths, resolve_codex_root};
 
     #[test]
     fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
@@ -281,5 +331,53 @@ mod tests {
         let error = AppPaths::resolve(Some(home)).expect_err("relative root must fail");
 
         assert!(error.to_string().contains("providers.claude_root"));
+    }
+
+    #[test]
+    fn configured_codex_root_is_independent_from_agentlog_home() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let home = temporary.path().join("agentlog");
+        fs::create_dir(&home).expect("create home");
+        fs::write(
+            home.join("config.toml"),
+            "[providers]\ncodex_root = '/private/tmp/codex-history'\n",
+        )
+        .expect("write config");
+
+        let paths = AppPaths::resolve(Some(home)).expect("paths resolve");
+
+        assert_eq!(
+            paths.codex_root().expect("configured root"),
+            Path::new("/private/tmp/codex-history")
+        );
+    }
+
+    #[test]
+    fn codex_root_precedence_and_validation_do_not_mutate_process_environment() {
+        assert_eq!(
+            resolve_codex_root(
+                Some(Path::new("/configured/codex")),
+                Some(OsString::from("/environment/codex")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("configured root"),
+            Path::new("/configured/codex")
+        );
+        assert_eq!(
+            resolve_codex_root(
+                None,
+                Some(OsString::from("/environment/codex")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("environment root"),
+            Path::new("/environment/codex")
+        );
+        assert_eq!(
+            resolve_codex_root(None, None, Some(OsString::from("/Users/example")))
+                .expect("default root"),
+            Path::new("/Users/example/.codex")
+        );
+        assert!(resolve_codex_root(None, Some(OsString::new()), None).is_err());
+        assert!(resolve_codex_root(None, Some(OsString::from("relative/codex")), None).is_err());
     }
 }

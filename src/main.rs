@@ -27,7 +27,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Initialize the local catalog. No collector is installed in this build.
+    /// Refresh Codex history without changing provider-owned files.
     Scan {
         /// Emit a machine-readable result.
         #[arg(long)]
@@ -68,6 +68,8 @@ async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         println!("Schema version: {}", summary.schema_version);
         println!("Collectors installed: {}", summary.collectors_installed);
         println!("Sources refreshed: {}", summary.sources_refreshed);
+        println!("Sources partial: {}", summary.sources_partial);
+        println!("Sources failed: {}", summary.sources_failed);
         println!("Sessions available: {}", summary.sessions_available);
         println!("Scan result: {}", summary.message);
     }

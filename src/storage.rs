@@ -4,15 +4,60 @@
 //! database or an existing v1 database, and refuses every other state without
 //! modifying it.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use sqlx::{
-    SqlitePool,
+    Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: i64 = 1;
+
+/// One provider-owned input with its stable, provider-scoped identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceIdentity {
+    pub provider: &'static str,
+    pub source_format: &'static str,
+    pub canonical_locator: String,
+}
+
+/// A normalized transcript entry that is safe to persist in Agentlog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogItem {
+    UserText(String),
+    AssistantText(String),
+    ToolMarker {
+        name: String,
+        status: Option<String>,
+    },
+}
+
+/// One bounded, provider-native session in an accepted source snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogSession {
+    pub session_key: String,
+    pub title: Option<String>,
+    pub repository: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub execution_kind: Option<String>,
+    pub started_at: Option<i64>,
+    pub last_visible_event_at: Option<i64>,
+    pub items: Vec<CatalogItem>,
+}
+
+/// The accepted snapshot from one provider-owned input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceSnapshot {
+    pub identity: SourceIdentity,
+    pub diagnostic_status: &'static str,
+    pub diagnostic_message: Option<&'static str>,
+    pub sessions: Vec<CatalogSession>,
+}
 
 /// Opens an Agentlog-owned database and ensures fresh schema v1 exists.
 ///
@@ -54,6 +99,175 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<(), StorageError> {
         0 => Err(StorageError::UnversionedDatabase),
         other => Err(StorageError::UnsupportedSchemaVersion { found: other }),
     }
+}
+
+/// Atomically replaces the normalized sessions for one successfully read source.
+///
+/// The replacement is intentionally scoped to the source row. A different
+/// source can fail without affecting this snapshot, and failures are recorded
+/// through [`record_source_failure`] without deleting a previous good snapshot.
+///
+/// # Errors
+///
+/// Returns an error if the snapshot cannot be written as one transaction.
+pub async fn replace_source_snapshot(
+    pool: &SqlitePool,
+    snapshot: &SourceSnapshot,
+) -> Result<(), StorageError> {
+    let now = unix_timestamp()?;
+    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
+
+    sqlx::query(
+        "INSERT INTO sources (provider, source_format, canonical_locator, last_success_at, diagnostic_status, diagnostic_message, diagnostic_recorded_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(provider, source_format, canonical_locator) DO UPDATE SET\n           last_success_at = excluded.last_success_at,\n           diagnostic_status = excluded.diagnostic_status,\n           diagnostic_message = excluded.diagnostic_message,\n           diagnostic_recorded_at = excluded.diagnostic_recorded_at",
+    )
+    .bind(snapshot.identity.provider)
+    .bind(snapshot.identity.source_format)
+    .bind(&snapshot.identity.canonical_locator)
+    .bind(now)
+    .bind(snapshot.diagnostic_status)
+    .bind(snapshot.diagnostic_message)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(StorageError::Query)?;
+
+    let source_id = sqlx::query(
+        "SELECT id FROM sources WHERE provider = ? AND source_format = ? AND canonical_locator = ?",
+    )
+    .bind(snapshot.identity.provider)
+    .bind(snapshot.identity.source_format)
+    .bind(&snapshot.identity.canonical_locator)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(StorageError::Query)?
+    .try_get::<i64, _>("id")
+    .map_err(StorageError::Query)?;
+
+    sqlx::query("DELETE FROM sessions WHERE source_id = ?")
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
+
+    for session in &snapshot.sessions {
+        let session_id = sqlx::query(
+            "INSERT INTO sessions (source_id, session_key, title, repository, cwd, model, execution_kind, started_at, last_visible_event_at)\n             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(source_id)
+        .bind(&session.session_key)
+        .bind(&session.title)
+        .bind(&session.repository)
+        .bind(&session.cwd)
+        .bind(&session.model)
+        .bind(&session.execution_kind)
+        .bind(session.started_at)
+        .bind(session.last_visible_event_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?
+        .last_insert_rowid();
+
+        for (ordinal, item) in session.items.iter().enumerate() {
+            let ordinal = i64::try_from(ordinal).map_err(|_| StorageError::OrdinalOverflow)?;
+            match item {
+                CatalogItem::UserText(content) => {
+                    insert_text_item(&mut transaction, session_id, ordinal, "user_text", content)
+                        .await?;
+                }
+                CatalogItem::AssistantText(content) => {
+                    insert_text_item(
+                        &mut transaction,
+                        session_id,
+                        ordinal,
+                        "assistant_text",
+                        content,
+                    )
+                    .await?;
+                }
+                CatalogItem::ToolMarker { name, status } => {
+                    sqlx::query(
+                        "INSERT INTO transcript_items (session_id, ordinal, item_kind, tool_name, tool_status)\n                         VALUES (?, ?, 'tool_marker', ?, ?)",
+                    )
+                    .bind(session_id)
+                    .bind(ordinal)
+                    .bind(name)
+                    .bind(status)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(StorageError::Query)?;
+                }
+            }
+        }
+    }
+
+    transaction.commit().await.map_err(StorageError::Query)
+}
+
+async fn insert_text_item(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: i64,
+    ordinal: i64,
+    item_kind: &'static str,
+    content: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO transcript_items (session_id, ordinal, item_kind, content)\n         VALUES (?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(ordinal)
+    .bind(item_kind)
+    .bind(content)
+    .execute(&mut **transaction)
+    .await
+    .map_err(StorageError::Query)?;
+    Ok(())
+}
+
+/// Records a source-level failure while preserving its previous session rows.
+///
+/// # Errors
+///
+/// Returns an error when the source diagnostic cannot be persisted.
+pub async fn record_source_failure(
+    pool: &SqlitePool,
+    identity: &SourceIdentity,
+    diagnostic_message: &'static str,
+) -> Result<(), StorageError> {
+    record_source_diagnostic(pool, identity, "error", diagnostic_message).await
+}
+
+/// Updates a source diagnostic without replacing its last-good snapshot.
+///
+/// # Errors
+///
+/// Returns an error when the source diagnostic cannot be persisted.
+pub async fn record_source_diagnostic(
+    pool: &SqlitePool,
+    identity: &SourceIdentity,
+    diagnostic_status: &'static str,
+    diagnostic_message: &'static str,
+) -> Result<(), StorageError> {
+    let now = unix_timestamp()?;
+    sqlx::query(
+        "INSERT INTO sources (provider, source_format, canonical_locator, diagnostic_status, diagnostic_message, diagnostic_recorded_at)\n         VALUES (?, ?, ?, ?, ?, ?)\n         ON CONFLICT(provider, source_format, canonical_locator) DO UPDATE SET\n           diagnostic_status = excluded.diagnostic_status,\n           diagnostic_message = excluded.diagnostic_message,\n           diagnostic_recorded_at = excluded.diagnostic_recorded_at",
+    )
+    .bind(identity.provider)
+    .bind(identity.source_format)
+    .bind(&identity.canonical_locator)
+    .bind(diagnostic_status)
+    .bind(diagnostic_message)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(StorageError::Query)?;
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<i64, StorageError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(StorageError::Clock)?;
+    i64::try_from(duration.as_secs()).map_err(|_| StorageError::ClockOutOfRange)
 }
 
 async fn scalar_i64(pool: &SqlitePool, query: &str) -> Result<i64, StorageError> {
@@ -143,6 +357,14 @@ pub enum StorageError {
     UnsupportedSchemaVersion { found: i64 },
     #[error("database claims schema v1 but is missing required table {table}")]
     IncompleteV1Schema { table: &'static str },
+    #[error("catalog transcript ordinal exceeds SQLite integer range")]
+    OrdinalOverflow,
+    #[error("system clock is before the Unix epoch")]
+    Clock(std::time::SystemTimeError),
+    #[error("system clock is outside the catalog timestamp range")]
+    ClockOutOfRange,
+    #[error("cannot inspect a provider-owned source: {0}")]
+    SourceIo(std::io::Error),
 }
 
 #[cfg(test)]
