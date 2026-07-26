@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 
 use crate::storage::{
     CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
-    record_source_failure, replace_source_snapshot,
+    record_source_failure_in_transaction, replace_source_snapshot_in_transaction,
 };
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -128,25 +128,27 @@ pub async fn collect_codex(
         candidate_sources: u64::try_from(sources.len()).unwrap_or(u64::MAX),
         ..CodexScanReport::default()
     };
+    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
 
     for source in sources {
         let identity = source_identity(&source);
         match parse_source(&source) {
             Ok(snapshot) => {
                 let partial = snapshot.diagnostic_status == "partial";
-                replace_source_snapshot(pool, &snapshot).await?;
+                replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
                 report.refreshed_sources += 1;
                 if partial {
                     report.partial_sources += 1;
                 }
             }
             Err(message) => {
-                record_source_failure(pool, &identity, message).await?;
+                record_source_failure_in_transaction(&mut transaction, &identity, message).await?;
                 report.failed_sources += 1;
             }
         }
     }
 
+    transaction.commit().await.map_err(StorageError::Query)?;
     Ok(report)
 }
 

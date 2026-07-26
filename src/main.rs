@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use agentlog::{
-    app::{paths_report, scan_shell},
+    app::{list_shell, paths_report, scan_shell, show_shell},
     paths::AppPaths,
 };
 
@@ -27,9 +27,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Refresh Codex history without changing provider-owned files.
+    /// Refresh Codex and Claude history without changing provider-owned files.
     Scan {
         /// Emit a machine-readable result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List already-cataloged sessions without scanning provider-owned files.
+    List {
+        /// Maximum number of sessions to display.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
+        /// Emit a machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview one already-cataloged session without scanning provider-owned files.
+    Show {
+        /// Catalog session ID from `agentlog list`.
+        session_id: i64,
+        /// Emit a machine-readable report.
         #[arg(long)]
         json: bool,
     },
@@ -43,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Scan { json: false }) {
         Command::Paths { json } => print_paths(&paths, json),
         Command::Scan { json } => print_scan(&paths, json).await,
+        Command::List { limit, json } => print_list(&paths, limit, json).await,
+        Command::Show { session_id, json } => print_show(&paths, session_id, json).await,
     }
 }
 
@@ -72,6 +91,71 @@ async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         println!("Sources failed: {}", summary.sources_failed);
         println!("Sessions available: {}", summary.sessions_available);
         println!("Scan result: {}", summary.message);
+    }
+    Ok(())
+}
+
+async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<()> {
+    let sessions = list_shell(paths, limit).await?;
+    if json {
+        println!("{}", serde_json::to_string(&sessions)?);
+    } else if sessions.is_empty() {
+        println!("No cataloged sessions. Run `agentlog scan` to refresh sources.");
+    } else {
+        for session in sessions {
+            let title = session.title.as_deref().unwrap_or("(no visible title)");
+            let freshness = if session.source_diagnostic_status == "error" {
+                "stale/error"
+            } else {
+                session.source_diagnostic_status.as_str()
+            };
+            println!(
+                "{}  [{}:{}; {}] {}",
+                session.id, session.provider, session.source_format, freshness, title
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Result<()> {
+    let preview = show_shell(paths, session_id).await?;
+    if json {
+        println!("{}", serde_json::to_string(&preview)?);
+    } else {
+        let freshness = &preview.session.source_diagnostic_status;
+        println!(
+            "Session {} [{}:{}; source status: {}]",
+            preview.session.id, preview.session.provider, preview.session.source_format, freshness
+        );
+        println!(
+            "{}",
+            preview
+                .session
+                .title
+                .as_deref()
+                .unwrap_or("(no visible title)")
+        );
+        for item in preview.items {
+            match item {
+                agentlog::storage::CatalogItemView::UserText { content } => {
+                    println!("user: {content}");
+                }
+                agentlog::storage::CatalogItemView::AssistantText { content } => {
+                    println!("assistant: {content}");
+                }
+                agentlog::storage::CatalogItemView::ToolMarker { name, status } => {
+                    println!(
+                        "tool: {} ({})",
+                        name,
+                        status.unwrap_or_else(|| "unknown".to_owned())
+                    );
+                }
+            }
+        }
+        if preview.items_truncated {
+            println!("Preview truncated after 80 items.");
+        }
     }
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! this crate.
 
 pub mod app;
+pub mod claude;
 pub mod codex;
 pub mod paths;
 pub mod storage;

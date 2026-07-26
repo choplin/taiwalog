@@ -96,6 +96,25 @@ impl AppPaths {
             env::var_os("HOME"),
         )
     }
+
+    /// Returns the read-only Claude configuration root.
+    ///
+    /// Claude Code stores project transcripts below `~/.claude/projects` by
+    /// default. `CLAUDE_CONFIG_DIR` follows the CLI's configuration-root
+    /// convention, so it is used before the operating-system default.
+    /// Agentlog's `--home` setting never changes this provider-owned location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured or environment root exists and the
+    /// operating-system home directory is unavailable.
+    pub fn claude_root(&self) -> Result<PathBuf, PathError> {
+        resolve_claude_root(
+            self.provider_roots.claude_root(),
+            env::var_os("CLAUDE_CONFIG_DIR"),
+            env::var_os("HOME"),
+        )
+    }
 }
 
 fn resolve_codex_root(
@@ -119,6 +138,31 @@ fn resolve_codex_root(
 fn validate_codex_root(root: PathBuf) -> Result<PathBuf, PathError> {
     if root.as_os_str().is_empty() || !root.is_absolute() {
         return Err(PathError::InvalidCodexRoot { path: root });
+    }
+    Ok(root)
+}
+
+fn resolve_claude_root(
+    configured: Option<&Path>,
+    claude_config_dir: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(root) = configured {
+        return validate_claude_root(root.to_path_buf());
+    }
+    if let Some(root) = claude_config_dir {
+        return validate_claude_root(PathBuf::from(root));
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::ClaudeHomeUnavailable)?;
+    validate_claude_root(home.join(".claude"))
+}
+
+fn validate_claude_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidClaudeRoot { path: root });
     }
     Ok(root)
 }
@@ -243,6 +287,12 @@ pub enum PathError {
     CodexHomeUnavailable,
     #[error("Codex root must be a nonempty absolute path, got {path}")]
     InvalidCodexRoot { path: PathBuf },
+    #[error(
+        "cannot resolve the default Claude root because neither CLAUDE_CONFIG_DIR nor HOME is available"
+    )]
+    ClaudeHomeUnavailable,
+    #[error("Claude root must be a nonempty absolute path, got {path}")]
+    InvalidClaudeRoot { path: PathBuf },
     #[error("cannot read Agentlog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -271,7 +321,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{AppPaths, resolve_codex_root};
+    use super::{AppPaths, resolve_claude_root, resolve_codex_root};
 
     #[test]
     fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
@@ -379,5 +429,34 @@ mod tests {
         );
         assert!(resolve_codex_root(None, Some(OsString::new()), None).is_err());
         assert!(resolve_codex_root(None, Some(OsString::from("relative/codex")), None).is_err());
+    }
+
+    #[test]
+    fn claude_root_precedence_matches_claude_config_dir_convention() {
+        assert_eq!(
+            resolve_claude_root(
+                Some(Path::new("/configured/claude")),
+                Some(OsString::from("/environment/claude")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("configured root"),
+            Path::new("/configured/claude")
+        );
+        assert_eq!(
+            resolve_claude_root(
+                None,
+                Some(OsString::from("/environment/claude")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("environment root"),
+            Path::new("/environment/claude")
+        );
+        assert_eq!(
+            resolve_claude_root(None, None, Some(OsString::from("/Users/example")))
+                .expect("default root"),
+            Path::new("/Users/example/.claude")
+        );
+        assert!(resolve_claude_root(None, Some(OsString::new()), None).is_err());
+        assert!(resolve_claude_root(None, Some(OsString::from("relative/claude")), None).is_err());
     }
 }

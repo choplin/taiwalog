@@ -9,13 +9,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: i64 = 1;
+const TRANSCRIPT_ITEM_INSERT_CHUNK: usize = 500;
 
 /// One provider-owned input with its stable, provider-scoped identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +61,52 @@ pub struct SourceSnapshot {
     pub sessions: Vec<CatalogSession>,
 }
 
+/// One session row suitable for the shared, read-only catalog list.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogSessionSummary {
+    pub id: i64,
+    pub provider: String,
+    pub source_format: String,
+    pub title: Option<String>,
+    pub repository: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub execution_kind: Option<String>,
+    pub started_at: Option<i64>,
+    pub last_visible_event_at: Option<i64>,
+    pub source_diagnostic_status: String,
+    pub source_last_success_at: Option<i64>,
+}
+
+/// The safe, bounded transcript stored for one selected catalog session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogSessionPreview {
+    pub session: CatalogSessionSummary,
+    pub items: Vec<CatalogItemView>,
+    pub items_truncated: bool,
+}
+
+/// A display-safe transcript item returned by the catalog preview.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogItemView {
+    UserText {
+        content: String,
+    },
+    AssistantText {
+        content: String,
+    },
+    ToolMarker {
+        name: String,
+        status: Option<String>,
+    },
+}
+
 /// Opens an Agentlog-owned database and ensures fresh schema v1 exists.
+///
+/// The rebuildable catalog uses WAL with `synchronous=NORMAL`: a sudden power
+/// loss can lose recent derived catalog updates, but does not corrupt the
+/// catalog or affect provider-owned logs. A later scan rebuilds the catalog.
 ///
 /// # Errors
 ///
@@ -78,6 +125,10 @@ pub async fn open_database(path: &Path) -> Result<SqlitePool, StorageError> {
 
     ensure_schema(&pool).await?;
     sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await
+        .map_err(StorageError::Query)?;
+    sqlx::query("PRAGMA synchronous = NORMAL")
         .execute(&pool)
         .await
         .map_err(StorageError::Query)?;
@@ -114,11 +165,24 @@ pub async fn replace_source_snapshot(
     pool: &SqlitePool,
     snapshot: &SourceSnapshot,
 ) -> Result<(), StorageError> {
-    let now = unix_timestamp()?;
     let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
+    replace_source_snapshot_in_transaction(&mut transaction, snapshot).await?;
+    transaction.commit().await.map_err(StorageError::Query)
+}
 
-    sqlx::query(
-        "INSERT INTO sources (provider, source_format, canonical_locator, last_success_at, diagnostic_status, diagnostic_message, diagnostic_recorded_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(provider, source_format, canonical_locator) DO UPDATE SET\n           last_success_at = excluded.last_success_at,\n           diagnostic_status = excluded.diagnostic_status,\n           diagnostic_message = excluded.diagnostic_message,\n           diagnostic_recorded_at = excluded.diagnostic_recorded_at",
+/// Replaces one source snapshot inside an already-open provider scan transaction.
+///
+/// The caller controls the outer transaction, so every statement that replaces
+/// this one source stays atomic while a provider scan can commit many accepted
+/// sources together.
+pub(crate) async fn replace_source_snapshot_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot: &SourceSnapshot,
+) -> Result<(), StorageError> {
+    let now = unix_timestamp()?;
+
+    let source_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO sources (provider, source_format, canonical_locator, last_success_at, diagnostic_status, diagnostic_message, diagnostic_recorded_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(provider, source_format, canonical_locator) DO UPDATE SET\n           last_success_at = excluded.last_success_at,\n           diagnostic_status = excluded.diagnostic_status,\n           diagnostic_message = excluded.diagnostic_message,\n           diagnostic_recorded_at = excluded.diagnostic_recorded_at\n         RETURNING id",
     )
     .bind(snapshot.identity.provider)
     .bind(snapshot.identity.source_format)
@@ -127,25 +191,13 @@ pub async fn replace_source_snapshot(
     .bind(snapshot.diagnostic_status)
     .bind(snapshot.diagnostic_message)
     .bind(now)
-    .execute(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await
-    .map_err(StorageError::Query)?;
-
-    let source_id = sqlx::query(
-        "SELECT id FROM sources WHERE provider = ? AND source_format = ? AND canonical_locator = ?",
-    )
-    .bind(snapshot.identity.provider)
-    .bind(snapshot.identity.source_format)
-    .bind(&snapshot.identity.canonical_locator)
-    .fetch_one(&mut *transaction)
-    .await
-    .map_err(StorageError::Query)?
-    .try_get::<i64, _>("id")
     .map_err(StorageError::Query)?;
 
     sqlx::query("DELETE FROM sessions WHERE source_id = ?")
         .bind(source_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(StorageError::Query)?;
 
@@ -162,64 +214,62 @@ pub async fn replace_source_snapshot(
         .bind(&session.execution_kind)
         .bind(session.started_at)
         .bind(session.last_visible_event_at)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(StorageError::Query)?
         .last_insert_rowid();
 
-        for (ordinal, item) in session.items.iter().enumerate() {
-            let ordinal = i64::try_from(ordinal).map_err(|_| StorageError::OrdinalOverflow)?;
-            match item {
-                CatalogItem::UserText(content) => {
-                    insert_text_item(&mut transaction, session_id, ordinal, "user_text", content)
-                        .await?;
-                }
-                CatalogItem::AssistantText(content) => {
-                    insert_text_item(
-                        &mut transaction,
-                        session_id,
-                        ordinal,
-                        "assistant_text",
-                        content,
-                    )
-                    .await?;
-                }
-                CatalogItem::ToolMarker { name, status } => {
-                    sqlx::query(
-                        "INSERT INTO transcript_items (session_id, ordinal, item_kind, tool_name, tool_status)\n                         VALUES (?, ?, 'tool_marker', ?, ?)",
-                    )
-                    .bind(session_id)
-                    .bind(ordinal)
-                    .bind(name)
-                    .bind(status)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(StorageError::Query)?;
-                }
-            }
-        }
+        insert_transcript_items(&mut *transaction, session_id, &session.items).await?;
     }
 
-    transaction.commit().await.map_err(StorageError::Query)
+    Ok(())
 }
 
-async fn insert_text_item(
+async fn insert_transcript_items(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     session_id: i64,
-    ordinal: i64,
-    item_kind: &'static str,
-    content: &str,
+    items: &[CatalogItem],
 ) -> Result<(), StorageError> {
-    sqlx::query(
-        "INSERT INTO transcript_items (session_id, ordinal, item_kind, content)\n         VALUES (?, ?, ?, ?)",
-    )
-    .bind(session_id)
-    .bind(ordinal)
-    .bind(item_kind)
-    .bind(content)
-    .execute(&mut **transaction)
-    .await
-    .map_err(StorageError::Query)?;
+    for (chunk_index, chunk) in items.chunks(TRANSCRIPT_ITEM_INSERT_CHUNK).enumerate() {
+        let chunk_offset = chunk_index
+            .checked_mul(TRANSCRIPT_ITEM_INSERT_CHUNK)
+            .ok_or(StorageError::OrdinalOverflow)?;
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO transcript_items (session_id, ordinal, item_kind, content, tool_name, tool_status) ",
+        );
+        builder.push_values(chunk.iter().enumerate(), |mut row, (within_chunk, item)| {
+            let ordinal = chunk_offset
+                .checked_add(within_chunk)
+                .and_then(|value| i64::try_from(value).ok())
+                .expect("source session item ordinal was checked before insertion");
+            row.push_bind(session_id).push_bind(ordinal);
+            match item {
+                CatalogItem::UserText(content) => {
+                    row.push_bind("user_text")
+                        .push_bind(Some(content.as_str()))
+                        .push_bind(Option::<&str>::None)
+                        .push_bind(Option::<&str>::None);
+                }
+                CatalogItem::AssistantText(content) => {
+                    row.push_bind("assistant_text")
+                        .push_bind(Some(content.as_str()))
+                        .push_bind(Option::<&str>::None)
+                        .push_bind(Option::<&str>::None);
+                }
+                CatalogItem::ToolMarker { name, status } => {
+                    row.push_bind("tool_marker")
+                        .push_bind(Option::<&str>::None)
+                        .push_bind(Some(name.as_str()))
+                        .push_bind(status.as_deref());
+                }
+            }
+        });
+        builder
+            .build()
+            .execute(&mut **transaction)
+            .await
+            .map_err(StorageError::Query)?;
+    }
     Ok(())
 }
 
@@ -236,6 +286,16 @@ pub async fn record_source_failure(
     record_source_diagnostic(pool, identity, "error", diagnostic_message).await
 }
 
+/// Records one failed source inside an already-open provider scan transaction.
+pub(crate) async fn record_source_failure_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    identity: &SourceIdentity,
+    diagnostic_message: &'static str,
+) -> Result<(), StorageError> {
+    record_source_diagnostic_in_transaction(transaction, identity, "error", diagnostic_message)
+        .await
+}
+
 /// Updates a source diagnostic without replacing its last-good snapshot.
 ///
 /// # Errors
@@ -243,6 +303,23 @@ pub async fn record_source_failure(
 /// Returns an error when the source diagnostic cannot be persisted.
 pub async fn record_source_diagnostic(
     pool: &SqlitePool,
+    identity: &SourceIdentity,
+    diagnostic_status: &'static str,
+    diagnostic_message: &'static str,
+) -> Result<(), StorageError> {
+    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
+    record_source_diagnostic_in_transaction(
+        &mut transaction,
+        identity,
+        diagnostic_status,
+        diagnostic_message,
+    )
+    .await?;
+    transaction.commit().await.map_err(StorageError::Query)
+}
+
+async fn record_source_diagnostic_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     identity: &SourceIdentity,
     diagnostic_status: &'static str,
     diagnostic_message: &'static str,
@@ -257,10 +334,184 @@ pub async fn record_source_diagnostic(
     .bind(diagnostic_status)
     .bind(diagnostic_message)
     .bind(now)
-    .execute(pool)
+    .execute(&mut **transaction)
     .await
     .map_err(StorageError::Query)?;
     Ok(())
+}
+
+/// Lists normalized sessions across every successfully retained provider source.
+///
+/// # Errors
+///
+/// Returns an error if the catalog cannot be queried.
+pub async fn list_catalog_sessions(
+    pool: &SqlitePool,
+    limit: u32,
+) -> Result<Vec<CatalogSessionSummary>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT sessions.id,
+                sources.provider,
+                sources.source_format,
+                sessions.title,
+                sessions.repository,
+                sessions.cwd,
+                sessions.model,
+                sessions.execution_kind,
+                sessions.started_at,
+                sessions.last_visible_event_at,
+                sources.diagnostic_status,
+                sources.last_success_at
+         FROM sessions
+         JOIN sources ON sources.id = sessions.source_id
+         ORDER BY sessions.last_visible_event_at DESC,
+                  sessions.started_at DESC,
+                  sessions.id DESC
+         LIMIT ?",
+    )
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::Query)?;
+
+    rows.iter().map(catalog_session_summary).collect()
+}
+
+/// Reads one normalized catalog session without scanning any provider sources.
+///
+/// # Errors
+///
+/// Returns an error if the session is absent or the catalog cannot be queried.
+pub async fn read_catalog_preview(
+    pool: &SqlitePool,
+    session_id: i64,
+    item_limit: u32,
+    snippet_bytes: usize,
+) -> Result<CatalogSessionPreview, StorageError> {
+    let row = sqlx::query(
+        "SELECT sessions.id,
+                sources.provider,
+                sources.source_format,
+                sessions.title,
+                sessions.repository,
+                sessions.cwd,
+                sessions.model,
+                sessions.execution_kind,
+                sessions.started_at,
+                sessions.last_visible_event_at,
+                sources.diagnostic_status,
+                sources.last_success_at
+         FROM sessions
+         JOIN sources ON sources.id = sessions.source_id
+         WHERE sessions.id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StorageError::Query)?
+    .ok_or(StorageError::CatalogSessionNotFound { session_id })?;
+    let session = catalog_session_summary(&row)?;
+
+    let rows = sqlx::query(
+        "SELECT item_kind,
+                content,
+                tool_name,
+                tool_status
+         FROM transcript_items
+         WHERE session_id = ?
+         ORDER BY ordinal ASC
+         LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(i64::from(item_limit.saturating_add(1)))
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::Query)?;
+    let items_truncated = rows.len() > usize::try_from(item_limit).unwrap_or(usize::MAX);
+    let items = rows
+        .iter()
+        .take(usize::try_from(item_limit).unwrap_or(usize::MAX))
+        .map(catalog_item_view)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|item| truncate_item_view(item, snippet_bytes))
+        .collect();
+
+    Ok(CatalogSessionPreview {
+        session,
+        items,
+        items_truncated,
+    })
+}
+
+fn catalog_session_summary(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<CatalogSessionSummary, StorageError> {
+    Ok(CatalogSessionSummary {
+        id: row.try_get("id").map_err(StorageError::Query)?,
+        provider: row.try_get("provider").map_err(StorageError::Query)?,
+        source_format: row.try_get("source_format").map_err(StorageError::Query)?,
+        title: row.try_get("title").map_err(StorageError::Query)?,
+        repository: row.try_get("repository").map_err(StorageError::Query)?,
+        cwd: row.try_get("cwd").map_err(StorageError::Query)?,
+        model: row.try_get("model").map_err(StorageError::Query)?,
+        execution_kind: row.try_get("execution_kind").map_err(StorageError::Query)?,
+        started_at: row.try_get("started_at").map_err(StorageError::Query)?,
+        last_visible_event_at: row
+            .try_get("last_visible_event_at")
+            .map_err(StorageError::Query)?,
+        source_diagnostic_status: row
+            .try_get("diagnostic_status")
+            .map_err(StorageError::Query)?,
+        source_last_success_at: row
+            .try_get("last_success_at")
+            .map_err(StorageError::Query)?,
+    })
+}
+
+fn truncate_item_view(item: CatalogItemView, snippet_bytes: usize) -> CatalogItemView {
+    match item {
+        CatalogItemView::UserText { content } => CatalogItemView::UserText {
+            content: truncate_display_text(content, snippet_bytes),
+        },
+        CatalogItemView::AssistantText { content } => CatalogItemView::AssistantText {
+            content: truncate_display_text(content, snippet_bytes),
+        },
+        marker @ CatalogItemView::ToolMarker { .. } => marker,
+    }
+}
+
+fn truncate_display_text(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+fn catalog_item_view(row: &sqlx::sqlite::SqliteRow) -> Result<CatalogItemView, StorageError> {
+    let item_kind = row
+        .try_get::<String, _>("item_kind")
+        .map_err(StorageError::Query)?;
+    match item_kind.as_str() {
+        "user_text" => Ok(CatalogItemView::UserText {
+            content: row.try_get("content").map_err(StorageError::Query)?,
+        }),
+        "assistant_text" => Ok(CatalogItemView::AssistantText {
+            content: row.try_get("content").map_err(StorageError::Query)?,
+        }),
+        "tool_marker" => Ok(CatalogItemView::ToolMarker {
+            name: row.try_get("tool_name").map_err(StorageError::Query)?,
+            status: row.try_get("tool_status").map_err(StorageError::Query)?,
+        }),
+        _ => Err(StorageError::InvalidCatalogItemKind { item_kind }),
+    }
 }
 
 fn unix_timestamp() -> Result<i64, StorageError> {
@@ -363,6 +614,10 @@ pub enum StorageError {
     Clock(std::time::SystemTimeError),
     #[error("system clock is outside the catalog timestamp range")]
     ClockOutOfRange,
+    #[error("catalog session {session_id} was not found")]
+    CatalogSessionNotFound { session_id: i64 },
+    #[error("catalog contains an invalid transcript item kind {item_kind}")]
+    InvalidCatalogItemKind { item_kind: String },
     #[error("cannot inspect a provider-owned source: {0}")]
     SourceIo(std::io::Error),
 }
@@ -375,12 +630,16 @@ mod tests {
     };
 
     use sqlx::{
-        SqlitePool,
+        Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
     use tempfile::TempDir;
 
-    use super::{SCHEMA_VERSION, StorageError, open_database};
+    use super::{
+        CatalogItem, CatalogSession, SCHEMA_VERSION, SourceIdentity, SourceSnapshot, StorageError,
+        list_catalog_sessions, open_database, read_catalog_preview, record_source_failure,
+        replace_source_snapshot,
+    };
 
     async fn user_tables(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar::<_, String>(
@@ -452,8 +711,12 @@ mod tests {
             .fetch_one(&database)
             .await
             .expect("schema version");
-
+        let synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+            .fetch_one(&database)
+            .await
+            .expect("synchronous mode");
         assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(synchronous, 1, "derived catalog uses WAL/NORMAL");
         assert_eq!(
             user_tables(&database).await,
             vec!["sessions", "sources", "transcript_items",]
@@ -573,5 +836,172 @@ mod tests {
         assert!(missing_text.is_err());
         assert!(tool_with_text.is_err());
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn shared_catalog_list_and_preview_expose_provider_and_stale_source_status() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
+        for (provider, locator, session_key, text) in [
+            (
+                "codex",
+                "/private/tmp/codex.jsonl",
+                "codex-session",
+                "Codex visible text",
+            ),
+            (
+                "claude",
+                "/private/tmp/claude.jsonl",
+                "claude-session",
+                "Claude visible text",
+            ),
+        ] {
+            replace_source_snapshot(
+                &database,
+                &SourceSnapshot {
+                    identity: SourceIdentity {
+                        provider,
+                        source_format: "session_jsonl",
+                        canonical_locator: locator.to_owned(),
+                    },
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: vec![CatalogSession {
+                        session_key: session_key.to_owned(),
+                        title: Some(text.to_owned()),
+                        repository: None,
+                        cwd: None,
+                        model: None,
+                        execution_kind: None,
+                        started_at: Some(1),
+                        last_visible_event_at: Some(1),
+                        items: vec![CatalogItem::UserText(text.to_owned())],
+                    }],
+                },
+            )
+            .await
+            .expect("store snapshot");
+        }
+        let claude_identity = SourceIdentity {
+            provider: "claude",
+            source_format: "session_jsonl",
+            canonical_locator: "/private/tmp/claude.jsonl".to_owned(),
+        };
+        record_source_failure(&database, &claude_identity, "source became malformed")
+            .await
+            .expect("record stale failure");
+
+        let sessions = list_catalog_sessions(&database, 50)
+            .await
+            .expect("list shared catalog");
+        assert_eq!(sessions.len(), 2);
+        let claude = sessions
+            .iter()
+            .find(|session| session.provider == "claude")
+            .expect("Claude session");
+        assert_eq!(claude.source_diagnostic_status, "error");
+        assert!(claude.source_last_success_at.is_some());
+        let preview = read_catalog_preview(&database, claude.id, 1, 5)
+            .await
+            .expect("read bounded preview");
+        assert_eq!(preview.session.provider, "claude");
+        assert_eq!(preview.session.source_diagnostic_status, "error");
+        assert!(
+            matches!(preview.items.as_slice(), [super::CatalogItemView::UserText { content }] if content == "Claud…")
+        );
+        assert!(!preview.items_truncated);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_batch_insert_preserves_all_item_shapes_across_chunk_boundary() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
+        let items = (0..501)
+            .map(|index| match index % 3 {
+                0 => CatalogItem::UserText(format!("user {index}")),
+                1 => CatalogItem::AssistantText(format!("assistant {index}")),
+                _ => CatalogItem::ToolMarker {
+                    name: format!("tool_{index}"),
+                    status: Some("requested".to_owned()),
+                },
+            })
+            .collect::<Vec<_>>();
+        replace_source_snapshot(
+            &database,
+            &SourceSnapshot {
+                identity: SourceIdentity {
+                    provider: "claude",
+                    source_format: "project_jsonl",
+                    canonical_locator: "/private/tmp/chunk.jsonl".to_owned(),
+                },
+                diagnostic_status: "ok",
+                diagnostic_message: None,
+                sessions: vec![CatalogSession {
+                    session_key: "chunked".to_owned(),
+                    title: None,
+                    repository: None,
+                    cwd: None,
+                    model: None,
+                    execution_kind: None,
+                    started_at: None,
+                    last_visible_event_at: None,
+                    items,
+                }],
+            },
+        )
+        .await
+        .expect("store chunked snapshot");
+
+        let rows = sqlx::query(
+            "SELECT ordinal, item_kind, content, tool_name, tool_status
+             FROM transcript_items
+             ORDER BY ordinal ASC",
+        )
+        .fetch_all(&database)
+        .await
+        .expect("read inserted items");
+        assert_eq!(rows.len(), 501);
+        for (expected_ordinal, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.try_get::<i64, _>("ordinal").expect("ordinal"),
+                i64::try_from(expected_ordinal).expect("ordinal range")
+            );
+            assert_batch_item_shape(row, expected_ordinal % 3);
+        }
+        database.close().await;
+    }
+
+    fn assert_batch_item_shape(row: &sqlx::sqlite::SqliteRow, item_type: usize) {
+        let kind = row.try_get::<String, _>("item_kind").expect("kind");
+        let content = row
+            .try_get::<Option<String>, _>("content")
+            .expect("content");
+        let tool_name = row
+            .try_get::<Option<String>, _>("tool_name")
+            .expect("tool name");
+        let tool_status = row
+            .try_get::<Option<String>, _>("tool_status")
+            .expect("tool status");
+        match item_type {
+            0 => {
+                assert_eq!(kind, "user_text");
+                assert!(content.is_some());
+                assert!(tool_name.is_none());
+                assert!(tool_status.is_none());
+            }
+            1 => {
+                assert_eq!(kind, "assistant_text");
+                assert!(content.is_some());
+                assert!(tool_name.is_none());
+                assert!(tool_status.is_none());
+            }
+            _ => {
+                assert_eq!(kind, "tool_marker");
+                assert!(content.is_none());
+                assert!(tool_name.is_some());
+                assert_eq!(tool_status, Some("requested".to_owned()));
+            }
+        }
     }
 }
