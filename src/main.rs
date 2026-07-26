@@ -27,7 +27,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Refresh Codex and Claude history without changing provider-owned files.
+    /// Refresh supported provider history without changing provider-owned files.
     Scan {
         /// Emit a machine-readable result.
         #[arg(long)]

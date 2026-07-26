@@ -115,6 +115,28 @@ impl AppPaths {
             env::var_os("HOME"),
         )
     }
+
+    /// Returns the read-only `OpenCode` data roots.
+    ///
+    /// `OpenCode` keeps its local catalog below the XDG data directory by
+    /// default. Agentlog's `--home` setting never changes this
+    /// provider-owned location.
+    ///
+    /// An explicit config root or `XDG_DATA_HOME/opencode` is authoritative.
+    /// Without either, Agentlog checks `OpenCode`'s documented XDG location and
+    /// the macOS-native Application Support fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured or environment root exists and the
+    /// operating-system home directory is unavailable.
+    pub fn opencode_roots(&self) -> Result<Vec<PathBuf>, PathError> {
+        resolve_opencode_roots(
+            self.provider_roots.opencode_root(),
+            env::var_os("XDG_DATA_HOME"),
+            env::var_os("HOME"),
+        )
+    }
 }
 
 fn resolve_codex_root(
@@ -163,6 +185,38 @@ fn resolve_claude_root(
 fn validate_claude_root(root: PathBuf) -> Result<PathBuf, PathError> {
     if root.as_os_str().is_empty() || !root.is_absolute() {
         return Err(PathError::InvalidClaudeRoot { path: root });
+    }
+    Ok(root)
+}
+
+fn resolve_opencode_roots(
+    configured: Option<&Path>,
+    xdg_data_home: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<Vec<PathBuf>, PathError> {
+    if let Some(root) = configured {
+        return validate_opencode_root(root.to_path_buf()).map(|root| vec![root]);
+    }
+    if let Some(root) = xdg_data_home {
+        let root = PathBuf::from(root);
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            return Err(PathError::InvalidOpenCodeRoot { path: root });
+        }
+        return validate_opencode_root(root.join("opencode")).map(|root| vec![root]);
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::OpenCodeHomeUnavailable)?;
+    Ok(vec![
+        validate_opencode_root(home.join(".local/share/opencode"))?,
+        validate_opencode_root(home.join("Library/Application Support/opencode"))?,
+    ])
+}
+
+fn validate_opencode_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidOpenCodeRoot { path: root });
     }
     Ok(root)
 }
@@ -293,6 +347,12 @@ pub enum PathError {
     ClaudeHomeUnavailable,
     #[error("Claude root must be a nonempty absolute path, got {path}")]
     InvalidClaudeRoot { path: PathBuf },
+    #[error(
+        "cannot resolve the default OpenCode root because XDG_DATA_HOME and HOME are unavailable"
+    )]
+    OpenCodeHomeUnavailable,
+    #[error("OpenCode root must be a nonempty absolute path, got {path}")]
+    InvalidOpenCodeRoot { path: PathBuf },
     #[error("cannot read Agentlog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -317,11 +377,15 @@ pub enum PathError {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs, path::Path};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
-    use super::{AppPaths, resolve_claude_root, resolve_codex_root};
+    use super::{AppPaths, resolve_claude_root, resolve_codex_root, resolve_opencode_roots};
 
     #[test]
     fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
@@ -458,5 +522,39 @@ mod tests {
         );
         assert!(resolve_claude_root(None, Some(OsString::new()), None).is_err());
         assert!(resolve_claude_root(None, Some(OsString::from("relative/claude")), None).is_err());
+    }
+
+    #[test]
+    fn opencode_root_precedence_matches_xdg_data_convention() {
+        assert_eq!(
+            resolve_opencode_roots(
+                Some(Path::new("/configured/opencode")),
+                Some(OsString::from("/xdg/data")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("configured root"),
+            vec![PathBuf::from("/configured/opencode")]
+        );
+        assert_eq!(
+            resolve_opencode_roots(
+                None,
+                Some(OsString::from("/xdg/data")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("XDG root"),
+            vec![PathBuf::from("/xdg/data/opencode")]
+        );
+        assert_eq!(
+            resolve_opencode_roots(None, None, Some(OsString::from("/Users/example")))
+                .expect("default root"),
+            vec![
+                PathBuf::from("/Users/example/.local/share/opencode"),
+                PathBuf::from("/Users/example/Library/Application Support/opencode"),
+            ]
+        );
+        assert!(resolve_opencode_roots(None, Some(OsString::new()), None).is_err());
+        assert!(
+            resolve_opencode_roots(None, Some(OsString::from("relative/opencode")), None).is_err()
+        );
     }
 }

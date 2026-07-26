@@ -7,5 +7,6 @@
 pub mod app;
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 pub mod paths;
 pub mod storage;
