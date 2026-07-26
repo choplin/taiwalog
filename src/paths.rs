@@ -137,6 +137,37 @@ impl AppPaths {
             env::var_os("HOME"),
         )
     }
+
+    /// Returns the read-only `Gemini` CLI configuration root.
+    ///
+    /// The precedence is explicit config, `GEMINI_CLI_HOME/.gemini`, then
+    /// `~/.gemini`. Agentlog's `--home` setting never changes this
+    /// provider-owned location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured or environment root exists and the
+    /// operating-system home directory is unavailable.
+    pub fn gemini_root(&self) -> Result<PathBuf, PathError> {
+        resolve_gemini_root(
+            self.provider_roots.gemini_root(),
+            env::var_os("GEMINI_CLI_HOME"),
+            env::var_os("HOME"),
+        )
+    }
+
+    /// Returns the read-only `Cursor` configuration root.
+    ///
+    /// The precedence is explicit config, then `~/.cursor`. Agentlog's
+    /// `--home` setting never changes this provider-owned location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured root exists and the operating-system
+    /// home directory is unavailable.
+    pub fn cursor_root(&self) -> Result<PathBuf, PathError> {
+        resolve_cursor_root(self.provider_roots.cursor_root(), env::var_os("HOME"))
+    }
 }
 
 fn resolve_codex_root(
@@ -217,6 +248,49 @@ fn resolve_opencode_roots(
 fn validate_opencode_root(root: PathBuf) -> Result<PathBuf, PathError> {
     if root.as_os_str().is_empty() || !root.is_absolute() {
         return Err(PathError::InvalidOpenCodeRoot { path: root });
+    }
+    Ok(root)
+}
+
+fn resolve_gemini_root(
+    configured: Option<&Path>,
+    gemini_cli_home: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(root) = configured {
+        return validate_gemini_root(root.to_path_buf());
+    }
+    if let Some(root) = gemini_cli_home {
+        return validate_gemini_root(PathBuf::from(root).join(".gemini"));
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::GeminiHomeUnavailable)?;
+    validate_gemini_root(home.join(".gemini"))
+}
+fn validate_gemini_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidGeminiRoot { path: root });
+    }
+    Ok(root)
+}
+fn resolve_cursor_root(
+    configured: Option<&Path>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(root) = configured {
+        return validate_cursor_root(root.to_path_buf());
+    }
+    let home = os_home
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(PathError::CursorHomeUnavailable)?;
+    validate_cursor_root(home.join(".cursor"))
+}
+fn validate_cursor_root(root: PathBuf) -> Result<PathBuf, PathError> {
+    if root.as_os_str().is_empty() || !root.is_absolute() {
+        return Err(PathError::InvalidCursorRoot { path: root });
     }
     Ok(root)
 }
@@ -353,6 +427,16 @@ pub enum PathError {
     OpenCodeHomeUnavailable,
     #[error("OpenCode root must be a nonempty absolute path, got {path}")]
     InvalidOpenCodeRoot { path: PathBuf },
+    #[error(
+        "cannot resolve the default Gemini root because GEMINI_CLI_HOME and HOME are unavailable"
+    )]
+    GeminiHomeUnavailable,
+    #[error("Gemini root must be a nonempty absolute path, got {path}")]
+    InvalidGeminiRoot { path: PathBuf },
+    #[error("cannot resolve the default Cursor root because HOME is unavailable")]
+    CursorHomeUnavailable,
+    #[error("Cursor root must be a nonempty absolute path, got {path}")]
+    InvalidCursorRoot { path: PathBuf },
     #[error("cannot read Agentlog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -385,7 +469,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{AppPaths, resolve_claude_root, resolve_codex_root, resolve_opencode_roots};
+    use super::{
+        AppPaths, resolve_claude_root, resolve_codex_root, resolve_cursor_root,
+        resolve_gemini_root, resolve_opencode_roots,
+    };
 
     #[test]
     fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
@@ -556,5 +643,51 @@ mod tests {
         assert!(
             resolve_opencode_roots(None, Some(OsString::from("relative/opencode")), None).is_err()
         );
+    }
+
+    #[test]
+    fn gemini_root_precedence_and_relative_values_are_rejected() {
+        assert_eq!(
+            resolve_gemini_root(
+                Some(Path::new("/configured/gemini")),
+                Some(OsString::from("/environment/gemini")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("configured root"),
+            Path::new("/configured/gemini")
+        );
+        assert_eq!(
+            resolve_gemini_root(
+                None,
+                Some(OsString::from("/environment/gemini")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("environment root"),
+            Path::new("/environment/gemini/.gemini")
+        );
+        assert_eq!(
+            resolve_gemini_root(None, None, Some(OsString::from("/Users/example")))
+                .expect("default root"),
+            Path::new("/Users/example/.gemini")
+        );
+        assert!(resolve_gemini_root(None, Some(OsString::from("relative/gemini")), None).is_err());
+    }
+
+    #[test]
+    fn cursor_root_precedence_and_relative_values_are_rejected() {
+        assert_eq!(
+            resolve_cursor_root(
+                Some(Path::new("/configured/cursor")),
+                Some(OsString::from("/Users/example")),
+            )
+            .expect("configured root"),
+            Path::new("/configured/cursor")
+        );
+        assert_eq!(
+            resolve_cursor_root(None, Some(OsString::from("/Users/example")))
+                .expect("default root"),
+            Path::new("/Users/example/.cursor")
+        );
+        assert!(resolve_cursor_root(Some(Path::new("relative/cursor")), None).is_err());
     }
 }

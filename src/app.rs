@@ -7,6 +7,8 @@ use serde::Serialize;
 use crate::{
     claude::collect_claude,
     codex::collect_codex,
+    cursor::collect_cursor,
+    gemini::collect_gemini,
     opencode::collect_opencode,
     paths::AppPaths,
     storage::{
@@ -39,6 +41,8 @@ pub async fn scan_shell(paths: &AppPaths) -> anyhow::Result<ScanSummary> {
     let codex_report = collect_codex(&paths.codex_root()?, &database).await?;
     let claude_report = collect_claude(&paths.claude_root()?, &database).await?;
     let opencode_report = collect_opencode(&paths.opencode_roots()?, &database).await?;
+    let gemini_report = collect_gemini(&paths.gemini_root()?, &database).await?;
+    let cursor_report = collect_cursor(&paths.cursor_root()?, &database).await?;
     let sessions_available = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
         .fetch_one(&database)
         .await?;
@@ -46,16 +50,22 @@ pub async fn scan_shell(paths: &AppPaths) -> anyhow::Result<ScanSummary> {
 
     Ok(ScanSummary {
         schema_version: SCHEMA_VERSION,
-        collectors_installed: 3,
+        collectors_installed: 5,
         sources_refreshed: codex_report.refreshed_sources
             + claude_report.refreshed_sources
-            + opencode_report.refreshed_sources,
+            + opencode_report.refreshed_sources
+            + gemini_report.refreshed_sources
+            + cursor_report.refreshed_sources,
         sources_partial: codex_report.partial_sources
             + claude_report.partial_sources
-            + opencode_report.partial_sources,
+            + opencode_report.partial_sources
+            + gemini_report.partial_sources
+            + cursor_report.partial_sources,
         sources_failed: codex_report.failed_sources
             + claude_report.failed_sources
-            + opencode_report.failed_sources,
+            + opencode_report.failed_sources
+            + gemini_report.failed_sources
+            + cursor_report.failed_sources,
         sessions_available: u64::try_from(sessions_available)?,
         message: "Provider sources were read without modifying provider-owned files".to_owned(),
     })
@@ -113,7 +123,7 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
         data_directory: paths.data_dir.clone(),
         database: paths.database_path.clone(),
         provider_sources: format!(
-            "Codex root (read-only): {}; Claude root (read-only): {}; OpenCode roots (read-only): {}",
+            "Codex root (read-only): {}; Claude root (read-only): {}; OpenCode roots (read-only): {}; Gemini root (read-only): {}; Cursor root (read-only): {}",
             paths.codex_root().map_or_else(
                 |_| "unavailable".to_owned(),
                 |path| path.display().to_string()
@@ -129,6 +139,14 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            paths.gemini_root().map_or_else(
+                |_| "unavailable".to_owned(),
+                |path| path.display().to_string()
+            ),
+            paths.cursor_root().map_or_else(
+                |_| "unavailable".to_owned(),
+                |path| path.display().to_string()
             ),
         ),
     }
@@ -152,10 +170,12 @@ mod tests {
         fs::write(
             agentlog_home.join("config.toml"),
             format!(
-                "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\n",
+                "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
                 temporary.path().join("empty-claude").display(),
                 temporary.path().join("empty-opencode").display(),
+                temporary.path().join("empty-gemini").display(),
+                temporary.path().join("empty-cursor").display(),
             ),
         )
         .expect("write config");
@@ -164,11 +184,47 @@ mod tests {
         let summary = scan_shell(&paths).await.expect("run shell scan");
 
         assert_eq!(summary.schema_version, SCHEMA_VERSION);
-        assert_eq!(summary.collectors_installed, 3);
+        assert_eq!(summary.collectors_installed, 5);
         assert_eq!(summary.sources_refreshed, 0);
         assert_eq!(summary.sources_partial, 0);
         assert_eq!(summary.sources_failed, 0);
         assert_eq!(summary.sessions_available, 0);
         assert!(paths.database_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_gemini_failure_does_not_block_a_cursor_source() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        let gemini_root = temporary.path().join("gemini");
+        let cursor_root = temporary.path().join("cursor");
+        fs::create_dir_all(gemini_root.join("tmp")).expect("Gemini directory");
+        fs::create_dir_all(cursor_root.join("projects/project/session")).expect("Cursor directory");
+        fs::write(gemini_root.join("tmp/broken.jsonl"), "not JSON\n").expect("Gemini source");
+        fs::write(
+            cursor_root.join("projects/project/session/capture.jsonl"),
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"visible\"}]}}\n",
+        )
+        .expect("Cursor source");
+        fs::write(
+            agentlog_home.join("config.toml"),
+            format!(
+                "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\n",
+                temporary.path().join("empty-codex").display(),
+                temporary.path().join("empty-claude").display(),
+                temporary.path().join("empty-opencode").display(),
+                gemini_root.display(),
+                cursor_root.display(),
+            ),
+        )
+        .expect("write config");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+
+        let summary = scan_shell(&paths).await.expect("run shell scan");
+
+        assert_eq!(summary.sources_refreshed, 1);
+        assert_eq!(summary.sources_failed, 1);
+        assert_eq!(summary.sessions_available, 1);
     }
 }

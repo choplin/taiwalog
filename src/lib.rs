@@ -7,6 +7,8 @@
 pub mod app;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
+pub mod gemini;
 pub mod opencode;
 pub mod paths;
 pub mod storage;
