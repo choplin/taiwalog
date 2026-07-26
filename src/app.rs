@@ -5,13 +5,11 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::Serialize;
 
 use crate::{
-    claude::collect_claude,
-    codex::collect_codex,
-    cursor::collect_cursor,
-    gemini::collect_gemini,
-    kimi::collect_kimi,
-    opencode::collect_opencode,
     paths::AppPaths,
+    providers::{
+        claude::collect_claude, codex::collect_codex, cursor::collect_cursor,
+        gemini::collect_gemini, kimi::collect_kimi, opencode::collect_opencode,
+    },
     storage::{
         CatalogSessionPreview, CatalogSessionSummary, SCHEMA_VERSION, list_catalog_sessions,
         open_database, read_catalog_preview,
