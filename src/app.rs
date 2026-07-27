@@ -7,7 +7,10 @@ use serde::Serialize;
 use crate::{
     paths::AppPaths,
     providers::{installed, source_descriptions},
-    storage::{Catalog, CatalogSessionPreview, CatalogSessionSummary, SCHEMA_VERSION},
+    storage::{
+        Catalog, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
+        SCHEMA_VERSION,
+    },
 };
 
 /// Observable result of a read-only provider scan.
@@ -125,6 +128,19 @@ pub async fn show_shell(
     Ok(session)
 }
 
+/// Reads all retained source diagnostics without starting a provider scan.
+///
+/// # Errors
+///
+/// Returns an error when the Agentlog catalog cannot be opened or queried.
+pub async fn diagnostics_shell(paths: &AppPaths) -> anyhow::Result<Vec<CatalogSourceDiagnostic>> {
+    paths.ensure_data_dir()?;
+    let catalog = Catalog::open(&paths.database_path).await?;
+    let diagnostics = catalog.source_diagnostics().await?;
+    catalog.close().await;
+    Ok(diagnostics)
+}
+
 /// Paths shown by the diagnostic command. All paths except provider sources are
 /// owned by Agentlog. Collectors will report provider source paths later.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -157,7 +173,22 @@ mod tests {
         paths::AppPaths, providers::opencode::create_test_database, storage::SCHEMA_VERSION,
     };
 
-    use super::scan_shell;
+    use super::{diagnostics_shell, scan_shell};
+
+    #[tokio::test]
+    async fn diagnostics_shell_opens_the_catalog_without_scanning_sources() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+
+        let diagnostics = diagnostics_shell(&paths)
+            .await
+            .expect("read empty diagnostics");
+
+        assert!(diagnostics.is_empty());
+        assert!(paths.database_path.is_file());
+    }
 
     #[tokio::test]
     async fn shell_scan_creates_catalog_and_reports_empty_codex_collection() {

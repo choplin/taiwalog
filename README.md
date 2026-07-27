@@ -25,8 +25,42 @@ cargo run -- browse
 
 `browse` reads the existing Agentlog catalog without scanning provider sources.
 Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
-preview, `Esc` to return, and `q` to quit. At wide terminal widths the selected
-session has a passive preview beside the chronological recent-session list.
+preview, `Esc` to return, and `q` to quit. Press `f` to refine by provider,
+repository, CWD, model, execution kind, and start date. Within each metadata
+field, `Space` toggles exact values with OR semantics; fields combine with AND.
+Blank or missing metadata is not offered as a filter value. Start-date choices
+also toggle with OR semantics. `Tab`/`Enter` moves forward, `BackTab` moves
+back, `x` clears the current step, and `C` clears every choice and returns to
+Recent grouping. Press `?` for the key reference and `!` for retained source
+diagnostics. The diagnostics list deliberately shows each retained source's
+local locator for source attribution; locators are never emitted by the JSON
+catalog interfaces.
+
+### Manual browse review
+
+Run this only with an actual local catalog: at least two provider values, a
+repository or CWD value, and several sessions with different `started_at`
+values make every interaction observable. Run `cargo run -- scan` first, then
+`cargo run -- browse`; if the catalog lacks one of those values, verify the
+available layout, help, diagnostics, selection, and terminal restoration steps
+below rather than inventing a fixture.
+
+1. At **at least 100x24**, expect a chronological list with Started, Title,
+   Repository, and Provider plus a passive preview. At **80x24**, expect the
+   narrow list with Started, Title, and Provider. Below **40x10**, expect
+   `Terminal too small` and no panic.
+2. Press `f`. Toggle two provider values with `Space` (OR), advance with
+   `Tab`, select a repository and/or CWD (AND), then select multiple date
+   buckets (OR). Advance to Group and choose Provider or Repository. Expect
+   fixed recent order inside each first-seen group; missing repositories are
+   displayed as `(no repository)`.
+3. Press `Esc`: the choices remain active. Press `?` to confirm the key
+   reference. Press `!`, use `j`/`k`, `PgUp`/`PgDn`, and `g`/`G` to scroll the
+   diagnostics, then `Esc` to close it.
+4. In Browse, move selection with `j`/`k`, press `Enter`, scroll the preview,
+   and press `Esc`. Expect the same list selection and list context. Finally,
+   press `q`; the normal terminal must be restored.
+
 On a normal exit, Agentlog reports a terminal-restoration failure; on an
 unexpected terminal error or panic it still makes a best-effort restoration.
 

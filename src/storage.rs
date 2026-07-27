@@ -143,6 +143,15 @@ impl Catalog {
         read_catalog_preview(&self.pool, session_id, 80, 4 * 1024).await
     }
 
+    /// Returns every retained source diagnostic without scanning providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be queried.
+    pub async fn source_diagnostics(&self) -> Result<Vec<CatalogSourceDiagnostic>, StorageError> {
+        list_catalog_source_diagnostics(&self.pool).await
+    }
+
     /// Closes the shared catalog connection pool.
     pub async fn close(self) {
         self.pool.close().await;
@@ -256,6 +265,19 @@ pub struct CatalogSessionPreview {
     pub session: CatalogSessionSummary,
     pub items: Vec<CatalogItemView>,
     pub items_truncated: bool,
+}
+
+/// One source-level diagnostic suitable for the interactive catalog browser.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogSourceDiagnostic {
+    pub provider: String,
+    pub source_format: String,
+    #[serde(skip_serializing)]
+    pub source_locator: String,
+    pub diagnostic_status: String,
+    pub diagnostic_message: Option<String>,
+    pub diagnostic_recorded_at: Option<i64>,
+    pub last_success_at: Option<i64>,
 }
 
 /// A display-safe transcript item returned by the catalog preview.
@@ -538,8 +560,7 @@ pub async fn list_catalog_sessions(
                 sources.last_success_at
          FROM sessions
          JOIN sources ON sources.id = sessions.source_id
-         ORDER BY sessions.last_visible_event_at DESC,
-                  sessions.started_at DESC,
+         ORDER BY COALESCE(sessions.last_visible_event_at, sessions.started_at) DESC,
                   sources.provider ASC,
                   sources.source_format ASC,
                   sources.canonical_locator ASC,
@@ -552,6 +573,32 @@ pub async fn list_catalog_sessions(
     .map_err(StorageError::Query)?;
 
     rows.iter().map(catalog_session_summary).collect()
+}
+
+/// Lists diagnostics for every known source, including sources with no sessions.
+///
+/// # Errors
+///
+/// Returns an error when the catalog cannot be queried.
+pub async fn list_catalog_source_diagnostics(
+    pool: &SqlitePool,
+) -> Result<Vec<CatalogSourceDiagnostic>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT provider,
+                source_format,
+                canonical_locator AS source_locator,
+                diagnostic_status,
+                diagnostic_message,
+                diagnostic_recorded_at,
+                last_success_at
+         FROM sources
+         ORDER BY provider ASC, source_format ASC, canonical_locator ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::Query)?;
+
+    rows.iter().map(catalog_source_diagnostic).collect()
 }
 
 /// Reads one normalized catalog session without scanning any provider sources.
@@ -645,6 +692,28 @@ fn catalog_session_summary(
             .try_get("diagnostic_status")
             .map_err(StorageError::Query)?,
         source_last_success_at: row
+            .try_get("last_success_at")
+            .map_err(StorageError::Query)?,
+    })
+}
+
+fn catalog_source_diagnostic(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<CatalogSourceDiagnostic, StorageError> {
+    Ok(CatalogSourceDiagnostic {
+        provider: row.try_get("provider").map_err(StorageError::Query)?,
+        source_format: row.try_get("source_format").map_err(StorageError::Query)?,
+        source_locator: row.try_get("source_locator").map_err(StorageError::Query)?,
+        diagnostic_status: row
+            .try_get("diagnostic_status")
+            .map_err(StorageError::Query)?,
+        diagnostic_message: row
+            .try_get("diagnostic_message")
+            .map_err(StorageError::Query)?,
+        diagnostic_recorded_at: row
+            .try_get("diagnostic_recorded_at")
+            .map_err(StorageError::Query)?,
+        last_success_at: row
             .try_get("last_success_at")
             .map_err(StorageError::Query)?,
     })
@@ -830,8 +899,8 @@ mod tests {
 
     use super::{
         Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
-        SourceSnapshot, StorageError, list_catalog_sessions, open_database, read_catalog_preview,
-        record_source_failure, replace_source_snapshot,
+        SourceSnapshot, StorageError, list_catalog_sessions, list_catalog_source_diagnostics,
+        open_database, read_catalog_preview, record_source_failure, replace_source_snapshot,
     };
 
     struct MismatchedScanner;
@@ -1249,6 +1318,111 @@ mod tests {
                 ("cursor", "/private/tmp/z.jsonl", "b"),
             ]
         );
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_list_orders_by_visible_activity_then_stable_identity() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "activity.sqlite3").await;
+        replace_source_snapshot(
+            &database,
+            &SourceSnapshot {
+                identity: SourceIdentity {
+                    provider: "codex",
+                    source_format: "session_jsonl",
+                    canonical_locator: "/private/tmp/activity.jsonl".to_owned(),
+                },
+                diagnostic_status: "ok",
+                diagnostic_message: None,
+                sessions: vec![
+                    CatalogSession {
+                        session_key: "started-only".to_owned(),
+                        title: None,
+                        repository: None,
+                        cwd: None,
+                        model: None,
+                        execution_kind: None,
+                        started_at: Some(100),
+                        last_visible_event_at: None,
+                        items: Vec::new(),
+                    },
+                    CatalogSession {
+                        session_key: "older-visible".to_owned(),
+                        title: None,
+                        repository: None,
+                        cwd: None,
+                        model: None,
+                        execution_kind: None,
+                        started_at: Some(1_000),
+                        last_visible_event_at: Some(99),
+                        items: Vec::new(),
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("store activity snapshot");
+
+        let sessions = list_catalog_sessions(&database, 10)
+            .await
+            .expect("list sessions");
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["started-only", "older-visible"]
+        );
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn source_diagnostics_include_zero_session_failures_and_hide_locators_from_json() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "diagnostics.sqlite3").await;
+        let failed = SourceIdentity {
+            provider: "alpha",
+            source_format: "session_jsonl",
+            canonical_locator: "/private/tmp/failed.jsonl".to_owned(),
+        };
+        record_source_failure(&database, &failed, "malformed source")
+            .await
+            .expect("record zero-session failure");
+        replace_source_snapshot(
+            &database,
+            &SourceSnapshot {
+                identity: SourceIdentity {
+                    provider: "beta",
+                    source_format: "session_jsonl",
+                    canonical_locator: "/private/tmp/accepted.jsonl".to_owned(),
+                },
+                diagnostic_status: "ok",
+                diagnostic_message: None,
+                sessions: Vec::new(),
+            },
+        )
+        .await
+        .expect("store empty accepted source");
+
+        let diagnostics = list_catalog_source_diagnostics(&database)
+            .await
+            .expect("list diagnostics");
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].provider, "alpha");
+        assert_eq!(diagnostics[0].source_locator, failed.canonical_locator);
+        assert_eq!(diagnostics[0].diagnostic_status, "error");
+        assert_eq!(
+            diagnostics[0].diagnostic_message.as_deref(),
+            Some("malformed source")
+        );
+        assert!(diagnostics[0].diagnostic_recorded_at.is_some());
+        assert_eq!(diagnostics[1].provider, "beta");
+        assert_eq!(diagnostics[1].diagnostic_status, "ok");
+        assert!(diagnostics[1].last_success_at.is_some());
+        let json = serde_json::to_value(&diagnostics).expect("serialize diagnostics");
+        assert!(json[0].get("source_locator").is_none());
+        assert!(!json.to_string().contains("/private/tmp/failed.jsonl"));
         database.close().await;
     }
 
