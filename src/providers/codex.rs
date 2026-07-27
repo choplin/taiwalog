@@ -7,6 +7,8 @@
 
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsString,
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
@@ -15,9 +17,15 @@ use std::{
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::storage::{
-    CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
-    record_source_failure_in_transaction, replace_source_snapshot_in_transaction,
+use crate::{
+    providers::{
+        ProviderId, ProviderRootError, ProviderScan, ProviderScanError, ProviderScanFuture,
+        ProviderScanner, SourceOutcome,
+    },
+    storage::{
+        CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
+        scan_provider_with_pool,
+    },
 };
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,6 +46,114 @@ pub struct CodexScanReport {
     pub refreshed_sources: u64,
     pub partial_sources: u64,
     pub failed_sources: u64,
+}
+
+/// Codex-owned source locations and native discovery rules.
+#[derive(Clone, Debug)]
+pub struct CodexProvider {
+    root: PathBuf,
+}
+
+impl CodexProvider {
+    /// Resolves the Codex root using provider-native precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no usable absolute root can be resolved.
+    pub fn resolve(configured: Option<&Path>) -> Result<Self, ProviderRootError> {
+        Self::resolve_from(configured, env::var_os("CODEX_HOME"), env::var_os("HOME"))
+    }
+
+    pub(crate) fn resolve_from(
+        configured: Option<&Path>,
+        codex_home: Option<OsString>,
+        os_home: Option<OsString>,
+    ) -> Result<Self, ProviderRootError> {
+        let root = if let Some(root) = configured {
+            root.to_path_buf()
+        } else if let Some(root) = codex_home {
+            PathBuf::from(root)
+        } else {
+            os_home
+                .map(PathBuf::from)
+                .filter(|home| !home.as_os_str().is_empty())
+                .ok_or(ProviderRootError::CodexHomeUnavailable)?
+                .join(".codex")
+        };
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            return Err(ProviderRootError::InvalidCodexRoot { path: root });
+        }
+        Ok(Self { root })
+    }
+
+    #[must_use]
+    pub fn at_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ProviderId {
+        ProviderId::Codex
+    }
+
+    fn sources(&self) -> std::io::Result<Vec<CodexSource>> {
+        discover_sources(&self.root)
+    }
+}
+
+/// Agentlog projection of Codex-native sources.
+#[derive(Clone, Debug)]
+pub struct CodexScanner {
+    provider: CodexProvider,
+}
+
+impl CodexScanner {
+    #[must_use]
+    pub fn new(provider: CodexProvider) -> Self {
+        Self { provider }
+    }
+}
+
+impl ProviderScanner for CodexScanner {
+    fn provider_id(&self) -> ProviderId {
+        self.provider.id()
+    }
+
+    fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+        let sources = self.provider.sources()?;
+        let candidate_sources = u64::try_from(sources.len()).unwrap_or(u64::MAX);
+        Ok(Box::new(CodexScan {
+            candidate_sources,
+            sources: sources.into_iter(),
+        }))
+    }
+}
+
+struct CodexScan {
+    candidate_sources: u64,
+    sources: std::vec::IntoIter<CodexSource>,
+}
+
+impl ProviderScan for CodexScan {
+    fn candidate_sources(&self) -> u64 {
+        self.candidate_sources
+    }
+
+    fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+        let outcome = self.sources.next().map(|source| {
+            let identity = source_identity(&source);
+            match parse_source(&source) {
+                Ok(snapshot) => SourceOutcome::Accepted(snapshot),
+                Err(message) => SourceOutcome::Failed { identity, message },
+            }
+        });
+        Box::pin(async move { Ok(outcome) })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,36 +239,17 @@ pub async fn collect_codex(
     root: &Path,
     pool: &SqlitePool,
 ) -> Result<CodexScanReport, StorageError> {
-    let sources = discover_sources(root)?;
-    let mut report = CodexScanReport {
-        candidate_sources: u64::try_from(sources.len()).unwrap_or(u64::MAX),
-        ..CodexScanReport::default()
-    };
-    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
-
-    for source in sources {
-        let identity = source_identity(&source);
-        match parse_source(&source) {
-            Ok(snapshot) => {
-                let partial = snapshot.diagnostic_status == "partial";
-                replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
-                report.refreshed_sources += 1;
-                if partial {
-                    report.partial_sources += 1;
-                }
-            }
-            Err(message) => {
-                record_source_failure_in_transaction(&mut transaction, &identity, message).await?;
-                report.failed_sources += 1;
-            }
-        }
-    }
-
-    transaction.commit().await.map_err(StorageError::Query)?;
-    Ok(report)
+    let scanner = CodexScanner::new(CodexProvider::at_root(root.to_path_buf()));
+    let report = scan_provider_with_pool(pool, &scanner).await?;
+    Ok(CodexScanReport {
+        candidate_sources: report.candidate_sources,
+        refreshed_sources: report.refreshed_sources,
+        partial_sources: report.partial_sources,
+        failed_sources: report.failed_sources,
+    })
 }
 
-fn discover_sources(root: &Path) -> Result<Vec<CodexSource>, StorageError> {
+fn discover_sources(root: &Path) -> std::io::Result<Vec<CodexSource>> {
     let mut sources = Vec::new();
     visit_jsonl_files(&root.join("sessions"), &mut |path| {
         sources.push(CodexSource {
@@ -175,12 +272,12 @@ fn discover_sources(root: &Path) -> Result<Vec<CodexSource>, StorageError> {
 
 fn visit_jsonl_files(
     root: &Path,
-    visit: &mut dyn FnMut(&Path) -> Result<(), StorageError>,
-) -> Result<(), StorageError> {
+    visit: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(StorageError::SourceIo(error)),
+        Err(error) => return Err(error),
     };
     if metadata.file_type().is_symlink() {
         return Ok(());
@@ -195,10 +292,10 @@ fn visit_jsonl_files(
         return Ok(());
     }
 
-    for entry in fs::read_dir(root).map_err(StorageError::SourceIo)? {
-        let entry = entry.map_err(StorageError::SourceIo)?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(StorageError::SourceIo)?;
+        let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             continue;
         }
@@ -213,11 +310,11 @@ fn visit_jsonl_files(
     Ok(())
 }
 
-fn is_regular_file(path: &Path) -> Result<bool, StorageError> {
+fn is_regular_file(path: &Path) -> std::io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(StorageError::SourceIo(error)),
+        Err(error) => Err(error),
     }
 }
 

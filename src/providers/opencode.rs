@@ -7,6 +7,8 @@
 
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
@@ -17,9 +19,15 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-use crate::storage::{
-    CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
-    record_source_failure_in_transaction, replace_source_snapshot_in_transaction,
+use crate::{
+    providers::{
+        ProviderId, ProviderRootError, ProviderScan, ProviderScanError, ProviderScanFuture,
+        ProviderScanner, SourceOutcome,
+    },
+    storage::{
+        CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
+        scan_provider_with_pool,
+    },
 };
 
 const DATABASE_FILE: &str = "opencode.db";
@@ -39,6 +47,134 @@ pub struct OpenCodeScanReport {
     pub refreshed_sources: u64,
     pub partial_sources: u64,
     pub failed_sources: u64,
+}
+
+/// OpenCode-owned source locations and native discovery rules.
+#[derive(Clone, Debug)]
+pub struct OpenCodeProvider {
+    roots: Vec<PathBuf>,
+}
+
+impl OpenCodeProvider {
+    /// Resolves `OpenCode` roots using provider-native precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no usable absolute root can be resolved.
+    pub fn resolve(configured: Option<&Path>) -> Result<Self, ProviderRootError> {
+        Self::resolve_from(
+            configured,
+            env::var_os("XDG_DATA_HOME"),
+            env::var_os("HOME"),
+        )
+    }
+
+    pub(crate) fn resolve_from(
+        configured: Option<&Path>,
+        xdg_data_home: Option<OsString>,
+        os_home: Option<OsString>,
+    ) -> Result<Self, ProviderRootError> {
+        let roots = if let Some(root) = configured {
+            vec![root.to_path_buf()]
+        } else if let Some(root) = xdg_data_home {
+            let root = PathBuf::from(root);
+            if root.as_os_str().is_empty() || !root.is_absolute() {
+                return Err(ProviderRootError::InvalidOpenCodeRoot { path: root });
+            }
+            vec![root.join("opencode")]
+        } else {
+            let home = os_home
+                .map(PathBuf::from)
+                .filter(|home| !home.as_os_str().is_empty())
+                .ok_or(ProviderRootError::OpenCodeHomeUnavailable)?;
+            vec![
+                home.join(".local/share/opencode"),
+                home.join("Library/Application Support/opencode"),
+            ]
+        };
+        if let Some(path) = roots
+            .iter()
+            .find(|path| path.as_os_str().is_empty() || !path.is_absolute())
+        {
+            return Err(ProviderRootError::InvalidOpenCodeRoot { path: path.clone() });
+        }
+        Ok(Self { roots })
+    }
+
+    #[must_use]
+    pub fn at_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
+
+    #[must_use]
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ProviderId {
+        ProviderId::OpenCode
+    }
+
+    fn sources(&self) -> Vec<PathBuf> {
+        database_candidates(&self.roots)
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect()
+    }
+}
+
+/// Agentlog projection of OpenCode-native sources.
+#[derive(Clone, Debug)]
+pub struct OpenCodeScanner {
+    provider: OpenCodeProvider,
+}
+
+impl OpenCodeScanner {
+    #[must_use]
+    pub fn new(provider: OpenCodeProvider) -> Self {
+        Self { provider }
+    }
+}
+
+impl ProviderScanner for OpenCodeScanner {
+    fn provider_id(&self) -> ProviderId {
+        self.provider.id()
+    }
+
+    fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+        let sources = self.provider.sources();
+        let candidate_sources = u64::try_from(sources.len()).unwrap_or(u64::MAX);
+        Ok(Box::new(OpenCodeScan {
+            candidate_sources,
+            sources: sources.into_iter(),
+        }))
+    }
+}
+
+struct OpenCodeScan {
+    candidate_sources: u64,
+    sources: std::vec::IntoIter<PathBuf>,
+}
+
+impl ProviderScan for OpenCodeScan {
+    fn candidate_sources(&self) -> u64 {
+        self.candidate_sources
+    }
+
+    fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+        let Some(path) = self.sources.next() else {
+            return Box::pin(async { Ok(None) });
+        };
+        Box::pin(async move {
+            let identity = source_identity(&path);
+            let outcome = match read_source(&path).await {
+                Ok(snapshot) => SourceOutcome::Accepted(snapshot),
+                Err(message) => SourceOutcome::Failed { identity, message },
+            };
+            Ok(Some(outcome))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -94,33 +230,14 @@ pub async fn collect_opencode(
     roots: &[PathBuf],
     catalog: &SqlitePool,
 ) -> Result<OpenCodeScanReport, StorageError> {
-    let mut report = OpenCodeScanReport::default();
-    let mut transaction = catalog.begin().await.map_err(StorageError::Query)?;
-
-    for path in database_candidates(roots) {
-        if !path.is_file() {
-            continue;
-        }
-        report.candidate_sources += 1;
-        let identity = source_identity(&path);
-        match read_source(&path).await {
-            Ok(snapshot) => {
-                let partial = snapshot.diagnostic_status == "partial";
-                replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
-                report.refreshed_sources += 1;
-                if partial {
-                    report.partial_sources += 1;
-                }
-            }
-            Err(message) => {
-                record_source_failure_in_transaction(&mut transaction, &identity, message).await?;
-                report.failed_sources += 1;
-            }
-        }
-    }
-
-    transaction.commit().await.map_err(StorageError::Query)?;
-    Ok(report)
+    let scanner = OpenCodeScanner::new(OpenCodeProvider::at_roots(roots.to_vec()));
+    let report = scan_provider_with_pool(catalog, &scanner).await?;
+    Ok(OpenCodeScanReport {
+        candidate_sources: report.candidate_sources,
+        refreshed_sources: report.refreshed_sources,
+        partial_sources: report.partial_sources,
+        failed_sources: report.failed_sources,
+    })
 }
 
 fn database_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {

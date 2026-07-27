@@ -5,6 +5,7 @@
 //! modifying it.
 
 use std::{
+    collections::BTreeMap,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,8 +17,176 @@ use sqlx::{
 };
 use thiserror::Error;
 
+use crate::providers::{ProviderScanError, ProviderScanReport, ProviderScanner, SourceOutcome};
+
 pub const SCHEMA_VERSION: i64 = 1;
 const TRANSCRIPT_ITEM_INSERT_CHUNK: usize = 500;
+
+/// Agentlog's durable catalog and the use cases that preserve its invariants.
+pub struct Catalog {
+    pool: SqlitePool,
+}
+
+impl Catalog {
+    /// Opens the Agentlog-owned catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened or validated.
+    pub async fn open(path: &Path) -> Result<Self, StorageError> {
+        Ok(Self {
+            pool: open_database(path).await?,
+        })
+    }
+
+    /// Scans one provider and applies all source outcomes atomically.
+    ///
+    /// The scanner owns provider-native discovery and interpretation. Catalog
+    /// owns persistence, aggregate diagnostics, and the provider-wide
+    /// transaction boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider discovery or iteration fails, a scanner
+    /// reports an inconsistent provider identity, or a catalog write fails.
+    pub async fn scan(
+        &self,
+        scanner: &dyn ProviderScanner,
+    ) -> Result<ProviderScanReport, CatalogScanError> {
+        let provider = scanner.provider_id().as_str();
+        let mut scan = scanner.start()?;
+        let mut report = ProviderScanReport {
+            candidate_sources: scan.candidate_sources(),
+            ..ProviderScanReport::default()
+        };
+        let mut transaction = self.pool.begin().await.map_err(StorageError::Query)?;
+
+        while let Some(outcome) = scan.next_outcome().await? {
+            match outcome {
+                SourceOutcome::Accepted(snapshot) => {
+                    validate_scanner_identity(provider, &snapshot.identity)?;
+                    let partial = snapshot.diagnostic_status == "partial";
+                    replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
+                    report.refreshed_sources += 1;
+                    report.partial_sources += u64::from(partial);
+                }
+                SourceOutcome::Failed { identity, message } => {
+                    validate_scanner_identity(provider, &identity)?;
+                    record_source_failure_in_transaction(&mut transaction, &identity, message)
+                        .await?;
+                    report.failed_sources += 1;
+                }
+            }
+        }
+
+        transaction.commit().await.map_err(StorageError::Query)?;
+        Ok(report)
+    }
+
+    /// Returns the number of cataloged sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be queried or the count cannot
+    /// be represented by the public result type.
+    pub async fn session_count(&self) -> Result<u64, StorageError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StorageError::Query)?;
+        u64::try_from(count).map_err(|_| StorageError::CountOutOfRange)
+    }
+
+    /// Returns cataloged session counts keyed by provider identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be queried or a count cannot
+    /// be represented by the public result type.
+    pub async fn provider_session_counts(&self) -> Result<BTreeMap<String, u64>, StorageError> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT sources.provider, COUNT(sessions.id)
+             FROM sources
+             LEFT JOIN sessions ON sessions.source_id = sources.id
+             GROUP BY sources.provider",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StorageError::Query)?
+        .into_iter()
+        .map(|(provider, count)| {
+            u64::try_from(count)
+                .map(|count| (provider, count))
+                .map_err(|_| StorageError::CountOutOfRange)
+        })
+        .collect()
+    }
+
+    /// Lists cataloged sessions without scanning provider-owned sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog cannot be queried.
+    pub async fn list_sessions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<CatalogSessionSummary>, StorageError> {
+        list_catalog_sessions(&self.pool, limit).await
+    }
+
+    /// Reads one bounded catalog preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unavailable or cannot be queried.
+    pub async fn preview(&self, session_id: i64) -> Result<CatalogSessionPreview, StorageError> {
+        read_catalog_preview(&self.pool, session_id, 80, 4 * 1024).await
+    }
+
+    /// Closes the shared catalog connection pool.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+}
+
+fn validate_scanner_identity(
+    expected_provider: &'static str,
+    identity: &SourceIdentity,
+) -> Result<(), StorageError> {
+    if identity.provider == expected_provider {
+        Ok(())
+    } else {
+        Err(StorageError::ProviderIdentityMismatch {
+            expected: expected_provider,
+            found: identity.provider,
+        })
+    }
+}
+
+/// Runs a scanner through Catalog for legacy collector entry points that still
+/// accept a raw pool.
+pub(crate) async fn scan_provider_with_pool(
+    pool: &SqlitePool,
+    scanner: &dyn ProviderScanner,
+) -> Result<ProviderScanReport, StorageError> {
+    let catalog = Catalog { pool: pool.clone() };
+    match catalog.scan(scanner).await {
+        Ok(report) => Ok(report),
+        Err(CatalogScanError::Storage(error)) => Err(error),
+        Err(CatalogScanError::Provider(ProviderScanError::SourceIo(error))) => {
+            Err(StorageError::SourceIo(error))
+        }
+    }
+}
+
+/// Failures while coordinating a provider scan with catalog persistence.
+#[derive(Debug, Error)]
+pub enum CatalogScanError {
+    #[error(transparent)]
+    Provider(#[from] ProviderScanError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
 
 /// One provider-owned input with its stable, provider-scoped identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -618,6 +787,13 @@ pub enum StorageError {
     CatalogSessionNotFound { session_id: i64 },
     #[error("catalog contains an invalid transcript item kind {item_kind}")]
     InvalidCatalogItemKind { item_kind: String },
+    #[error("catalog count cannot be represented by the public result type")]
+    CountOutOfRange,
+    #[error("provider scanner identity mismatch: expected {expected}, found {found}")]
+    ProviderIdentityMismatch {
+        expected: &'static str,
+        found: &'static str,
+    },
     #[error("cannot inspect a provider-owned source: {0}")]
     SourceIo(std::io::Error),
 }
@@ -635,11 +811,54 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{
-        CatalogItem, CatalogSession, SCHEMA_VERSION, SourceIdentity, SourceSnapshot, StorageError,
-        list_catalog_sessions, open_database, read_catalog_preview, record_source_failure,
-        replace_source_snapshot,
+    use crate::providers::{
+        ProviderId, ProviderScan, ProviderScanError, ProviderScanFuture, ProviderScanner,
+        SourceOutcome,
     };
+
+    use super::{
+        Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
+        SourceSnapshot, StorageError, list_catalog_sessions, open_database, read_catalog_preview,
+        record_source_failure, replace_source_snapshot,
+    };
+
+    struct MismatchedScanner;
+
+    impl ProviderScanner for MismatchedScanner {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+            Ok(Box::new(MismatchedScan {
+                outcome: Some(SourceOutcome::Accepted(SourceSnapshot {
+                    identity: SourceIdentity {
+                        provider: "claude",
+                        source_format: "test",
+                        canonical_locator: "test://source".to_owned(),
+                    },
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: Vec::new(),
+                })),
+            }))
+        }
+    }
+
+    struct MismatchedScan {
+        outcome: Option<SourceOutcome>,
+    }
+
+    impl ProviderScan for MismatchedScan {
+        fn candidate_sources(&self) -> u64 {
+            1
+        }
+
+        fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+            let outcome = self.outcome.take();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
 
     async fn user_tables(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar::<_, String>(
@@ -722,6 +941,33 @@ mod tests {
             vec!["sessions", "sources", "transcript_items",]
         );
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_rejects_scanner_identity_mismatch_without_persisting_it() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let pool = open_temporary_database(&temporary, "identity.sqlite3").await;
+        let catalog = Catalog { pool };
+
+        let error = catalog
+            .scan(&MismatchedScanner)
+            .await
+            .expect_err("identity mismatch");
+        assert!(matches!(
+            error,
+            CatalogScanError::Storage(StorageError::ProviderIdentityMismatch {
+                expected: "codex",
+                found: "claude",
+            })
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+                .fetch_one(&catalog.pool)
+                .await
+                .expect("source count"),
+            0
+        );
+        catalog.close().await;
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 //! Read-only Kimi Code session-index and wire JSONL collection.
 
 use std::{
+    env,
+    ffi::OsString,
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
@@ -10,9 +12,15 @@ use std::{
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::storage::{
-    CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
-    record_source_failure_in_transaction, replace_source_snapshot_in_transaction,
+use crate::{
+    providers::{
+        ProviderId, ProviderRootError, ProviderScan, ProviderScanError, ProviderScanFuture,
+        ProviderScanner, SourceOutcome,
+    },
+    storage::{
+        CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, StorageError,
+        scan_provider_with_pool,
+    },
 };
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -29,6 +37,126 @@ pub struct KimiScanReport {
     pub refreshed_sources: u64,
     pub partial_sources: u64,
     pub failed_sources: u64,
+}
+
+/// Kimi-owned source locations and native discovery rules.
+#[derive(Clone, Debug)]
+pub struct KimiProvider {
+    root: PathBuf,
+}
+
+impl KimiProvider {
+    /// Resolves the Kimi root using provider-native precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no usable absolute root can be resolved.
+    pub fn resolve(configured: Option<&Path>) -> Result<Self, ProviderRootError> {
+        Self::resolve_from(
+            configured,
+            env::var_os("KIMI_CODE_HOME"),
+            env::var_os("HOME"),
+        )
+    }
+
+    pub(crate) fn resolve_from(
+        configured: Option<&Path>,
+        kimi_code_home: Option<OsString>,
+        os_home: Option<OsString>,
+    ) -> Result<Self, ProviderRootError> {
+        let root = if let Some(root) = configured {
+            root.to_path_buf()
+        } else if let Some(root) = kimi_code_home {
+            PathBuf::from(root)
+        } else {
+            os_home
+                .map(PathBuf::from)
+                .filter(|home| !home.as_os_str().is_empty())
+                .ok_or(ProviderRootError::KimiHomeUnavailable)?
+                .join(".kimi-code")
+        };
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            return Err(ProviderRootError::InvalidKimiRoot { path: root });
+        }
+        Ok(Self { root })
+    }
+
+    #[must_use]
+    pub fn at_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> ProviderId {
+        ProviderId::Kimi
+    }
+
+    fn sources(&self) -> std::io::Result<Vec<KimiSource>> {
+        discover(&self.root)
+    }
+}
+
+/// Agentlog projection of Kimi-native sources.
+#[derive(Clone, Debug)]
+pub struct KimiScanner {
+    provider: KimiProvider,
+}
+
+impl KimiScanner {
+    #[must_use]
+    pub fn new(provider: KimiProvider) -> Self {
+        Self { provider }
+    }
+}
+
+impl ProviderScanner for KimiScanner {
+    fn provider_id(&self) -> ProviderId {
+        self.provider.id()
+    }
+
+    fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+        let sources = self.provider.sources()?;
+        let candidate_sources = u64::try_from(sources.len()).unwrap_or(u64::MAX);
+        Ok(Box::new(KimiScan {
+            root: self.provider.root().to_path_buf(),
+            candidate_sources,
+            sources: sources.into_iter(),
+            index: parse_index(self.provider.root()),
+        }))
+    }
+}
+
+struct KimiScan {
+    root: PathBuf,
+    candidate_sources: u64,
+    sources: std::vec::IntoIter<KimiSource>,
+    index: Result<IndexSnapshot, &'static str>,
+}
+
+impl ProviderScan for KimiScan {
+    fn candidate_sources(&self) -> u64 {
+        self.candidate_sources
+    }
+
+    fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+        let outcome = self.sources.next().map(|source| {
+            let identity = identity(&source);
+            let parsed = match &self.index {
+                Ok(index) => parse(&self.root, &source, index),
+                Err(message) => Err(*message),
+            };
+            match parsed {
+                Ok(snapshot) => SourceOutcome::Accepted(snapshot),
+                Err(message) => SourceOutcome::Failed { identity, message },
+            }
+        });
+        Box::pin(async move { Ok(outcome) })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -86,37 +214,17 @@ impl PartialReason {
 ///
 /// Returns an error when Agentlog cannot record source outcomes.
 pub async fn collect_kimi(root: &Path, pool: &SqlitePool) -> Result<KimiScanReport, StorageError> {
-    let sources = discover(root)?;
-    let mut report = KimiScanReport {
-        candidate_sources: u64::try_from(sources.len()).unwrap_or(u64::MAX),
-        ..KimiScanReport::default()
-    };
-    let index = parse_index(root);
-    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
-    for source in sources {
-        let identity = identity(&source);
-        let outcome = match &index {
-            Ok(index) => parse(root, &source, index),
-            Err(message) => Err(*message),
-        };
-        match outcome {
-            Ok(snapshot) => {
-                let partial = snapshot.diagnostic_status == "partial";
-                replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
-                report.refreshed_sources += 1;
-                report.partial_sources += u64::from(partial);
-            }
-            Err(message) => {
-                record_source_failure_in_transaction(&mut transaction, &identity, message).await?;
-                report.failed_sources += 1;
-            }
-        }
-    }
-    transaction.commit().await.map_err(StorageError::Query)?;
-    Ok(report)
+    let scanner = KimiScanner::new(KimiProvider::at_root(root.to_path_buf()));
+    let report = scan_provider_with_pool(pool, &scanner).await?;
+    Ok(KimiScanReport {
+        candidate_sources: report.candidate_sources,
+        refreshed_sources: report.refreshed_sources,
+        partial_sources: report.partial_sources,
+        failed_sources: report.failed_sources,
+    })
 }
 
-fn discover(root: &Path) -> Result<Vec<KimiSource>, StorageError> {
+fn discover(root: &Path) -> std::io::Result<Vec<KimiSource>> {
     let mut sources = Vec::new();
     visit(&root.join("sessions"), &mut |path| {
         if path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl")
@@ -162,19 +270,19 @@ fn wire_parts(root: &Path, wire: &Path) -> Option<KimiSource> {
 
 fn visit(
     root: &Path,
-    callback: &mut dyn FnMut(&Path) -> Result<(), StorageError>,
-) -> Result<(), StorageError> {
+    callback: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(StorageError::SourceIo(error)),
+        Err(error) => return Err(error),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(root).map_err(StorageError::SourceIo)? {
-        let path = entry.map_err(StorageError::SourceIo)?.path();
-        let metadata = fs::symlink_metadata(&path).map_err(StorageError::SourceIo)?;
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             continue;
         }

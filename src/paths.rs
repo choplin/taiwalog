@@ -10,6 +10,11 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::providers::{
+    ProviderRootError, claude::ClaudeProvider, codex::CodexProvider, cursor::CursorProvider,
+    gemini::GeminiProvider, kimi::KimiProvider, opencode::OpenCodeProvider,
+};
+
 const APPLICATION_SUPPORT: &str = "Library/Application Support/Agentlog";
 const CONFIG_FILE: &str = "config.toml";
 const DATABASE_FILE: &str = "agentlog.sqlite3";
@@ -193,24 +198,9 @@ fn resolve_codex_root(
     codex_home: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(root) = configured {
-        return validate_codex_root(root.to_path_buf());
-    }
-    if let Some(root) = codex_home {
-        return validate_codex_root(PathBuf::from(root));
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::CodexHomeUnavailable)?;
-    validate_codex_root(home.join(".codex"))
-}
-
-fn validate_codex_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidCodexRoot { path: root });
-    }
-    Ok(root)
+    CodexProvider::resolve_from(configured, codex_home, os_home)
+        .map(|provider| provider.root().to_path_buf())
+        .map_err(Into::into)
 }
 
 fn resolve_claude_root(
@@ -218,24 +208,9 @@ fn resolve_claude_root(
     claude_config_dir: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(root) = configured {
-        return validate_claude_root(root.to_path_buf());
-    }
-    if let Some(root) = claude_config_dir {
-        return validate_claude_root(PathBuf::from(root));
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::ClaudeHomeUnavailable)?;
-    validate_claude_root(home.join(".claude"))
-}
-
-fn validate_claude_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidClaudeRoot { path: root });
-    }
-    Ok(root)
+    ClaudeProvider::resolve_from(configured, claude_config_dir, os_home)
+        .map(|provider| provider.root().to_path_buf())
+        .map_err(Into::into)
 }
 
 fn resolve_opencode_roots(
@@ -243,31 +218,9 @@ fn resolve_opencode_roots(
     xdg_data_home: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<Vec<PathBuf>, PathError> {
-    if let Some(root) = configured {
-        return validate_opencode_root(root.to_path_buf()).map(|root| vec![root]);
-    }
-    if let Some(root) = xdg_data_home {
-        let root = PathBuf::from(root);
-        if root.as_os_str().is_empty() || !root.is_absolute() {
-            return Err(PathError::InvalidOpenCodeRoot { path: root });
-        }
-        return validate_opencode_root(root.join("opencode")).map(|root| vec![root]);
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::OpenCodeHomeUnavailable)?;
-    Ok(vec![
-        validate_opencode_root(home.join(".local/share/opencode"))?,
-        validate_opencode_root(home.join("Library/Application Support/opencode"))?,
-    ])
-}
-
-fn validate_opencode_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidOpenCodeRoot { path: root });
-    }
-    Ok(root)
+    OpenCodeProvider::resolve_from(configured, xdg_data_home, os_home)
+        .map(|provider| provider.roots().to_vec())
+        .map_err(Into::into)
 }
 
 fn resolve_gemini_root(
@@ -275,65 +228,26 @@ fn resolve_gemini_root(
     gemini_cli_home: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(root) = configured {
-        return validate_gemini_root(root.to_path_buf());
-    }
-    if let Some(root) = gemini_cli_home {
-        return validate_gemini_root(PathBuf::from(root).join(".gemini"));
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::GeminiHomeUnavailable)?;
-    validate_gemini_root(home.join(".gemini"))
-}
-fn validate_gemini_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidGeminiRoot { path: root });
-    }
-    Ok(root)
+    GeminiProvider::resolve_from(configured, gemini_cli_home, os_home)
+        .map(|provider| provider.root().to_path_buf())
+        .map_err(Into::into)
 }
 fn resolve_cursor_root(
     configured: Option<&Path>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(root) = configured {
-        return validate_cursor_root(root.to_path_buf());
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::CursorHomeUnavailable)?;
-    validate_cursor_root(home.join(".cursor"))
-}
-fn validate_cursor_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidCursorRoot { path: root });
-    }
-    Ok(root)
+    CursorProvider::resolve_from(configured, os_home)
+        .map(|provider| provider.root().to_path_buf())
+        .map_err(Into::into)
 }
 fn resolve_kimi_root(
     configured: Option<&Path>,
     kimi_code_home: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(root) = configured {
-        return validate_kimi_root(root.to_path_buf());
-    }
-    if let Some(root) = kimi_code_home {
-        return validate_kimi_root(PathBuf::from(root));
-    }
-    let home = os_home
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(PathError::KimiHomeUnavailable)?;
-    validate_kimi_root(home.join(".kimi-code"))
-}
-fn validate_kimi_root(root: PathBuf) -> Result<PathBuf, PathError> {
-    if root.as_os_str().is_empty() || !root.is_absolute() {
-        return Err(PathError::InvalidKimiRoot { path: root });
-    }
-    Ok(root)
+    KimiProvider::resolve_from(configured, kimi_code_home, os_home)
+        .map(|provider| provider.root().to_path_buf())
+        .map_err(Into::into)
 }
 
 fn default_home() -> Result<PathBuf, PathError> {
@@ -502,6 +416,25 @@ pub enum PathError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+impl From<ProviderRootError> for PathError {
+    fn from(error: ProviderRootError) -> Self {
+        match error {
+            ProviderRootError::CodexHomeUnavailable => Self::CodexHomeUnavailable,
+            ProviderRootError::InvalidCodexRoot { path } => Self::InvalidCodexRoot { path },
+            ProviderRootError::ClaudeHomeUnavailable => Self::ClaudeHomeUnavailable,
+            ProviderRootError::InvalidClaudeRoot { path } => Self::InvalidClaudeRoot { path },
+            ProviderRootError::OpenCodeHomeUnavailable => Self::OpenCodeHomeUnavailable,
+            ProviderRootError::InvalidOpenCodeRoot { path } => Self::InvalidOpenCodeRoot { path },
+            ProviderRootError::GeminiHomeUnavailable => Self::GeminiHomeUnavailable,
+            ProviderRootError::InvalidGeminiRoot { path } => Self::InvalidGeminiRoot { path },
+            ProviderRootError::CursorHomeUnavailable => Self::CursorHomeUnavailable,
+            ProviderRootError::InvalidCursorRoot { path } => Self::InvalidCursorRoot { path },
+            ProviderRootError::KimiHomeUnavailable => Self::KimiHomeUnavailable,
+            ProviderRootError::InvalidKimiRoot { path } => Self::InvalidKimiRoot { path },
+        }
+    }
 }
 
 #[cfg(test)]

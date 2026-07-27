@@ -6,14 +6,8 @@ use serde::Serialize;
 
 use crate::{
     paths::AppPaths,
-    providers::{
-        claude::collect_claude, codex::collect_codex, cursor::collect_cursor,
-        gemini::collect_gemini, kimi::collect_kimi, opencode::collect_opencode,
-    },
-    storage::{
-        CatalogSessionPreview, CatalogSessionSummary, SCHEMA_VERSION, list_catalog_sessions,
-        open_database, read_catalog_preview,
-    },
+    providers::{installed, source_descriptions},
+    storage::{Catalog, CatalogSessionPreview, CatalogSessionSummary, SCHEMA_VERSION},
 };
 
 /// Observable result of a read-only provider scan.
@@ -48,101 +42,48 @@ pub struct ProviderScanSummary {
 /// queried.
 pub async fn scan_shell(paths: &AppPaths) -> anyhow::Result<ScanSummary> {
     paths.ensure_data_dir()?;
-    let database = open_database(&paths.database_path).await?;
-    let codex_report = collect_codex(&paths.codex_root()?, &database).await?;
-    let claude_report = collect_claude(&paths.claude_root()?, &database).await?;
-    let opencode_report = collect_opencode(&paths.opencode_roots()?, &database).await?;
-    let gemini_report = collect_gemini(&paths.gemini_root()?, &database).await?;
-    let cursor_report = collect_cursor(&paths.cursor_root()?, &database).await?;
-    let kimi_report = collect_kimi(&paths.kimi_root()?, &database).await?;
-    let sessions_available = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
-        .fetch_one(&database)
-        .await?;
-    let provider_session_counts = sqlx::query_as::<_, (String, i64)>(
-        "SELECT sources.provider, COUNT(sessions.id)
-         FROM sources
-         LEFT JOIN sessions ON sessions.source_id = sources.id
-         GROUP BY sources.provider",
-    )
-    .fetch_all(&database)
-    .await?
-    .into_iter()
-    .map(|(provider, count)| Ok((provider, u64::try_from(count)?)))
-    .collect::<Result<BTreeMap<_, _>, std::num::TryFromIntError>>()?;
-    database.close().await;
+    let catalog = Catalog::open(&paths.database_path).await?;
+    let mut scan_results = Vec::with_capacity(6);
+    for scanner in installed(paths.provider_roots()) {
+        let scanner = scanner?;
+        scan_results.push((
+            scanner.provider_id().as_str(),
+            catalog.scan(&*scanner).await?,
+        ));
+    }
+    let sessions_available = catalog.session_count().await?;
+    let provider_session_counts = catalog.provider_session_counts().await?;
+    catalog.close().await;
+
+    let provider_summaries = scan_results
+        .iter()
+        .map(|(provider, report)| ProviderScanSummary {
+            provider,
+            candidate_sources: report.candidate_sources,
+            refreshed_sources: report.refreshed_sources,
+            partial_sources: report.partial_sources,
+            failed_sources: report.failed_sources,
+            sessions_available: provider_sessions(&provider_session_counts, provider),
+        })
+        .collect::<Vec<_>>();
 
     Ok(ScanSummary {
         schema_version: SCHEMA_VERSION,
-        collectors_installed: 6,
-        sources_refreshed: codex_report.refreshed_sources
-            + claude_report.refreshed_sources
-            + opencode_report.refreshed_sources
-            + gemini_report.refreshed_sources
-            + cursor_report.refreshed_sources
-            + kimi_report.refreshed_sources,
-        sources_partial: codex_report.partial_sources
-            + claude_report.partial_sources
-            + opencode_report.partial_sources
-            + gemini_report.partial_sources
-            + cursor_report.partial_sources
-            + kimi_report.partial_sources,
-        sources_failed: codex_report.failed_sources
-            + claude_report.failed_sources
-            + opencode_report.failed_sources
-            + gemini_report.failed_sources
-            + cursor_report.failed_sources
-            + kimi_report.failed_sources,
-        sessions_available: u64::try_from(sessions_available)?,
-        provider_summaries: vec![
-            ProviderScanSummary {
-                provider: "codex",
-                candidate_sources: codex_report.candidate_sources,
-                refreshed_sources: codex_report.refreshed_sources,
-                partial_sources: codex_report.partial_sources,
-                failed_sources: codex_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "codex"),
-            },
-            ProviderScanSummary {
-                provider: "claude",
-                candidate_sources: claude_report.candidate_sources,
-                refreshed_sources: claude_report.refreshed_sources,
-                partial_sources: claude_report.partial_sources,
-                failed_sources: claude_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "claude"),
-            },
-            ProviderScanSummary {
-                provider: "opencode",
-                candidate_sources: opencode_report.candidate_sources,
-                refreshed_sources: opencode_report.refreshed_sources,
-                partial_sources: opencode_report.partial_sources,
-                failed_sources: opencode_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "opencode"),
-            },
-            ProviderScanSummary {
-                provider: "gemini",
-                candidate_sources: gemini_report.candidate_sources,
-                refreshed_sources: gemini_report.refreshed_sources,
-                partial_sources: gemini_report.partial_sources,
-                failed_sources: gemini_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "gemini"),
-            },
-            ProviderScanSummary {
-                provider: "cursor",
-                candidate_sources: cursor_report.candidate_sources,
-                refreshed_sources: cursor_report.refreshed_sources,
-                partial_sources: cursor_report.partial_sources,
-                failed_sources: cursor_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "cursor"),
-            },
-            ProviderScanSummary {
-                provider: "kimi",
-                candidate_sources: kimi_report.candidate_sources,
-                refreshed_sources: kimi_report.refreshed_sources,
-                partial_sources: kimi_report.partial_sources,
-                failed_sources: kimi_report.failed_sources,
-                sessions_available: provider_sessions(&provider_session_counts, "kimi"),
-            },
-        ],
+        collectors_installed: u8::try_from(scan_results.len()).unwrap_or(u8::MAX),
+        sources_refreshed: scan_results
+            .iter()
+            .map(|(_, report)| report.refreshed_sources)
+            .sum(),
+        sources_partial: scan_results
+            .iter()
+            .map(|(_, report)| report.partial_sources)
+            .sum(),
+        sources_failed: scan_results
+            .iter()
+            .map(|(_, report)| report.failed_sources)
+            .sum(),
+        sessions_available,
+        provider_summaries,
         message: "Provider sources were read without modifying provider-owned files".to_owned(),
     })
 }
@@ -161,9 +102,9 @@ pub async fn list_shell(
     limit: u32,
 ) -> anyhow::Result<Vec<CatalogSessionSummary>> {
     paths.ensure_data_dir()?;
-    let database = open_database(&paths.database_path).await?;
-    let sessions = list_catalog_sessions(&database, limit).await?;
-    database.close().await;
+    let catalog = Catalog::open(&paths.database_path).await?;
+    let sessions = catalog.list_sessions(limit).await?;
+    catalog.close().await;
     Ok(sessions)
 }
 
@@ -178,9 +119,9 @@ pub async fn show_shell(
     session_id: i64,
 ) -> anyhow::Result<CatalogSessionPreview> {
     paths.ensure_data_dir()?;
-    let database = open_database(&paths.database_path).await?;
-    let session = read_catalog_preview(&database, session_id, 80, 4 * 1024).await?;
-    database.close().await;
+    let catalog = Catalog::open(&paths.database_path).await?;
+    let session = catalog.preview(session_id).await?;
+    catalog.close().await;
     Ok(session)
 }
 
@@ -202,37 +143,7 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
         config_file: paths.config_path.clone(),
         data_directory: paths.data_dir.clone(),
         database: paths.database_path.clone(),
-        provider_sources: format!(
-            "Codex root (read-only): {}; Claude root (read-only): {}; OpenCode roots (read-only): {}; Gemini root (read-only): {}; Cursor root (read-only): {}; Kimi root (read-only): {}",
-            paths.codex_root().map_or_else(
-                |_| "unavailable".to_owned(),
-                |path| path.display().to_string()
-            ),
-            paths.claude_root().map_or_else(
-                |_| "unavailable".to_owned(),
-                |path| path.display().to_string()
-            ),
-            paths.opencode_roots().map_or_else(
-                |_| "unavailable".to_owned(),
-                |paths| paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            paths.gemini_root().map_or_else(
-                |_| "unavailable".to_owned(),
-                |path| path.display().to_string()
-            ),
-            paths.cursor_root().map_or_else(
-                |_| "unavailable".to_owned(),
-                |path| path.display().to_string()
-            ),
-            paths.kimi_root().map_or_else(
-                |_| "unavailable".to_owned(),
-                |path| path.display().to_string()
-            ),
-        ),
+        provider_sources: source_descriptions(paths.provider_roots()),
     }
 }
 
