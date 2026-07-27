@@ -1,17 +1,26 @@
 //! The small application workflows available before collectors are installed.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+};
 
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::{
     paths::AppPaths,
     providers::{installed, source_descriptions},
     storage::{
-        Catalog, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
-        SCHEMA_VERSION,
+        Catalog, CatalogFileIdentity, CatalogFileState, CatalogSessionPreview,
+        CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, clear_existing_catalog,
+        inspect_catalog_file_state, inspect_catalog_snapshot,
     },
 };
+
+const DATA_CLEAR_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Observable result of a read-only provider scan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -180,17 +189,404 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
     }
 }
 
+/// The exact Agentlog-owned catalog target described before a clear operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DataClearSummary {
+    pub database: PathBuf,
+    pub sessions: u64,
+    pub transcript_items: u64,
+    pub approximate_bytes: u64,
+    pub cleared: bool,
+}
+
+/// Reports, and when explicitly confirmed clears, only the Agentlog-owned
+/// catalog contents.
+///
+/// The database path is fixed by [`AppPaths`]; configuration and provider-owned
+/// source paths are neither opened for writing nor selected for deletion.
+///
+/// # Errors
+///
+/// Previewing reads a bounded private copy of the `SQLite` main/WAL contents,
+/// while fingerprinting the complete main/WAL/SHM file set, so it never opens
+/// or writes the live catalog. Confirmation obtains `SQLite` writer
+/// serialization and clears rows in one transaction while preserving the
+/// schema and database files.
+///
+/// Returns an error when the database is not a regular Agentlog v1 catalog, a
+/// file changes while the private preview snapshot is taken, or an explicitly
+/// requested clear cannot acquire `SQLite`'s writer lock.
+pub async fn clear_data_shell(
+    paths: &AppPaths,
+    confirmed: bool,
+) -> anyhow::Result<DataClearSummary> {
+    if confirmed {
+        let Some(target) = inspect_confirmed_clear_target(&paths.database_path)? else {
+            return Ok(empty_data_clear_summary(paths));
+        };
+        let counts = clear_existing_catalog(&paths.database_path, target.database_identity)
+            .await
+            .with_context(|| {
+                format!(
+                    "clear Agentlog-owned database {}",
+                    paths.database_path.display()
+                )
+            })?;
+        return Ok(DataClearSummary {
+            database: paths.database_path.clone(),
+            sessions: counts.sessions,
+            transcript_items: counts.transcript_items,
+            approximate_bytes: target.approximate_bytes,
+            cleared: true,
+        });
+    }
+
+    let Some(target) = inspect_clear_target(&paths.database_path)? else {
+        return Ok(empty_data_clear_summary(paths));
+    };
+    let counts = inspect_catalog_snapshot(&target.snapshot_database)
+        .await
+        .with_context(|| {
+            format!(
+                "validate private snapshot of Agentlog-owned database {}",
+                paths.database_path.display()
+            )
+        })?;
+    Ok(DataClearSummary {
+        database: paths.database_path.clone(),
+        sessions: counts.sessions,
+        transcript_items: counts.transcript_items,
+        approximate_bytes: target.approximate_bytes,
+        cleared: false,
+    })
+}
+
+fn empty_data_clear_summary(paths: &AppPaths) -> DataClearSummary {
+    DataClearSummary {
+        database: paths.database_path.clone(),
+        sessions: 0,
+        transcript_items: 0,
+        approximate_bytes: 0,
+        cleared: false,
+    }
+}
+
+#[derive(Debug)]
+struct ClearTarget {
+    approximate_bytes: u64,
+    _snapshot_directory: tempfile::TempDir,
+    snapshot_database: PathBuf,
+}
+
+struct ConfirmedClearTarget {
+    approximate_bytes: u64,
+    database_identity: CatalogFileIdentity,
+}
+
+fn inspect_confirmed_clear_target(database: &Path) -> anyhow::Result<Option<ConfirmedClearTarget>> {
+    let Some(files) = inspect_catalog_file_set(database)? else {
+        return Ok(None);
+    };
+    let approximate_bytes =
+        catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
+    let database_identity = files
+        .first()
+        .context("catalog file set is missing its main database")?
+        .state
+        .identity;
+    Ok(Some(ConfirmedClearTarget {
+        approximate_bytes,
+        database_identity,
+    }))
+}
+
+fn inspect_clear_target(database: &Path) -> anyhow::Result<Option<ClearTarget>> {
+    inspect_clear_target_with_hook(database, || {})
+}
+
+fn inspect_clear_target_with_hook(
+    database: &Path,
+    after_copy: impl FnOnce(),
+) -> anyhow::Result<Option<ClearTarget>> {
+    let Some(files) = read_catalog_file_set(database)? else {
+        return Ok(None);
+    };
+    let approximate_bytes =
+        catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
+    let snapshot_directory = tempfile::Builder::new()
+        .prefix("agentlog-data-clear-")
+        .tempdir_in("/private/tmp")
+        .context("create private catalog inspection snapshot")?;
+    let snapshot_database = snapshot_directory.path().join("agentlog.sqlite3");
+    for file in &files {
+        if file.suffix == Some("-shm") {
+            continue;
+        }
+        let snapshot_path = if file.is_main {
+            snapshot_database.clone()
+        } else {
+            sqlite_sidecar_path(&snapshot_database, file.suffix.expect("sidecar suffix"))
+        };
+        fs::write(&snapshot_path, &file.bytes)
+            .with_context(|| format!("write private snapshot {}", snapshot_path.display()))?;
+    }
+    after_copy();
+    validate_catalog_file_set(database, &files)?;
+
+    Ok(Some(ClearTarget {
+        approximate_bytes,
+        _snapshot_directory: snapshot_directory,
+        snapshot_database,
+    }))
+}
+
+fn catalog_file_set_size(
+    database: &Path,
+    lengths: impl IntoIterator<Item = u64>,
+) -> anyhow::Result<u64> {
+    let approximate_bytes = lengths.into_iter().try_fold(0_u64, |total, length| {
+        total
+            .checked_add(length)
+            .context("database size exceeds supported range")
+    })?;
+    if approximate_bytes > DATA_CLEAR_SNAPSHOT_MAX_BYTES {
+        anyhow::bail!(
+            "refusing to inspect {}; the SQLite file set exceeds the {} byte snapshot limit",
+            database.display(),
+            DATA_CLEAR_SNAPSHOT_MAX_BYTES
+        );
+    }
+    Ok(approximate_bytes)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogFile {
+    path: PathBuf,
+    suffix: Option<&'static str>,
+    is_main: bool,
+    state: CatalogFileState,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogFileDescriptor {
+    path: PathBuf,
+    suffix: Option<&'static str>,
+    is_main: bool,
+    state: CatalogFileState,
+}
+
+fn inspect_catalog_file_set(database: &Path) -> anyhow::Result<Option<Vec<CatalogFileDescriptor>>> {
+    let Some(main) = inspect_catalog_file_state(database)? else {
+        return Ok(None);
+    };
+    let mut files = vec![CatalogFileDescriptor {
+        path: database.to_path_buf(),
+        suffix: None,
+        is_main: true,
+        state: main,
+    }];
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(database, suffix);
+        if let Some(state) = inspect_catalog_file_state(&sidecar)? {
+            files.push(CatalogFileDescriptor {
+                path: sidecar,
+                state,
+                is_main: false,
+                suffix: Some(suffix),
+            });
+        }
+    }
+    Ok(Some(files))
+}
+
+fn read_catalog_file_set(database: &Path) -> anyhow::Result<Option<Vec<CatalogFile>>> {
+    let Some(descriptors) = inspect_catalog_file_set(database)? else {
+        return Ok(None);
+    };
+    catalog_file_set_size(
+        database,
+        descriptors.iter().map(|descriptor| descriptor.state.length),
+    )?;
+    descriptors
+        .iter()
+        .map(read_catalog_file)
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn read_catalog_file(descriptor: &CatalogFileDescriptor) -> anyhow::Result<CatalogFile> {
+    let file = File::open(&descriptor.path)
+        .with_context(|| format!("read Agentlog database file {}", descriptor.path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("inspect opened database file {}", descriptor.path.display()))?;
+    let opened_state = CatalogFileState::from_metadata(&descriptor.path, &opened_metadata)?;
+    if opened_state != descriptor.state {
+        return catalog_changed();
+    }
+
+    let read_limit = descriptor
+        .state
+        .length
+        .checked_add(1)
+        .context("database size exceeds supported range")?;
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read Agentlog database file {}", descriptor.path.display()))?;
+    if u64::try_from(bytes.len()).ok() != Some(descriptor.state.length) {
+        return catalog_changed();
+    }
+
+    Ok(CatalogFile {
+        path: descriptor.path.clone(),
+        suffix: descriptor.suffix,
+        is_main: descriptor.is_main,
+        state: descriptor.state,
+        bytes,
+    })
+}
+
+fn validate_catalog_file_set(database: &Path, expected: &[CatalogFile]) -> anyhow::Result<()> {
+    let Some(current) = inspect_catalog_file_set(database)? else {
+        return catalog_changed();
+    };
+    catalog_file_set_size(
+        database,
+        current.iter().map(|descriptor| descriptor.state.length),
+    )?;
+    if !catalog_file_descriptors_match(&current, expected) {
+        return catalog_changed();
+    }
+
+    for (descriptor, expected) in current.iter().zip(expected) {
+        if read_catalog_file(descriptor)?.bytes != expected.bytes {
+            return catalog_changed();
+        }
+    }
+    let Some(final_state) = inspect_catalog_file_set(database)? else {
+        return catalog_changed();
+    };
+    if !catalog_file_descriptors_match(&final_state, expected) {
+        return catalog_changed();
+    }
+    Ok(())
+}
+
+fn catalog_file_descriptors_match(
+    current: &[CatalogFileDescriptor],
+    expected: &[CatalogFile],
+) -> bool {
+    current.len() == expected.len()
+        && current.iter().zip(expected).all(|(current, expected)| {
+            current.path == expected.path
+                && current.suffix == expected.suffix
+                && current.is_main == expected.is_main
+                && current.state == expected.state
+        })
+}
+
+fn catalog_changed<T>() -> anyhow::Result<T> {
+    Err(anyhow::anyhow!(
+        "Agentlog database file set changed while preparing a read-only clear preview; retry the command"
+    ))
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use std::fs;
 
-    use crate::{
-        paths::AppPaths, providers::opencode::create_test_database, storage::SCHEMA_VERSION,
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
 
-    use super::{diagnostics_shell, scan_shell};
+    use crate::{
+        paths::AppPaths,
+        providers::opencode::create_test_database,
+        storage::{SCHEMA_VERSION, open_database},
+    };
+
+    use super::{
+        DATA_CLEAR_SNAPSHOT_MAX_BYTES, clear_data_shell, diagnostics_shell, inspect_clear_target,
+        inspect_clear_target_with_hook, list_shell, scan_shell, sqlite_sidecar_path,
+    };
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct FileFingerprint {
+        bytes: Vec<u8>,
+        length: u64,
+        modified: std::time::SystemTime,
+    }
+
+    fn fingerprint(path: &std::path::Path) -> FileFingerprint {
+        let metadata = fs::metadata(path).expect("file metadata");
+        FileFingerprint {
+            bytes: fs::read(path).expect("file bytes"),
+            length: metadata.len(),
+            modified: metadata.modified().expect("file modification time"),
+        }
+    }
+
+    fn directory_fingerprint(directory: &std::path::Path) -> Vec<(String, FileFingerprint)> {
+        let mut files = fs::read_dir(directory)
+            .expect("read Agentlog data directory")
+            .map(|entry| {
+                let entry = entry.expect("directory entry");
+                (
+                    entry
+                        .file_name()
+                        .into_string()
+                        .expect("test filenames are UTF-8"),
+                    fingerprint(&entry.path()),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    async fn scanned_data_clear_fixture() -> (TempDir, AppPaths, std::path::PathBuf) {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        let gemini_root = temporary.path().join("gemini");
+        let source = gemini_root.join("tmp/session.jsonl");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir_all(source.parent().expect("Gemini source parent"))
+            .expect("create Gemini directory");
+        fs::write(
+            &source,
+            "{\"sessionId\":\"clear-session\"}\n{\"type\":\"user\",\"content\":\"retained request\"}\n",
+        )
+        .expect("write provider source");
+        let config = format!(
+            "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
+            temporary.path().join("empty-codex").display(),
+            temporary.path().join("empty-claude").display(),
+            temporary.path().join("empty-opencode").display(),
+            gemini_root.display(),
+            temporary.path().join("empty-cursor").display(),
+            temporary.path().join("empty-kimi").display(),
+        );
+        fs::write(agentlog_home.join("config.toml"), config).expect("write config");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let scan = scan_shell(&paths).await.expect("scan fixture source");
+        assert_eq!(scan.sessions_available, 1);
+
+        (temporary, paths, source)
+    }
 
     #[tokio::test]
     async fn diagnostics_shell_opens_the_catalog_without_scanning_sources() {
@@ -205,6 +601,263 @@ mod tests {
 
         assert!(diagnostics.is_empty());
         assert!(paths.database_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn data_clear_preview_and_missing_confirmation_leave_all_inputs_unchanged() {
+        let (_temporary, paths, source) = scanned_data_clear_fixture().await;
+        let writer = open_database(&paths.database_path)
+            .await
+            .expect("open catalog to retain live WAL sidecars");
+        sqlx::query(
+            "INSERT INTO sources (provider, source_format, canonical_locator) VALUES ('test', 'test', 'test://sidecar')",
+        )
+        .execute(&writer)
+        .await
+        .expect("write catalog WAL frame");
+        let live_shm = sqlite_sidecar_path(&paths.database_path, "-shm");
+        assert!(live_shm.is_file(), "live WAL database has an SHM sidecar");
+        let private_target = inspect_clear_target(&paths.database_path)
+            .expect("copy private clear target")
+            .expect("catalog target exists");
+        assert!(
+            !sqlite_sidecar_path(&private_target.snapshot_database, "-shm").exists(),
+            "live SHM is not copied into the private snapshot"
+        );
+        drop(private_target);
+        let database_before = directory_fingerprint(&paths.data_dir);
+        let config_before = fingerprint(&paths.config_path);
+        let source_before = fingerprint(&source);
+
+        let dry_run = clear_data_shell(&paths, false)
+            .await
+            .expect("preview data clear");
+        assert_eq!(dry_run.sessions, 1);
+        assert_eq!(dry_run.transcript_items, 1);
+        assert!(dry_run.approximate_bytes > 0);
+        assert!(!dry_run.cleared);
+        assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
+
+        let without_yes = clear_data_shell(&paths, false)
+            .await
+            .expect("reject unconfirmed clear");
+        assert!(!without_yes.cleared);
+        assert!(paths.database_path.is_file());
+        assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
+        assert_eq!(fingerprint(&paths.config_path), config_before);
+        assert_eq!(fingerprint(&source), source_before);
+        writer.close().await;
+    }
+
+    #[tokio::test]
+    async fn data_clear_preview_rejects_a_file_set_presence_change_during_snapshot() {
+        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+        let shm = sqlite_sidecar_path(&paths.database_path, "-shm");
+        let moved_shm = temporary.path().join("moved-agentlog-shm");
+        let shm_was_present = shm.exists();
+
+        let error = inspect_clear_target_with_hook(&paths.database_path, || {
+            if shm_was_present {
+                fs::rename(&shm, &moved_shm).expect("move existing SHM during snapshot");
+            } else {
+                fs::write(&shm, b"appeared during snapshot").expect("create SHM during snapshot");
+            }
+        })
+        .expect_err("reject changed SQLite file-set presence");
+
+        assert!(format!("{error:#}").contains("file set changed"));
+    }
+
+    #[test]
+    fn data_clear_snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = temporary.path().join("agentlog.sqlite3");
+        let file = fs::File::create(&database).expect("create sparse database");
+        file.set_len(DATA_CLEAR_SNAPSHOT_MAX_BYTES + 1)
+            .expect("size sparse database");
+
+        let error =
+            inspect_clear_target(&database).expect_err("reject oversized metadata before reading");
+
+        assert!(format!("{error:#}").contains("exceeds the 536870912 byte snapshot limit"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_data_clear_reports_counts_from_its_clear_transaction() {
+        let (_temporary, paths, _source) = scanned_data_clear_fixture().await;
+        let preview = clear_data_shell(&paths, false)
+            .await
+            .expect("preview initial catalog");
+        assert_eq!(preview.sessions, 1);
+        assert_eq!(preview.transcript_items, 1);
+
+        let writer = open_database(&paths.database_path)
+            .await
+            .expect("open catalog for intervening write");
+        let source_id = sqlx::query(
+            "INSERT INTO sources (provider, source_format, canonical_locator)
+             VALUES ('test', 'test', 'test://transaction-counts')",
+        )
+        .execute(&writer)
+        .await
+        .expect("insert intervening source")
+        .last_insert_rowid();
+        let session_id = sqlx::query(
+            "INSERT INTO sessions (source_id, session_key, title)
+             VALUES (?, 'transaction-counts', 'intervening session')",
+        )
+        .bind(source_id)
+        .execute(&writer)
+        .await
+        .expect("insert intervening session")
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO transcript_items (session_id, ordinal, item_kind, content)
+             VALUES (?, 0, 'user_text', 'intervening item')",
+        )
+        .bind(session_id)
+        .execute(&writer)
+        .await
+        .expect("insert intervening transcript item");
+        writer.close().await;
+
+        let cleared = clear_data_shell(&paths, true)
+            .await
+            .expect("clear current transaction contents");
+        assert_eq!(cleared.sessions, 2);
+        assert_eq!(cleared.transcript_items, 2);
+        assert!(cleared.cleared);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_data_clear_rejects_a_final_component_symlink() {
+        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+        let real_database = temporary.path().join("real-agentlog.sqlite3");
+        fs::rename(&paths.database_path, &real_database).expect("move real database");
+        symlink(&real_database, &paths.database_path).expect("link database path");
+        let real_before = fingerprint(&real_database);
+
+        let error = clear_data_shell(&paths, true)
+            .await
+            .expect_err("reject final database symlink");
+
+        assert!(format!("{error:#}").contains("symbolic-link component"));
+        assert_eq!(fingerprint(&real_database), real_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_data_clear_rejects_an_ancestor_symlink() {
+        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+        let alias = temporary.path().join("agentlog-alias");
+        symlink(&paths.data_dir, &alias).expect("link Agentlog home");
+        let aliased_paths = AppPaths::resolve(Some(alias)).expect("resolve aliased paths");
+        let before = directory_fingerprint(&paths.data_dir);
+
+        let error = clear_data_shell(&aliased_paths, true)
+            .await
+            .expect_err("reject Agentlog home symlink");
+
+        assert!(format!("{error:#}").contains("symbolic-link component"));
+        assert_eq!(directory_fingerprint(&paths.data_dir), before);
+    }
+
+    #[tokio::test]
+    async fn confirmed_data_clear_empties_only_catalog_and_a_fresh_scan_rebuilds_it() {
+        let (_temporary, paths, source) = scanned_data_clear_fixture().await;
+        let config_before = fingerprint(&paths.config_path);
+        let source_before = fingerprint(&source);
+
+        let cleared = clear_data_shell(&paths, true)
+            .await
+            .expect("confirm data clear");
+        assert!(cleared.cleared);
+        assert_eq!(cleared.sessions, 1);
+        assert_eq!(cleared.transcript_items, 1);
+        assert!(paths.database_path.is_file());
+        assert_eq!(fingerprint(&paths.config_path), config_before);
+        assert_eq!(fingerprint(&source), source_before);
+
+        assert!(
+            list_shell(&paths, 10)
+                .await
+                .expect("list cleared catalog")
+                .is_empty()
+        );
+        assert!(
+            diagnostics_shell(&paths)
+                .await
+                .expect("list cleared diagnostics")
+                .is_empty()
+        );
+
+        let rebuilt = scan_shell(&paths)
+            .await
+            .expect("fresh scan rebuilds catalog");
+        assert_eq!(rebuilt.sessions_available, 1);
+        let sessions = list_shell(&paths, 10).await.expect("list rebuilt catalog");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("retained request"));
+    }
+
+    #[tokio::test]
+    async fn data_clear_rejects_a_lookalike_v1_database_without_changing_it() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&paths.database_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("create lookalike database");
+        for statement in [
+            "CREATE TABLE sources (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE transcript_items (id INTEGER PRIMARY KEY)",
+            "PRAGMA user_version = 1",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create lookalike schema");
+        }
+        pool.close().await;
+        let before = directory_fingerprint(&paths.data_dir);
+
+        let error = clear_data_shell(&paths, false)
+            .await
+            .expect_err("reject lookalike database");
+        assert!(format!("{error:#}").contains("schema v1 fingerprint"));
+        assert_eq!(directory_fingerprint(&paths.data_dir), before);
+    }
+
+    #[tokio::test]
+    async fn confirmed_data_clear_fails_when_another_sqlite_writer_is_active() {
+        let (_temporary, paths, _source) = scanned_data_clear_fixture().await;
+        let writer: SqlitePool = open_database(&paths.database_path)
+            .await
+            .expect("open competing writer");
+        let transaction = writer
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold SQLite writer lock");
+
+        assert!(clear_data_shell(&paths, true).await.is_err());
+        transaction.rollback().await.expect("release writer lock");
+        writer.close().await;
+        assert_eq!(
+            list_shell(&paths, 10)
+                .await
+                .expect("list retained catalog")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

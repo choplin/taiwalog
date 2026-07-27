@@ -6,9 +6,13 @@
 
 use std::{
     collections::BTreeMap,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    fs,
+    path::{Component, Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use serde::Serialize;
 use sqlx::{
@@ -21,10 +25,91 @@ use crate::providers::{ProviderScanError, ProviderScanReport, ProviderScanner, S
 
 pub const SCHEMA_VERSION: i64 = 1;
 const TRANSCRIPT_ITEM_INSERT_CHUNK: usize = 500;
+const MAX_CATALOG_PATH_COMPONENTS: usize = 128;
+const CREATE_SOURCES: &str = "CREATE TABLE sources (\n             id INTEGER PRIMARY KEY,\n             provider TEXT NOT NULL,\n             source_format TEXT NOT NULL,\n             canonical_locator TEXT NOT NULL,\n             last_success_at INTEGER,\n             diagnostic_status TEXT NOT NULL DEFAULT 'unknown' CHECK(diagnostic_status IN ('unknown', 'ok', 'partial', 'error')),\n             diagnostic_message TEXT,\n             diagnostic_recorded_at INTEGER,\n             UNIQUE(provider, source_format, canonical_locator)\n         )";
+const CREATE_SESSIONS: &str = "CREATE TABLE sessions (\n             id INTEGER PRIMARY KEY,\n             source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,\n             session_key TEXT NOT NULL,\n             title TEXT,\n             repository TEXT,\n             cwd TEXT,\n             model TEXT,\n             execution_kind TEXT,\n             started_at INTEGER,\n             last_visible_event_at INTEGER,\n             UNIQUE(source_id, session_key)\n         )";
+const CREATE_TRANSCRIPT_ITEMS: &str = "CREATE TABLE transcript_items (\n             id INTEGER PRIMARY KEY,\n             session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\n             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),\n             item_kind TEXT NOT NULL CHECK(item_kind IN ('user_text', 'assistant_text', 'tool_marker')),\n             content TEXT,\n             tool_name TEXT,\n             tool_status TEXT,\n             UNIQUE(session_id, ordinal),\n             CHECK((item_kind IN ('user_text', 'assistant_text') AND content IS NOT NULL AND tool_name IS NULL AND tool_status IS NULL)\n                OR (item_kind = 'tool_marker' AND content IS NULL AND tool_name IS NOT NULL))\n         )";
+const CREATE_SESSIONS_RECENT_INDEX: &str =
+    "CREATE INDEX sessions_recent ON sessions(last_visible_event_at DESC, started_at DESC)";
 
 /// Agentlog's durable catalog and the use cases that preserve its invariants.
 pub struct Catalog {
     pool: SqlitePool,
+}
+
+/// Counts retained in an existing, validated Agentlog catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogCounts {
+    pub sessions: u64,
+    pub transcript_items: u64,
+}
+
+/// Stable identity and observable metadata for one inspected catalog file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogFileState {
+    pub identity: CatalogFileIdentity,
+    pub length: u64,
+    pub modified: SystemTime,
+}
+
+/// Operating-system identity for the exact regular file inspected by Agentlog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    length: u64,
+    #[cfg(not(unix))]
+    modified: SystemTime,
+}
+
+impl CatalogFileState {
+    pub(crate) fn from_metadata(
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> Result<Self, StorageError> {
+        let modified = metadata
+            .modified()
+            .map_err(|source| StorageError::CatalogPathIo {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(Self {
+            identity: CatalogFileIdentity::from_metadata(metadata, modified),
+            length: metadata.len(),
+            modified,
+        })
+    }
+}
+
+impl CatalogFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata, modified: SystemTime) -> Self {
+        #[cfg(unix)]
+        {
+            let _ = modified;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                length: metadata.len(),
+                modified,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
 }
 
 impl Catalog {
@@ -341,6 +426,202 @@ pub async fn open_database(path: &Path) -> Result<SqlitePool, StorageError> {
     Ok(pool)
 }
 
+/// Inspects an existing catalog snapshot without creating or modifying it.
+///
+/// Callers must pass a private writable snapshot rather than the live Agentlog
+/// catalog. The snapshot may include a `SQLite` WAL; `SQLite` creates a private
+/// SHM file as needed without changing the catalog being described.
+///
+/// # Errors
+///
+/// Returns an error when the private database cannot be opened, does not contain
+/// the current Agentlog schema, or its counts cannot be represented.
+pub async fn inspect_catalog_snapshot(path: &Path) -> Result<CatalogCounts, StorageError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(StorageError::Connect)?;
+
+    validate_existing_schema(&pool).await?;
+    let sessions = count_rows(&pool, "sessions").await?;
+    let transcript_items = count_rows(&pool, "transcript_items").await?;
+    pool.close().await;
+
+    Ok(CatalogCounts {
+        sessions,
+        transcript_items,
+    })
+}
+
+/// Inspects a regular catalog file through a symlink-free bounded path.
+///
+/// A missing component means that the requested catalog does not exist. Any
+/// symbolic-link component or non-directory ancestor is rejected.
+pub(crate) fn inspect_catalog_file_state(
+    path: &Path,
+) -> Result<Option<CatalogFileState>, StorageError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| StorageError::CatalogPathIo {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let components = absolute.components().collect::<Vec<_>>();
+    let normal_components = components
+        .iter()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    if normal_components > MAX_CATALOG_PATH_COMPONENTS {
+        return Err(StorageError::UnsafeCatalogPath {
+            path: path.to_path_buf(),
+            reason: "has too many path components",
+        });
+    }
+
+    let mut inspected = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                inspected.push(component.as_os_str());
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(StorageError::UnsafeCatalogPath {
+                    path: path.to_path_buf(),
+                    reason: "contains a parent-directory component",
+                });
+            }
+        }
+        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+
+        let metadata = match fs::symlink_metadata(&inspected) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StorageError::CatalogPathIo {
+                    path: inspected,
+                    source,
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(StorageError::UnsafeCatalogPath {
+                path: inspected,
+                reason: "contains a symbolic-link component",
+            });
+        }
+
+        let is_final = index + 1 == components.len();
+        if !is_final && !metadata.is_dir() {
+            return Err(StorageError::UnsafeCatalogPath {
+                path: inspected,
+                reason: "contains a non-directory ancestor",
+            });
+        }
+        if is_final {
+            if !metadata.is_file() {
+                return Err(StorageError::UnsafeCatalogPath {
+                    path: inspected,
+                    reason: "does not name a regular file",
+                });
+            }
+            return CatalogFileState::from_metadata(&inspected, &metadata).map(Some);
+        }
+    }
+
+    Err(StorageError::UnsafeCatalogPath {
+        path: path.to_path_buf(),
+        reason: "does not name a file",
+    })
+}
+
+fn verify_catalog_file_identity(
+    path: &Path,
+    expected: CatalogFileIdentity,
+) -> Result<(), StorageError> {
+    match inspect_catalog_file_state(path)? {
+        Some(actual) if actual.identity == expected => Ok(()),
+        Some(_) | None => Err(StorageError::CatalogFileIdentityChanged {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+/// Acquires `SQLite`'s writer serialization and clears every catalog row.
+///
+/// Schema validation, retained-count collection, and row deletion happen in
+/// one `BEGIN IMMEDIATE` transaction. The schema itself remains so a later
+/// scan can rebuild the catalog without recreating the database file.
+///
+/// # Errors
+///
+/// Returns an error when another writer is active, the database is not the
+/// exact Agentlog v1 schema, or the transaction cannot be committed.
+pub(crate) async fn clear_existing_catalog(
+    path: &Path,
+    expected_identity: CatalogFileIdentity,
+) -> Result<CatalogCounts, StorageError> {
+    clear_existing_catalog_with_hook(path, expected_identity, || {}).await
+}
+
+async fn clear_existing_catalog_with_hook(
+    path: &Path,
+    expected_identity: CatalogFileIdentity,
+    after_open: impl FnOnce(),
+) -> Result<CatalogCounts, StorageError> {
+    verify_catalog_file_identity(path, expected_identity)?;
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(Duration::ZERO);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(StorageError::Connect)?;
+
+    after_open();
+    if let Err(error) = verify_catalog_file_identity(path, expected_identity) {
+        pool.close().await;
+        return Err(error);
+    }
+
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StorageError::Query)?;
+    verify_catalog_file_identity(path, expected_identity)?;
+    validate_existing_schema_in_transaction(&mut transaction).await?;
+    let counts = CatalogCounts {
+        sessions: count_rows_in_transaction(&mut transaction, "sessions").await?,
+        transcript_items: count_rows_in_transaction(&mut transaction, "transcript_items").await?,
+    };
+    sqlx::query("DELETE FROM sources")
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
+    if let Err(error) = verify_catalog_file_identity(path, expected_identity) {
+        transaction.rollback().await.map_err(StorageError::Query)?;
+        pool.close().await;
+        return Err(error);
+    }
+    transaction.commit().await.map_err(StorageError::Query)?;
+    pool.close().await;
+    Ok(counts)
+}
+
 /// Initializes only a truly empty database, or validates the current v1 marker.
 ///
 /// # Errors
@@ -351,11 +632,151 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<(), StorageError> {
     let version = scalar_i64(pool, "PRAGMA user_version").await?;
 
     match version {
-        SCHEMA_VERSION => verify_v1_tables(pool).await,
+        SCHEMA_VERSION => validate_existing_schema(pool).await,
         0 if database_has_no_user_objects(pool).await? => create_v1_schema(pool).await,
         0 => Err(StorageError::UnversionedDatabase),
         other => Err(StorageError::UnsupportedSchemaVersion { found: other }),
     }
+}
+
+async fn validate_existing_schema(pool: &SqlitePool) -> Result<(), StorageError> {
+    let version = scalar_i64(pool, "PRAGMA user_version").await?;
+    let objects = schema_objects(pool).await?;
+    validate_schema_fingerprint(version, &objects)
+}
+
+async fn validate_existing_schema_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StorageError> {
+    let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(StorageError::Query)?;
+    let objects = schema_objects_in_transaction(transaction).await?;
+    validate_schema_fingerprint(version, &objects)
+}
+
+async fn count_rows(pool: &SqlitePool, table: &'static str) -> Result<u64, StorageError> {
+    count_rows_from_pool(pool, table).await
+}
+
+async fn count_rows_from_pool(pool: &SqlitePool, table: &'static str) -> Result<u64, StorageError> {
+    let query = count_query(table);
+    let count = scalar_i64(pool, query).await?;
+    u64::try_from(count).map_err(|_| StorageError::CountOutOfRange)
+}
+
+async fn count_rows_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &'static str,
+) -> Result<u64, StorageError> {
+    let query = count_query(table);
+    let count = sqlx::query_scalar::<_, i64>(query)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(StorageError::Query)?;
+    u64::try_from(count).map_err(|_| StorageError::CountOutOfRange)
+}
+
+fn count_query(table: &'static str) -> &'static str {
+    match table {
+        "sessions" => "SELECT COUNT(*) FROM sessions",
+        "transcript_items" => "SELECT COUNT(*) FROM transcript_items",
+        _ => unreachable!("only catalog tables are counted"),
+    }
+}
+
+async fn schema_objects(pool: &SqlitePool) -> Result<Vec<SchemaObject>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT type, name, tbl_name, sql
+         FROM sqlite_master
+         WHERE type IN ('table', 'index', 'trigger', 'view')
+           AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::Query)?;
+    schema_objects_from_rows(&rows)
+}
+
+async fn schema_objects_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<SchemaObject>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT type, name, tbl_name, sql
+         FROM sqlite_master
+         WHERE type IN ('table', 'index', 'trigger', 'view')
+           AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(StorageError::Query)?;
+    schema_objects_from_rows(&rows)
+}
+
+fn schema_objects_from_rows(
+    rows: &[sqlx::sqlite::SqliteRow],
+) -> Result<Vec<SchemaObject>, StorageError> {
+    let mut objects = rows
+        .iter()
+        .map(|row| {
+            Ok(SchemaObject {
+                object_type: row.try_get("type").map_err(StorageError::Query)?,
+                name: row.try_get("name").map_err(StorageError::Query)?,
+                table_name: row.try_get("tbl_name").map_err(StorageError::Query)?,
+                sql: row.try_get("sql").map_err(StorageError::Query)?,
+            })
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    objects.sort();
+    Ok(objects)
+}
+
+fn validate_schema_fingerprint(version: i64, actual: &[SchemaObject]) -> Result<(), StorageError> {
+    if version != SCHEMA_VERSION {
+        return Err(if version == 0 {
+            StorageError::UnversionedDatabase
+        } else {
+            StorageError::UnsupportedSchemaVersion { found: version }
+        });
+    }
+
+    if actual == expected_schema_objects() {
+        Ok(())
+    } else {
+        Err(StorageError::SchemaFingerprintMismatch)
+    }
+}
+
+fn expected_schema_objects() -> Vec<SchemaObject> {
+    let mut expected = vec![
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "sources".to_owned(),
+            table_name: "sources".to_owned(),
+            sql: Some(CREATE_SOURCES.to_owned()),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "sessions".to_owned(),
+            table_name: "sessions".to_owned(),
+            sql: Some(CREATE_SESSIONS.to_owned()),
+        },
+        SchemaObject {
+            object_type: "table".to_owned(),
+            name: "transcript_items".to_owned(),
+            table_name: "transcript_items".to_owned(),
+            sql: Some(CREATE_TRANSCRIPT_ITEMS.to_owned()),
+        },
+        SchemaObject {
+            object_type: "index".to_owned(),
+            name: "sessions_recent".to_owned(),
+            table_name: "sessions".to_owned(),
+            sql: Some(CREATE_SESSIONS_RECENT_INDEX.to_owned()),
+        },
+    ];
+    expected.sort();
+    expected
 }
 
 /// Atomically replaces the normalized sessions for one successfully read source.
@@ -863,57 +1284,31 @@ async fn database_has_no_user_objects(pool: &SqlitePool) -> Result<bool, Storage
 async fn create_v1_schema(pool: &SqlitePool) -> Result<(), StorageError> {
     let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
 
-    sqlx::query(
-        "CREATE TABLE sources (\n             id INTEGER PRIMARY KEY,\n             provider TEXT NOT NULL,\n             source_format TEXT NOT NULL,\n             canonical_locator TEXT NOT NULL,\n             last_success_at INTEGER,\n             diagnostic_status TEXT NOT NULL DEFAULT 'unknown' CHECK(diagnostic_status IN ('unknown', 'ok', 'partial', 'error')),\n             diagnostic_message TEXT,\n             diagnostic_recorded_at INTEGER,\n             UNIQUE(provider, source_format, canonical_locator)\n         )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(StorageError::Query)?;
+    sqlx::query(CREATE_SOURCES)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
 
-    sqlx::query(
-        "CREATE TABLE sessions (\n             id INTEGER PRIMARY KEY,\n             source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,\n             session_key TEXT NOT NULL,\n             title TEXT,\n             repository TEXT,\n             cwd TEXT,\n             model TEXT,\n             execution_kind TEXT,\n             started_at INTEGER,\n             last_visible_event_at INTEGER,\n             UNIQUE(source_id, session_key)\n         )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(StorageError::Query)?;
+    sqlx::query(CREATE_SESSIONS)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
 
-    sqlx::query(
-        "CREATE TABLE transcript_items (\n             id INTEGER PRIMARY KEY,\n             session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\n             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),\n             item_kind TEXT NOT NULL CHECK(item_kind IN ('user_text', 'assistant_text', 'tool_marker')),\n             content TEXT,\n             tool_name TEXT,\n             tool_status TEXT,\n             UNIQUE(session_id, ordinal),\n             CHECK((item_kind IN ('user_text', 'assistant_text') AND content IS NOT NULL AND tool_name IS NULL AND tool_status IS NULL)\n                OR (item_kind = 'tool_marker' AND content IS NULL AND tool_name IS NOT NULL))\n         )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(StorageError::Query)?;
+    sqlx::query(CREATE_TRANSCRIPT_ITEMS)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
 
-    sqlx::query(
-        "CREATE INDEX sessions_recent ON sessions(last_visible_event_at DESC, started_at DESC)",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(StorageError::Query)?;
+    sqlx::query(CREATE_SESSIONS_RECENT_INDEX)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::Query)?;
     sqlx::query("PRAGMA user_version = 1")
         .execute(&mut *transaction)
         .await
         .map_err(StorageError::Query)?;
 
     transaction.commit().await.map_err(StorageError::Query)
-}
-
-async fn verify_v1_tables(pool: &SqlitePool) -> Result<(), StorageError> {
-    for table in ["sources", "sessions", "transcript_items"] {
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(\n                 SELECT 1\n                 FROM sqlite_master\n                 WHERE type = 'table'\n                   AND name = ?\n             )",
-        )
-        .bind(table)
-        .fetch_one(pool)
-        .await
-        .map_err(StorageError::Query)?;
-
-        if exists == 0 {
-            return Err(StorageError::IncompleteV1Schema { table });
-        }
-    }
-
-    Ok(())
 }
 
 /// Failures while opening or validating Agentlog's `SQLite` catalog.
@@ -927,8 +1322,18 @@ pub enum StorageError {
     UnversionedDatabase,
     #[error("unsupported Agentlog schema version {found}; refusing to modify it")]
     UnsupportedSchemaVersion { found: i64 },
-    #[error("database claims schema v1 but is missing required table {table}")]
-    IncompleteV1Schema { table: &'static str },
+    #[error("database does not match the complete Agentlog schema v1 fingerprint")]
+    SchemaFingerprintMismatch,
+    #[error("cannot inspect Agentlog catalog path {path}: {source}")]
+    CatalogPathIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("refusing to clear; Agentlog catalog path {path} {reason}")]
+    UnsafeCatalogPath { path: PathBuf, reason: &'static str },
+    #[error("Agentlog catalog file identity changed while opening {path}; refusing to clear")]
+    CatalogFileIdentityChanged { path: PathBuf },
     #[error("catalog transcript ordinal exceeds SQLite integer range")]
     OrdinalOverflow,
     #[error("system clock is before the Unix epoch")]
@@ -970,9 +1375,10 @@ mod tests {
 
     use super::{
         Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
-        SourceSnapshot, StorageError, list_catalog_sessions, list_catalog_source_diagnostics,
-        open_database, read_catalog_preview, read_catalog_preview_by_identity,
-        record_source_failure, replace_source_snapshot,
+        SourceSnapshot, StorageError, clear_existing_catalog_with_hook, inspect_catalog_file_state,
+        list_catalog_sessions, list_catalog_source_diagnostics, open_database,
+        read_catalog_preview, read_catalog_preview_by_identity, record_source_failure,
+        replace_source_snapshot,
     };
 
     struct MismatchedScanner;
@@ -1094,6 +1500,62 @@ mod tests {
             vec!["sessions", "sources", "transcript_items",]
         );
         database.close().await;
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_a_database_identity_replaced_after_sqlite_open() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database_path = temporary.path().join("agentlog.sqlite3");
+        let original = open_database(&database_path)
+            .await
+            .expect("open original database");
+        sqlx::query(
+            "INSERT INTO sources (provider, source_format, canonical_locator)
+             VALUES ('test', 'test', 'test://original')",
+        )
+        .execute(&original)
+        .await
+        .expect("insert original row");
+        original.close().await;
+        let expected_identity = inspect_catalog_file_state(&database_path)
+            .expect("inspect original database")
+            .expect("original database exists")
+            .identity;
+
+        let replacement_path = temporary.path().join("replacement.sqlite3");
+        let replacement = open_database(&replacement_path)
+            .await
+            .expect("open replacement database");
+        sqlx::query(
+            "INSERT INTO sources (provider, source_format, canonical_locator)
+             VALUES ('test', 'test', 'test://replacement')",
+        )
+        .execute(&replacement)
+        .await
+        .expect("insert replacement row");
+        replacement.close().await;
+        let displaced_path = temporary.path().join("displaced.sqlite3");
+
+        let error = clear_existing_catalog_with_hook(&database_path, expected_identity, || {
+            fs::rename(&database_path, &displaced_path).expect("displace opened database");
+            fs::rename(&replacement_path, &database_path).expect("replace database path");
+        })
+        .await
+        .expect_err("reject replaced database identity");
+
+        assert!(matches!(
+            error,
+            StorageError::CatalogFileIdentityChanged { .. }
+        ));
+        let replacement = open_database(&database_path)
+            .await
+            .expect("reopen replacement database");
+        let retained = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+            .fetch_one(&replacement)
+            .await
+            .expect("count retained replacement rows");
+        assert_eq!(retained, 1);
+        replacement.close().await;
     }
 
     #[tokio::test]

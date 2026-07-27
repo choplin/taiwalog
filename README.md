@@ -20,6 +20,8 @@ cargo run -- scan
 cargo run -- scan --json
 cargo run -- list
 cargo run -- show 1
+cargo run -- data clear --dry-run
+cargo run -- data clear --yes
 cargo run -- browse
 ```
 
@@ -83,6 +85,21 @@ not redirect Codex history discovery:
 cargo run -- --home /tmp/agentlog-demo paths
 cargo run -- --home /tmp/agentlog-demo scan
 ```
+
+### Clearing the local catalog
+
+`agentlog data clear --dry-run` reports the exact Agentlog-owned database path,
+catalog session count, transcript-item count, and approximate SQLite file-set
+size without changing any files. `agentlog data clear` is also non-destructive;
+add `--yes` only after reviewing that report to clear catalog rows while
+preserving the Agentlog-owned SQLite schema and files. Previewing privately
+copies only the bounded SQLite main/WAL contents, validates the complete
+main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh private SHM,
+so it never opens the live catalog. Confirmation reports counts collected by
+the same SQLite writer transaction that clears the rows; it fails instead of
+racing another active writer. The command never deletes configuration, provider
+sources, or raw provider logs. Run `agentlog scan` afterwards to build a fresh
+catalog from the unchanged provider-owned sources.
 
 Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
 `~/.codex`. Claude Code source discovery uses `providers.claude_root`, then
