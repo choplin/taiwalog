@@ -5,6 +5,7 @@
 //! this crate.
 
 pub mod app;
+pub mod cli;
 pub mod paths;
 pub mod providers;
 pub mod storage;

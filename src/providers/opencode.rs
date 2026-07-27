@@ -813,6 +813,74 @@ fn note_partial(current: &mut Option<PartialReason>, reason: PartialReason) {
 }
 
 #[cfg(test)]
+pub(crate) async fn create_test_database(path: &Path) -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("OpenCode fixture database");
+    for statement in [
+        "CREATE TABLE session (
+             id TEXT PRIMARY KEY,
+             directory TEXT NOT NULL,
+             model TEXT,
+             time_created INTEGER NOT NULL,
+             time_updated INTEGER NOT NULL
+         )",
+        "CREATE TABLE message (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             time_created INTEGER NOT NULL,
+             data TEXT NOT NULL
+         )",
+        "CREATE TABLE part (
+             id TEXT PRIMARY KEY,
+             message_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             time_created INTEGER NOT NULL,
+             data TEXT NOT NULL
+         )",
+    ] {
+        sqlx::query(statement)
+            .execute(&pool)
+            .await
+            .expect("fixture schema");
+    }
+    sqlx::query(
+        "INSERT INTO session (id, directory, model, time_created, time_updated)
+         VALUES ('open-session', '/work', 'model', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("session");
+    sqlx::query(
+        "INSERT INTO message (id, session_id, time_created, data)
+         VALUES ('message', 'open-session', 1, '{\"role\":\"user\"}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("message");
+    sqlx::query(
+        "INSERT INTO part (id, message_id, session_id, time_created, data)
+         VALUES (
+             'part',
+             'message',
+             'open-session',
+             1,
+             '{\"type\":\"text\",\"text\":\"open visible\"}'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("part");
+    pool
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         fs,

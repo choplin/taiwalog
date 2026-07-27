@@ -149,52 +149,15 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::{
-        SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    };
     use tempfile::TempDir;
 
     use std::fs;
 
-    use crate::{paths::AppPaths, storage::SCHEMA_VERSION};
+    use crate::{
+        paths::AppPaths, providers::opencode::create_test_database, storage::SCHEMA_VERSION,
+    };
 
     use super::scan_shell;
-
-    async fn create_opencode_fixture(path: &std::path::Path) -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(path)
-                    .create_if_missing(true),
-            )
-            .await
-            .expect("OpenCode fixture database");
-        for statement in [
-            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, model TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)",
-            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)",
-            "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)",
-        ] {
-            sqlx::query(statement)
-                .execute(&pool)
-                .await
-                .expect("fixture schema");
-        }
-        sqlx::query("INSERT INTO session VALUES ('open-session', '/work', 'model', 1, 1)")
-            .execute(&pool)
-            .await
-            .expect("session");
-        sqlx::query(
-            "INSERT INTO message VALUES ('message', 'open-session', 1, '{\"role\":\"user\"}')",
-        )
-        .execute(&pool)
-        .await
-        .expect("message");
-        sqlx::query("INSERT INTO part VALUES ('part', 'message', 'open-session', 1, '{\"type\":\"text\",\"text\":\"open visible\"}')")
-            .execute(&pool).await.expect("part");
-        pool
-    }
 
     #[tokio::test]
     async fn shell_scan_creates_catalog_and_reports_empty_codex_collection() {
@@ -360,7 +323,7 @@ mod tests {
         fs::write(&claude_source, "{\"type\":\"user\",\"sessionId\":\"claude-session\",\"message\":{\"role\":\"user\",\"content\":\"claude visible\"}}\n").expect("Claude source");
         fs::create_dir_all(&opencode).expect("OpenCode directory");
         let opencode_source = opencode.join("opencode.db");
-        let opencode_pool = create_opencode_fixture(&opencode_source).await;
+        let opencode_pool = create_test_database(&opencode_source).await;
         let gemini_source = gemini.join("tmp/source.jsonl");
         fs::create_dir_all(gemini_source.parent().expect("parent")).expect("Gemini dirs");
         fs::write(&gemini_source, "{\"sessionId\":\"gemini-session\"}\n{\"type\":\"user\",\"content\":\"gemini visible\"}\n").expect("Gemini source");
