@@ -143,6 +143,18 @@ impl Catalog {
         read_catalog_preview(&self.pool, session_id, 80, 4 * 1024).await
     }
 
+    /// Reads a current preview by the stable source-scoped session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is unavailable or cannot be queried.
+    pub async fn preview_by_identity(
+        &self,
+        session: &CatalogSessionSummary,
+    ) -> Result<CatalogSessionPreview, StorageError> {
+        read_catalog_preview_by_identity(&self.pool, session, 80, 4 * 1024).await
+    }
+
     /// Returns every retained source diagnostic without scanning providers.
     ///
     /// # Errors
@@ -636,6 +648,65 @@ pub async fn read_catalog_preview(
     .await
     .map_err(StorageError::Query)?
     .ok_or(StorageError::CatalogSessionNotFound { session_id })?;
+    read_catalog_preview_from_row(pool, row, item_limit, snippet_bytes).await
+}
+
+/// Reads a normalized catalog session by its stable provider/source/session key.
+///
+/// This is intended for interactive views which can retain a summary while a
+/// source refresh atomically replaces the numeric session row ID.
+///
+/// # Errors
+///
+/// Returns an error if the session is absent or the catalog cannot be queried.
+pub async fn read_catalog_preview_by_identity(
+    pool: &SqlitePool,
+    session: &CatalogSessionSummary,
+    item_limit: u32,
+    snippet_bytes: usize,
+) -> Result<CatalogSessionPreview, StorageError> {
+    let row = sqlx::query(
+        "SELECT sessions.id,
+                sources.provider,
+                sources.source_format,
+                sources.canonical_locator AS source_locator,
+                sessions.session_key,
+                sessions.title,
+                sessions.repository,
+                sessions.cwd,
+                sessions.model,
+                sessions.execution_kind,
+                sessions.started_at,
+                sessions.last_visible_event_at,
+                sources.diagnostic_status,
+                sources.last_success_at
+         FROM sessions
+         JOIN sources ON sources.id = sessions.source_id
+         WHERE sources.provider = ?
+           AND sources.source_format = ?
+           AND sources.canonical_locator = ?
+           AND sessions.session_key = ?",
+    )
+    .bind(&session.provider)
+    .bind(&session.source_format)
+    .bind(&session.source_locator)
+    .bind(&session.session_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(StorageError::Query)?
+    .ok_or(StorageError::CatalogSessionNotFound {
+        session_id: session.id,
+    })?;
+
+    read_catalog_preview_from_row(pool, row, item_limit, snippet_bytes).await
+}
+
+async fn read_catalog_preview_from_row(
+    pool: &SqlitePool,
+    row: sqlx::sqlite::SqliteRow,
+    item_limit: u32,
+    snippet_bytes: usize,
+) -> Result<CatalogSessionPreview, StorageError> {
     let session = catalog_session_summary(&row)?;
 
     let rows = sqlx::query(
@@ -648,7 +719,7 @@ pub async fn read_catalog_preview(
          ORDER BY ordinal ASC
          LIMIT ?",
     )
-    .bind(session_id)
+    .bind(session.id)
     .bind(i64::from(item_limit.saturating_add(1)))
     .fetch_all(pool)
     .await
@@ -900,7 +971,8 @@ mod tests {
     use super::{
         Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
         SourceSnapshot, StorageError, list_catalog_sessions, list_catalog_source_diagnostics,
-        open_database, read_catalog_preview, record_source_failure, replace_source_snapshot,
+        open_database, read_catalog_preview, read_catalog_preview_by_identity,
+        record_source_failure, replace_source_snapshot,
     };
 
     struct MismatchedScanner;
@@ -1254,6 +1326,103 @@ mod tests {
             matches!(preview.items.as_slice(), [super::CatalogItemView::UserText { content }] if content == "Claud…")
         );
         assert!(!preview.items_truncated);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn stable_preview_survives_a_replaced_session_row_during_refresh() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
+        let refreshed = SourceIdentity {
+            provider: "codex",
+            source_format: "session_jsonl",
+            canonical_locator: "/private/tmp/refreshed.jsonl".to_owned(),
+        };
+        let unchanged = SourceIdentity {
+            provider: "claude",
+            source_format: "session_jsonl",
+            canonical_locator: "/private/tmp/unchanged.jsonl".to_owned(),
+        };
+        for (identity, session_key, text) in [
+            (&refreshed, "refresh-key", "before replacement"),
+            (
+                &unchanged,
+                "other-key",
+                "keeps the old row ID from being reused",
+            ),
+        ] {
+            replace_source_snapshot(
+                &database,
+                &SourceSnapshot {
+                    identity: identity.clone(),
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: vec![CatalogSession {
+                        session_key: session_key.to_owned(),
+                        title: Some(text.to_owned()),
+                        repository: None,
+                        cwd: None,
+                        model: None,
+                        execution_kind: None,
+                        started_at: Some(1),
+                        last_visible_event_at: Some(1),
+                        items: vec![CatalogItem::UserText(text.to_owned())],
+                    }],
+                },
+            )
+            .await
+            .expect("store initial source snapshot");
+        }
+        let stale = list_catalog_sessions(&database, 10)
+            .await
+            .expect("list initial catalog")
+            .into_iter()
+            .find(|session| session.provider == "codex")
+            .expect("initial refreshed session");
+
+        replace_source_snapshot(
+            &database,
+            &SourceSnapshot {
+                identity: refreshed,
+                diagnostic_status: "ok",
+                diagnostic_message: None,
+                sessions: vec![CatalogSession {
+                    session_key: "refresh-key".to_owned(),
+                    title: Some("after replacement".to_owned()),
+                    repository: None,
+                    cwd: None,
+                    model: None,
+                    execution_kind: None,
+                    started_at: Some(2),
+                    last_visible_event_at: Some(2),
+                    items: vec![CatalogItem::UserText("after replacement".to_owned())],
+                }],
+            },
+        )
+        .await
+        .expect("replace refreshed source snapshot");
+
+        let current = list_catalog_sessions(&database, 10)
+            .await
+            .expect("list replaced catalog")
+            .into_iter()
+            .find(|session| session.provider == "codex")
+            .expect("replaced session");
+        assert_ne!(current.id, stale.id, "refresh must replace the numeric row");
+        assert!(matches!(
+            read_catalog_preview(&database, stale.id, 80, 4 * 1024).await,
+            Err(StorageError::CatalogSessionNotFound { .. })
+        ));
+
+        let preview = read_catalog_preview_by_identity(&database, &stale, 80, 4 * 1024)
+            .await
+            .expect("resolve a current preview from the stale visible row");
+        assert_eq!(preview.session.id, current.id);
+        assert_eq!(preview.session.session_key, "refresh-key");
+        assert!(matches!(
+            preview.items.as_slice(),
+            [super::CatalogItemView::UserText { content }] if content == "after replacement"
+        ));
         database.close().await;
     }
 

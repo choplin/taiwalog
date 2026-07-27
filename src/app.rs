@@ -128,6 +128,23 @@ pub async fn show_shell(
     Ok(session)
 }
 
+/// Reads a current session preview by the stable identity retained in a list row.
+///
+/// # Errors
+///
+/// Returns an error when the session is unavailable or the Agentlog catalog
+/// cannot be opened.
+pub async fn show_shell_by_identity(
+    paths: &AppPaths,
+    session: &CatalogSessionSummary,
+) -> anyhow::Result<CatalogSessionPreview> {
+    paths.ensure_data_dir()?;
+    let catalog = Catalog::open(&paths.database_path).await?;
+    let preview = catalog.preview_by_identity(session).await?;
+    catalog.close().await;
+    Ok(preview)
+}
+
 /// Reads all retained source diagnostics without starting a provider scan.
 ///
 /// # Errors
@@ -266,6 +283,50 @@ mod tests {
         assert_eq!(summary.provider_summaries.len(), 6);
         let json = serde_json::to_value(&summary).expect("serialize summary");
         assert_eq!(json["provider_summaries"].as_array().map(Vec::len), Some(6));
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_a_source_last_good_session_in_the_catalog() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        let gemini_root = temporary.path().join("gemini");
+        let source = gemini_root.join("tmp/session.jsonl");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir_all(source.parent().expect("Gemini source parent"))
+            .expect("create Gemini directory");
+        fs::write(
+            &source,
+            "{\"sessionId\":\"session\"}\n{\"type\":\"user\",\"content\":\"last good request\"}\n",
+        )
+        .expect("write valid Gemini source");
+        fs::write(
+            agentlog_home.join("config.toml"),
+            format!(
+                "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
+                temporary.path().join("empty-codex").display(),
+                temporary.path().join("empty-claude").display(),
+                temporary.path().join("empty-opencode").display(),
+                gemini_root.display(),
+                temporary.path().join("empty-cursor").display(),
+                temporary.path().join("empty-kimi").display(),
+            ),
+        )
+        .expect("write config");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+
+        let first = scan_shell(&paths).await.expect("initial scan");
+        assert_eq!(first.sessions_available, 1);
+        fs::write(&source, "not JSON\n").expect("make source malformed");
+
+        let refresh = scan_shell(&paths).await.expect("failing refresh");
+        assert_eq!(refresh.sources_failed, 1);
+        assert_eq!(refresh.sessions_available, 1);
+        let sessions = super::list_shell(&paths, 10)
+            .await
+            .expect("list last-good session");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_diagnostic_status, "error");
+        assert_eq!(sessions[0].title.as_deref(), Some("last good request"));
     }
 
     #[tokio::test]

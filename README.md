@@ -23,7 +23,12 @@ cargo run -- show 1
 cargo run -- browse
 ```
 
-`browse` reads the existing Agentlog catalog without scanning provider sources.
+`browse` first shows the existing Agentlog catalog, then starts a read-only
+refresh in the background. Press `r` to request another refresh; repeated
+requests while a refresh is active do not start another scan. The list remains
+available during refresh, keeps its selection by provider/source/session key
+when rows are replaced, and reports bounded refreshed/partial/failed/session
+counts when the refresh completes.
 Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
 preview, `Esc` to return, and `q` to quit. Press `f` to refine by provider,
 repository, CWD, model, execution kind, and start date. Within each metadata
