@@ -20,7 +20,15 @@ cargo run -- scan
 cargo run -- scan --json
 cargo run -- list
 cargo run -- show 1
+cargo run -- browse
 ```
+
+`browse` reads the existing Agentlog catalog without scanning provider sources.
+Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
+preview, `Esc` to return, and `q` to quit. At wide terminal widths the selected
+session has a passive preview beside the chronological recent-session list.
+On a normal exit, Agentlog reports a terminal-restoration failure; on an
+unexpected terminal error or panic it still makes a best-effort restoration.
 
 By default, Agentlog owns these paths under
 `~/Library/Application Support/Agentlog`:

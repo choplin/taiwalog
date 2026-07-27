@@ -7,8 +7,10 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     app::{list_shell, paths_report, scan_shell, show_shell},
+    display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
+    tui,
 };
 
 /// Browse local AI coding-agent history without changing provider-owned files.
@@ -53,6 +55,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Browse already-cataloged sessions in an interactive terminal UI.
+    Browse,
 }
 
 /// Parses process arguments and dispatches one command-line workflow.
@@ -70,6 +74,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Scan { json } => print_scan(&paths, json).await,
         Command::List { limit, json } => print_list(&paths, limit, json).await,
         Command::Show { session_id, json } => print_show(&paths, session_id, json).await,
+        Command::Browse => tui::run(&paths).await,
     }
 }
 
@@ -78,11 +83,26 @@ fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Agentlog-owned home: {}", report.agentlog_home.display());
-        println!("Agentlog-owned config: {}", report.config_file.display());
-        println!("Agentlog-owned data: {}", report.data_directory.display());
-        println!("Agentlog-owned database: {}", report.database.display());
-        println!("Provider-owned sources: {}", report.provider_sources);
+        println!(
+            "Agentlog-owned home: {}",
+            visible_text(&report.agentlog_home.display().to_string())
+        );
+        println!(
+            "Agentlog-owned config: {}",
+            visible_text(&report.config_file.display().to_string())
+        );
+        println!(
+            "Agentlog-owned data: {}",
+            visible_text(&report.data_directory.display().to_string())
+        );
+        println!(
+            "Agentlog-owned database: {}",
+            visible_text(&report.database.display().to_string())
+        );
+        println!(
+            "Provider-owned sources: {}",
+            visible_text(&report.provider_sources)
+        );
     }
     Ok(())
 }
@@ -101,7 +121,7 @@ async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         for provider in &summary.provider_summaries {
             println!(
                 "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, sessions={}",
-                provider.provider,
+                visible_text(provider.provider),
                 provider.candidate_sources,
                 provider.refreshed_sources,
                 provider.partial_sources,
@@ -109,7 +129,7 @@ async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
                 provider.sessions_available
             );
         }
-        println!("Scan result: {}", summary.message);
+        println!("Scan result: {}", visible_text(&summary.message));
     }
     Ok(())
 }
@@ -122,7 +142,11 @@ async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<
         println!("No cataloged sessions. Run `agentlog scan` to refresh sources.");
     } else {
         for session in sessions {
-            let title = session.title.as_deref().unwrap_or("(no visible title)");
+            let title = session
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(&session.session_key);
             let freshness = if session.source_diagnostic_status == "error" {
                 "stale/error"
             } else {
@@ -130,7 +154,11 @@ async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<
             };
             println!(
                 "{}  [{}:{}; {}] {}",
-                session.id, session.provider, session.source_format, freshness, title
+                session.id,
+                visible_text(&session.provider),
+                visible_text(&session.source_format),
+                visible_text(freshness),
+                visible_text(title)
             );
         }
     }
@@ -145,29 +173,31 @@ async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Re
         let freshness = &preview.session.source_diagnostic_status;
         println!(
             "Session {} [{}:{}; source status: {}]",
-            preview.session.id, preview.session.provider, preview.session.source_format, freshness
+            preview.session.id,
+            visible_text(&preview.session.provider),
+            visible_text(&preview.session.source_format),
+            visible_text(freshness)
         );
-        println!(
-            "{}",
-            preview
-                .session
-                .title
-                .as_deref()
-                .unwrap_or("(no visible title)")
-        );
+        let title = preview
+            .session
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&preview.session.session_key);
+        println!("{}", visible_text(title));
         for item in preview.items {
             match item {
                 CatalogItemView::UserText { content } => {
-                    println!("user: {content}");
+                    print_visible_transcript("user", &content);
                 }
                 CatalogItemView::AssistantText { content } => {
-                    println!("assistant: {content}");
+                    print_visible_transcript("assistant", &content);
                 }
                 CatalogItemView::ToolMarker { name, status } => {
                     println!(
                         "tool: {} ({})",
-                        name,
-                        status.unwrap_or_else(|| "unknown".to_owned())
+                        visible_text(&name),
+                        visible_text(status.as_deref().unwrap_or("unknown"))
                     );
                 }
             }
@@ -177,4 +207,20 @@ async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Re
         }
     }
     Ok(())
+}
+
+fn print_visible_transcript(label: &str, content: &str) {
+    if content.is_empty() {
+        println!("{label}:");
+        return;
+    }
+
+    for (index, line) in content.lines().enumerate() {
+        let prefix = if index == 0 {
+            format!("{label}: ")
+        } else {
+            "  ".to_owned()
+        };
+        println!("{prefix}{}", visible_text(line));
+    }
 }

@@ -6,9 +6,11 @@
 
 pub mod app;
 pub mod cli;
+pub mod display;
 pub mod paths;
 pub mod providers;
 pub mod storage;
+pub mod tui;
 
 // Preserve the initial public module paths while implementation and internal
 // dependencies use the explicit provider boundary.

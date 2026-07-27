@@ -236,6 +236,9 @@ pub struct CatalogSessionSummary {
     pub id: i64,
     pub provider: String,
     pub source_format: String,
+    #[serde(skip_serializing)]
+    pub source_locator: String,
+    pub session_key: String,
     pub title: Option<String>,
     pub repository: Option<String>,
     pub cwd: Option<String>,
@@ -522,6 +525,8 @@ pub async fn list_catalog_sessions(
         "SELECT sessions.id,
                 sources.provider,
                 sources.source_format,
+                sources.canonical_locator AS source_locator,
+                sessions.session_key,
                 sessions.title,
                 sessions.repository,
                 sessions.cwd,
@@ -535,7 +540,10 @@ pub async fn list_catalog_sessions(
          JOIN sources ON sources.id = sessions.source_id
          ORDER BY sessions.last_visible_event_at DESC,
                   sessions.started_at DESC,
-                  sessions.id DESC
+                  sources.provider ASC,
+                  sources.source_format ASC,
+                  sources.canonical_locator ASC,
+                  sessions.session_key ASC
          LIMIT ?",
     )
     .bind(i64::from(limit))
@@ -561,6 +569,8 @@ pub async fn read_catalog_preview(
         "SELECT sessions.id,
                 sources.provider,
                 sources.source_format,
+                sources.canonical_locator AS source_locator,
+                sessions.session_key,
                 sessions.title,
                 sessions.repository,
                 sessions.cwd,
@@ -620,6 +630,8 @@ fn catalog_session_summary(
         id: row.try_get("id").map_err(StorageError::Query)?,
         provider: row.try_get("provider").map_err(StorageError::Query)?,
         source_format: row.try_get("source_format").map_err(StorageError::Query)?,
+        source_locator: row.try_get("source_locator").map_err(StorageError::Query)?,
+        session_key: row.try_get("session_key").map_err(StorageError::Query)?,
         title: row.try_get("title").map_err(StorageError::Query)?,
         repository: row.try_get("repository").map_err(StorageError::Query)?,
         cwd: row.try_get("cwd").map_err(StorageError::Query)?,
@@ -1141,6 +1153,23 @@ mod tests {
             .await
             .expect("list shared catalog");
         assert_eq!(sessions.len(), 2);
+        let list_json = serde_json::to_value(&sessions).expect("serialize catalog list");
+        assert!(
+            list_json
+                .as_array()
+                .and_then(|sessions| sessions.first())
+                .and_then(|session| session.get("source_locator"))
+                .is_none(),
+            "list JSON must not expose canonical source paths"
+        );
+        assert!(
+            list_json
+                .as_array()
+                .and_then(|sessions| sessions.first())
+                .and_then(|session| session.get("session_key"))
+                .is_some(),
+            "list JSON retains the stable session key"
+        );
         let claude = sessions
             .iter()
             .find(|session| session.provider == "claude")
@@ -1156,6 +1185,70 @@ mod tests {
             matches!(preview.items.as_slice(), [super::CatalogItemView::UserText { content }] if content == "Claud…")
         );
         assert!(!preview.items_truncated);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_list_uses_stable_source_and_session_tie_breakers() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = open_temporary_database(&temporary, "ordered.sqlite3").await;
+        for (provider, locator, session_keys) in [
+            ("cursor", "/private/tmp/z.jsonl", &["b"][..]),
+            ("claude", "/private/tmp/b.jsonl", &["z"][..]),
+            ("claude", "/private/tmp/a.jsonl", &["z", "a"][..]),
+        ] {
+            replace_source_snapshot(
+                &database,
+                &SourceSnapshot {
+                    identity: SourceIdentity {
+                        provider,
+                        source_format: "session_jsonl",
+                        canonical_locator: locator.to_owned(),
+                    },
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: session_keys
+                        .iter()
+                        .map(|session_key| CatalogSession {
+                            session_key: (*session_key).to_owned(),
+                            title: None,
+                            repository: None,
+                            cwd: None,
+                            model: None,
+                            execution_kind: None,
+                            started_at: Some(1),
+                            last_visible_event_at: Some(1),
+                            items: Vec::new(),
+                        })
+                        .collect(),
+                },
+            )
+            .await
+            .expect("store ordered snapshot");
+        }
+
+        let sessions = list_catalog_sessions(&database, 50)
+            .await
+            .expect("list sessions");
+        let identities = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.provider.as_str(),
+                    session.source_locator.as_str(),
+                    session.session_key.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                ("claude", "/private/tmp/a.jsonl", "a"),
+                ("claude", "/private/tmp/a.jsonl", "z"),
+                ("claude", "/private/tmp/b.jsonl", "z"),
+                ("cursor", "/private/tmp/z.jsonl", "b"),
+            ]
+        );
         database.close().await;
     }
 
