@@ -107,7 +107,11 @@ async fn print_data_clear(paths: &AppPaths, dry_run: bool, yes: bool) -> anyhow:
     );
     println!("Catalog sessions: {}", summary.sessions);
     println!("Transcript items: {}", summary.transcript_items);
-    println!("Approximate database bytes: {}", summary.approximate_bytes);
+    println!(
+        "Approximate database size: {} ({} bytes)",
+        human_readable_bytes(summary.approximate_bytes),
+        summary.approximate_bytes
+    );
     if dry_run {
         println!("Dry run: no data was changed. Re-run with --yes to clear.");
     } else if !yes {
@@ -118,6 +122,29 @@ async fn print_data_clear(paths: &AppPaths, dry_run: bool, yes: bool) -> anyhow:
         println!("Data clear: no Agentlog-owned database was present.");
     }
     Ok(())
+}
+
+fn human_readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut unit = 0;
+    let mut unit_bytes = 1_u64;
+    while unit < UNITS.len() - 1 && bytes >= unit_bytes * 1024 {
+        unit += 1;
+        unit_bytes *= 1024;
+    }
+    let rounded_tenths =
+        (u128::from(bytes) * 10 + u128::from(unit_bytes) / 2) / u128::from(unit_bytes);
+    format!(
+        "{}.{} {}",
+        rounded_tenths / 10,
+        rounded_tenths % 10,
+        UNITS[unit]
+    )
 }
 
 fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
@@ -271,7 +298,16 @@ fn print_visible_transcript(label: &str, content: &str) {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DataCommand};
+    use super::{Cli, Command, DataCommand, human_readable_bytes};
+
+    #[test]
+    fn database_sizes_use_readable_binary_units() {
+        assert_eq!(human_readable_bytes(0), "0 B");
+        assert_eq!(human_readable_bytes(1023), "1023 B");
+        assert_eq!(human_readable_bytes(1024), "1.0 KiB");
+        assert_eq!(human_readable_bytes(128_339_968), "122.4 MiB");
+        assert_eq!(human_readable_bytes(u64::MAX), "16.0 EiB");
+    }
 
     #[test]
     fn data_clear_accepts_an_explicit_dry_run() {

@@ -90,7 +90,8 @@ cargo run -- --home /tmp/agentlog-demo scan
 
 `agentlog data clear --dry-run` reports the exact Agentlog-owned database path,
 catalog session count, transcript-item count, and approximate SQLite file-set
-size without changing any files. `agentlog data clear` is also non-destructive;
+size in human-readable IEC units (with the exact byte count) without changing
+any files. `agentlog data clear` is also non-destructive;
 add `--yes` only after reviewing that report to clear catalog rows while
 preserving the Agentlog-owned SQLite schema and files. Previewing privately
 copies only the bounded SQLite main/WAL contents, validates the complete
