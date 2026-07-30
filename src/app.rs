@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
+    future::Future,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -269,8 +270,8 @@ pub struct PurgeSummary {
 /// Previewing reads a bounded private copy of the `SQLite` main/WAL contents,
 /// while fingerprinting the complete main/WAL/SHM file set, so it never opens
 /// or writes the live catalog. Confirmation obtains `SQLite` writer
-/// serialization and purges rows in one transaction while preserving the
-/// schema and database files.
+/// serialization, then measures the complete main/WAL/SHM file set, counts
+/// rows, and purges them while preserving the schema and database files.
 ///
 /// Returns an error when the database is not a regular Agentlog v1 catalog, a
 /// file changes while the private preview snapshot is taken, or an explicitly
@@ -279,23 +280,43 @@ pub async fn purge_catalog_shell(
     paths: &AppPaths,
     confirmed: bool,
 ) -> anyhow::Result<PurgeSummary> {
+    purge_catalog_shell_with_hooks(paths, confirmed, |_| async {}, |_| {}).await
+}
+
+async fn purge_catalog_shell_with_hooks<BeforeLock, BeforeLockFuture, AfterMeasurement>(
+    paths: &AppPaths,
+    confirmed: bool,
+    before_lock: BeforeLock,
+    after_measurement: AfterMeasurement,
+) -> anyhow::Result<PurgeSummary>
+where
+    BeforeLock: FnOnce(u64) -> BeforeLockFuture,
+    BeforeLockFuture: Future<Output = ()>,
+    AfterMeasurement: FnOnce(crate::storage::CatalogPurgeResult),
+{
     if confirmed {
         let Some(target) = inspect_confirmed_purge_target(&paths.database_path)? else {
             return Ok(empty_purge_summary(paths));
         };
-        let counts = purge_existing_catalog(&paths.database_path, target.database_identity)
-            .await
-            .with_context(|| {
-                format!(
-                    "purge Agentlog-owned database {}",
-                    paths.database_path.display()
-                )
-            })?;
+        before_lock(target.approximate_bytes).await;
+        let result = purge_existing_catalog(
+            &paths.database_path,
+            target.database_identity,
+            PURGE_SNAPSHOT_MAX_BYTES,
+            after_measurement,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "purge Agentlog-owned database {}",
+                paths.database_path.display()
+            )
+        })?;
         return Ok(PurgeSummary {
             database: paths.database_path.clone(),
-            sessions: counts.sessions,
-            transcript_items: counts.transcript_items,
-            approximate_bytes: target.approximate_bytes,
+            sessions: result.counts.sessions,
+            transcript_items: result.counts.transcript_items,
+            approximate_bytes: result.approximate_bytes,
             cleared: true,
         });
     }
@@ -562,7 +583,10 @@ fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use tempfile::TempDir;
 
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -584,9 +608,10 @@ mod tests {
     };
 
     use super::{
-        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, diagnostics_shell,
-        inspect_purge_target, inspect_purge_target_with_hook, list_shell, purge_catalog_shell,
-        sqlite_sidecar_path, sync_scanner, sync_shell,
+        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, catalog_file_set_size,
+        diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
+        inspect_purge_target_with_hook, list_shell, purge_catalog_shell,
+        purge_catalog_shell_with_hooks, sqlite_sidecar_path, sync_scanner, sync_shell,
     };
 
     struct ProviderFailureScanner;
@@ -850,49 +875,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_purge_reports_counts_from_its_transaction() {
+    async fn confirmed_purge_reports_locked_counts_and_size_after_an_intervening_commit() {
         let (_temporary, paths, _source) = scanned_purge_fixture().await;
-        let preview = purge_catalog_shell(&paths, false)
-            .await
-            .expect("preview initial catalog purge");
-        assert_eq!(preview.sessions, 1);
-        assert_eq!(preview.transcript_items, 1);
-
         let writer = open_database(&paths.database_path)
             .await
             .expect("open catalog for intervening write");
-        let source_id = sqlx::query(
-            "INSERT INTO sources (provider, source_format, canonical_locator)
-             VALUES ('test', 'test', 'test://transaction-counts')",
-        )
-        .execute(&writer)
-        .await
-        .expect("insert intervening source")
-        .last_insert_rowid();
-        let session_id = sqlx::query(
-            "INSERT INTO sessions (source_id, session_key, title)
-             VALUES (?, 'transaction-counts', 'intervening session')",
-        )
-        .bind(source_id)
-        .execute(&writer)
-        .await
-        .expect("insert intervening session")
-        .last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO transcript_items (session_id, ordinal, item_kind, content)
-             VALUES (?, 0, 'user_text', 'intervening item')",
-        )
-        .bind(session_id)
-        .execute(&writer)
-        .await
-        .expect("insert intervening transcript item");
-        writer.close().await;
+        let preflight_size = Arc::new(Mutex::new(None));
+        let observed_preflight_size = Arc::clone(&preflight_size);
+        let locked_size = Arc::new(Mutex::new(None));
+        let measured_size = Arc::clone(&locked_size);
+        let measured_path = paths.database_path.clone();
 
-        let cleared = purge_catalog_shell(&paths, true)
-            .await
-            .expect("purge current transaction contents");
+        let cleared = purge_catalog_shell_with_hooks(
+            &paths,
+            true,
+            move |approximate_bytes| async move {
+                *observed_preflight_size.lock().expect("lock preflight size") =
+                    Some(approximate_bytes);
+                let source_id = sqlx::query(
+                    "INSERT INTO sources (provider, source_format, canonical_locator)
+                     VALUES ('test', 'test', 'test://transaction-counts')",
+                )
+                .execute(&writer)
+                .await
+                .expect("insert intervening source")
+                .last_insert_rowid();
+                let session_id = sqlx::query(
+                    "INSERT INTO sessions (source_id, session_key, title)
+                     VALUES (?, 'transaction-counts', 'intervening session')",
+                )
+                .bind(source_id)
+                .execute(&writer)
+                .await
+                .expect("insert intervening session")
+                .last_insert_rowid();
+                sqlx::query(
+                    "INSERT INTO transcript_items (session_id, ordinal, item_kind, content)
+                     VALUES (?, 0, 'user_text', 'intervening item')",
+                )
+                .bind(session_id)
+                .execute(&writer)
+                .await
+                .expect("insert intervening transcript item");
+                writer.close().await;
+            },
+            move |result| {
+                let files = inspect_catalog_file_set(&measured_path)
+                    .expect("inspect locked catalog file set")
+                    .expect("locked catalog exists");
+                let current_size = catalog_file_set_size(
+                    &measured_path,
+                    files.iter().map(|file| file.state.length),
+                )
+                .expect("measure locked catalog file set");
+                assert_eq!(result.approximate_bytes, current_size);
+                *measured_size.lock().expect("lock measured size") = Some(current_size);
+            },
+        )
+        .await
+        .expect("purge current locked transaction contents");
         assert_eq!(cleared.sessions, 2);
         assert_eq!(cleared.transcript_items, 2);
+        assert_eq!(
+            Some(cleared.approximate_bytes),
+            *locked_size.lock().expect("read measured size")
+        );
+        assert!(
+            preflight_size
+                .lock()
+                .expect("read preflight size")
+                .is_some(),
+            "confirmed purge must preflight the file set before the hook"
+        );
         assert!(cleared.cleared);
     }
 

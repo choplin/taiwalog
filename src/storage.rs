@@ -47,6 +47,13 @@ pub struct CatalogCounts {
     pub transcript_items: u64,
 }
 
+/// Counts and file-set size observed while the purge writer lock is held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogPurgeResult {
+    pub counts: CatalogCounts,
+    pub approximate_bytes: u64,
+}
+
 /// Stable identity and observable metadata for one inspected catalog file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogFileState {
@@ -576,9 +583,9 @@ fn verify_catalog_file_identity(
 
 /// Acquires `SQLite`'s writer serialization and purges every catalog row.
 ///
-/// Schema validation, retained-count collection, and row deletion happen in
-/// one `BEGIN IMMEDIATE` transaction. The schema itself remains so a later
-/// scan can rebuild the catalog without recreating the database file.
+/// Schema validation, retained-count collection, complete main/WAL/SHM size
+/// measurement, and row deletion happen while one `BEGIN IMMEDIATE`
+/// transaction holds writer serialization. The schema itself remains.
 ///
 /// # Errors
 ///
@@ -587,15 +594,26 @@ fn verify_catalog_file_identity(
 pub(crate) async fn purge_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
-) -> Result<CatalogCounts, StorageError> {
-    purge_existing_catalog_with_hook(path, expected_identity, || {}).await
+    max_file_set_bytes: u64,
+    after_measurement: impl FnOnce(CatalogPurgeResult),
+) -> Result<CatalogPurgeResult, StorageError> {
+    purge_existing_catalog_with_hooks(
+        path,
+        expected_identity,
+        max_file_set_bytes,
+        || {},
+        after_measurement,
+    )
+    .await
 }
 
-async fn purge_existing_catalog_with_hook(
+async fn purge_existing_catalog_with_hooks(
     path: &Path,
     expected_identity: CatalogFileIdentity,
+    max_file_set_bytes: u64,
     after_open: impl FnOnce(),
-) -> Result<CatalogCounts, StorageError> {
+    after_measurement: impl FnOnce(CatalogPurgeResult),
+) -> Result<CatalogPurgeResult, StorageError> {
     verify_catalog_file_identity(path, expected_identity)?;
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -624,6 +642,19 @@ async fn purge_existing_catalog_with_hook(
         sessions: count_rows_in_transaction(&mut transaction, "sessions").await?,
         transcript_items: count_rows_in_transaction(&mut transaction, "transcript_items").await?,
     };
+    let approximate_bytes = match inspect_catalog_file_set_size(path, max_file_set_bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            transaction.rollback().await.map_err(StorageError::Query)?;
+            pool.close().await;
+            return Err(error);
+        }
+    };
+    let result = CatalogPurgeResult {
+        counts,
+        approximate_bytes,
+    };
+    after_measurement(result);
     sqlx::query("DELETE FROM sources")
         .execute(&mut *transaction)
         .await
@@ -635,7 +666,40 @@ async fn purge_existing_catalog_with_hook(
     }
     transaction.commit().await.map_err(StorageError::Query)?;
     pool.close().await;
-    Ok(counts)
+    Ok(result)
+}
+
+fn inspect_catalog_file_set_size(path: &Path, max_bytes: u64) -> Result<u64, StorageError> {
+    let main = inspect_catalog_file_state(path)?.ok_or_else(|| {
+        StorageError::CatalogFileIdentityChanged {
+            path: path.to_path_buf(),
+        }
+    })?;
+    let mut total = main.length;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        if let Some(state) = inspect_catalog_file_state(&sidecar)? {
+            total = total.checked_add(state.length).ok_or_else(|| {
+                StorageError::CatalogFileSetSizeOverflow {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+    }
+    if total > max_bytes {
+        return Err(StorageError::CatalogFileSetTooLarge {
+            path: path.to_path_buf(),
+            bytes: total,
+            max_bytes,
+        });
+    }
+    Ok(total)
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 /// Initializes only a truly empty database, or validates the current v1 marker.
@@ -1413,6 +1477,16 @@ pub enum StorageError {
     UnsafeCatalogPath { path: PathBuf, reason: &'static str },
     #[error("Agentlog catalog file identity changed while opening {path}; refusing to purge")]
     CatalogFileIdentityChanged { path: PathBuf },
+    #[error("Agentlog catalog file-set size exceeds the supported range at {path}")]
+    CatalogFileSetSizeOverflow { path: PathBuf },
+    #[error(
+        "refusing to purge; Agentlog SQLite file set at {path} is {bytes} bytes, exceeding the {max_bytes} byte limit"
+    )]
+    CatalogFileSetTooLarge {
+        path: PathBuf,
+        bytes: u64,
+        max_bytes: u64,
+    },
     #[error("catalog transcript ordinal exceeds SQLite integer range")]
     OrdinalOverflow,
     #[error("system clock is before the Unix epoch")]
@@ -1455,7 +1529,7 @@ mod tests {
     use super::{
         Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
         SourceSnapshot, StorageError, inspect_catalog_file_state, list_catalog_sessions,
-        list_catalog_source_diagnostics, open_database, purge_existing_catalog_with_hook,
+        list_catalog_source_diagnostics, open_database, purge_existing_catalog_with_hooks,
         read_catalog_preview, read_catalog_preview_by_identity, record_source_failure,
         replace_source_snapshot,
     };
@@ -1615,10 +1689,16 @@ mod tests {
         replacement.close().await;
         let displaced_path = temporary.path().join("displaced.sqlite3");
 
-        let error = purge_existing_catalog_with_hook(&database_path, expected_identity, || {
-            fs::rename(&database_path, &displaced_path).expect("displace opened database");
-            fs::rename(&replacement_path, &database_path).expect("replace database path");
-        })
+        let error = purge_existing_catalog_with_hooks(
+            &database_path,
+            expected_identity,
+            u64::MAX,
+            || {
+                fs::rename(&database_path, &displaced_path).expect("displace opened database");
+                fs::rename(&replacement_path, &database_path).expect("replace database path");
+            },
+            |_| {},
+        )
         .await
         .expect_err("reject replaced database identity");
 
@@ -1635,6 +1715,53 @@ mod tests {
             .expect("count retained replacement rows");
         assert_eq!(retained, 1);
         replacement.close().await;
+    }
+
+    #[tokio::test]
+    async fn purge_enforces_the_file_set_bound_while_holding_the_writer_lock() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database_path = temporary.path().join("agentlog.sqlite3");
+        let database = open_database(&database_path).await.expect("open catalog");
+        sqlx::query(
+            "INSERT INTO sources (provider, source_format, canonical_locator)
+             VALUES ('test', 'test', 'test://retained')",
+        )
+        .execute(&database)
+        .await
+        .expect("insert retained source");
+        database.close().await;
+        let expected_identity = inspect_catalog_file_state(&database_path)
+            .expect("inspect catalog")
+            .expect("catalog exists")
+            .identity;
+
+        let error = purge_existing_catalog_with_hooks(
+            &database_path,
+            expected_identity,
+            0,
+            || {},
+            |_| panic!("oversized file set must fail before the measurement hook"),
+        )
+        .await
+        .expect_err("reject the locked file set above its limit");
+        assert!(matches!(
+            error,
+            StorageError::CatalogFileSetTooLarge {
+                bytes,
+                max_bytes: 0,
+                ..
+            } if bytes > 0
+        ));
+
+        let database = open_database(&database_path)
+            .await
+            .expect("reopen retained catalog");
+        let retained = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
+            .fetch_one(&database)
+            .await
+            .expect("count retained rows");
+        assert_eq!(retained, 1);
+        database.close().await;
     }
 
     #[tokio::test]

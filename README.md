@@ -96,11 +96,11 @@ rows while preserving the Agentlog-owned SQLite schema and files. Previewing
 privately copies only the bounded SQLite main/WAL contents, validates the
 complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
 private SHM, so it never opens the live catalog. Confirmation reports counts
-collected by the same SQLite writer transaction that purges the rows; it fails
-instead of racing another active writer. The command never deletes
-configuration, provider sources, an external database, or raw provider logs.
-Catalog data may not be reconstructible: only provider logs that still exist
-and remain readable can be synchronized.
+and current file-set size measured after acquiring the same SQLite writer
+serialization used to purge the rows; it fails instead of racing another active
+writer. The command never deletes configuration, provider sources, an external
+database, or raw provider logs. Catalog data may not be reconstructible: only
+provider logs that still exist and remain readable can be synchronized.
 
 Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
 `~/.codex`. Claude Code source discovery uses `providers.claude_root`, then
