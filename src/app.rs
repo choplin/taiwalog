@@ -16,11 +16,11 @@ use crate::{
     storage::{
         Catalog, CatalogFileIdentity, CatalogFileState, CatalogScanError, CatalogSessionPreview,
         CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, StorageError,
-        clear_existing_catalog, inspect_catalog_file_state, inspect_catalog_snapshot,
+        inspect_catalog_file_state, inspect_catalog_snapshot, purge_existing_catalog,
     },
 };
 
-const DATA_CLEAR_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PURGE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Observable result of one read-only provider synchronization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -248,9 +248,9 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
     }
 }
 
-/// The exact Agentlog-owned catalog target described before a clear operation.
+/// The exact Agentlog-owned catalog target described before a purge operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct DataClearSummary {
+pub struct PurgeSummary {
     pub database: PathBuf,
     pub sessions: u64,
     pub transcript_items: u64,
@@ -258,7 +258,7 @@ pub struct DataClearSummary {
     pub cleared: bool,
 }
 
-/// Reports, and when explicitly confirmed clears, only the Agentlog-owned
+/// Reports, and when explicitly confirmed purges, only the Agentlog-owned
 /// catalog contents.
 ///
 /// The database path is fixed by [`AppPaths`]; configuration and provider-owned
@@ -269,29 +269,29 @@ pub struct DataClearSummary {
 /// Previewing reads a bounded private copy of the `SQLite` main/WAL contents,
 /// while fingerprinting the complete main/WAL/SHM file set, so it never opens
 /// or writes the live catalog. Confirmation obtains `SQLite` writer
-/// serialization and clears rows in one transaction while preserving the
+/// serialization and purges rows in one transaction while preserving the
 /// schema and database files.
 ///
 /// Returns an error when the database is not a regular Agentlog v1 catalog, a
 /// file changes while the private preview snapshot is taken, or an explicitly
-/// requested clear cannot acquire `SQLite`'s writer lock.
-pub async fn clear_data_shell(
+/// requested purge cannot acquire `SQLite`'s writer lock.
+pub async fn purge_catalog_shell(
     paths: &AppPaths,
     confirmed: bool,
-) -> anyhow::Result<DataClearSummary> {
+) -> anyhow::Result<PurgeSummary> {
     if confirmed {
-        let Some(target) = inspect_confirmed_clear_target(&paths.database_path)? else {
-            return Ok(empty_data_clear_summary(paths));
+        let Some(target) = inspect_confirmed_purge_target(&paths.database_path)? else {
+            return Ok(empty_purge_summary(paths));
         };
-        let counts = clear_existing_catalog(&paths.database_path, target.database_identity)
+        let counts = purge_existing_catalog(&paths.database_path, target.database_identity)
             .await
             .with_context(|| {
                 format!(
-                    "clear Agentlog-owned database {}",
+                    "purge Agentlog-owned database {}",
                     paths.database_path.display()
                 )
             })?;
-        return Ok(DataClearSummary {
+        return Ok(PurgeSummary {
             database: paths.database_path.clone(),
             sessions: counts.sessions,
             transcript_items: counts.transcript_items,
@@ -300,8 +300,8 @@ pub async fn clear_data_shell(
         });
     }
 
-    let Some(target) = inspect_clear_target(&paths.database_path)? else {
-        return Ok(empty_data_clear_summary(paths));
+    let Some(target) = inspect_purge_target(&paths.database_path)? else {
+        return Ok(empty_purge_summary(paths));
     };
     let counts = inspect_catalog_snapshot(&target.snapshot_database)
         .await
@@ -311,7 +311,7 @@ pub async fn clear_data_shell(
                 paths.database_path.display()
             )
         })?;
-    Ok(DataClearSummary {
+    Ok(PurgeSummary {
         database: paths.database_path.clone(),
         sessions: counts.sessions,
         transcript_items: counts.transcript_items,
@@ -320,8 +320,8 @@ pub async fn clear_data_shell(
     })
 }
 
-fn empty_data_clear_summary(paths: &AppPaths) -> DataClearSummary {
-    DataClearSummary {
+fn empty_purge_summary(paths: &AppPaths) -> PurgeSummary {
+    PurgeSummary {
         database: paths.database_path.clone(),
         sessions: 0,
         transcript_items: 0,
@@ -331,18 +331,18 @@ fn empty_data_clear_summary(paths: &AppPaths) -> DataClearSummary {
 }
 
 #[derive(Debug)]
-struct ClearTarget {
+struct PurgeTarget {
     approximate_bytes: u64,
     _snapshot_directory: tempfile::TempDir,
     snapshot_database: PathBuf,
 }
 
-struct ConfirmedClearTarget {
+struct ConfirmedPurgeTarget {
     approximate_bytes: u64,
     database_identity: CatalogFileIdentity,
 }
 
-fn inspect_confirmed_clear_target(database: &Path) -> anyhow::Result<Option<ConfirmedClearTarget>> {
+fn inspect_confirmed_purge_target(database: &Path) -> anyhow::Result<Option<ConfirmedPurgeTarget>> {
     let Some(files) = inspect_catalog_file_set(database)? else {
         return Ok(None);
     };
@@ -353,27 +353,27 @@ fn inspect_confirmed_clear_target(database: &Path) -> anyhow::Result<Option<Conf
         .context("catalog file set is missing its main database")?
         .state
         .identity;
-    Ok(Some(ConfirmedClearTarget {
+    Ok(Some(ConfirmedPurgeTarget {
         approximate_bytes,
         database_identity,
     }))
 }
 
-fn inspect_clear_target(database: &Path) -> anyhow::Result<Option<ClearTarget>> {
-    inspect_clear_target_with_hook(database, || {})
+fn inspect_purge_target(database: &Path) -> anyhow::Result<Option<PurgeTarget>> {
+    inspect_purge_target_with_hook(database, || {})
 }
 
-fn inspect_clear_target_with_hook(
+fn inspect_purge_target_with_hook(
     database: &Path,
     after_copy: impl FnOnce(),
-) -> anyhow::Result<Option<ClearTarget>> {
+) -> anyhow::Result<Option<PurgeTarget>> {
     let Some(files) = read_catalog_file_set(database)? else {
         return Ok(None);
     };
     let approximate_bytes =
         catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
     let snapshot_directory = tempfile::Builder::new()
-        .prefix("agentlog-data-clear-")
+        .prefix("agentlog-purge-")
         .tempdir_in("/private/tmp")
         .context("create private catalog inspection snapshot")?;
     let snapshot_database = snapshot_directory.path().join("agentlog.sqlite3");
@@ -392,7 +392,7 @@ fn inspect_clear_target_with_hook(
     after_copy();
     validate_catalog_file_set(database, &files)?;
 
-    Ok(Some(ClearTarget {
+    Ok(Some(PurgeTarget {
         approximate_bytes,
         _snapshot_directory: snapshot_directory,
         snapshot_database,
@@ -408,11 +408,11 @@ fn catalog_file_set_size(
             .checked_add(length)
             .context("database size exceeds supported range")
     })?;
-    if approximate_bytes > DATA_CLEAR_SNAPSHOT_MAX_BYTES {
+    if approximate_bytes > PURGE_SNAPSHOT_MAX_BYTES {
         anyhow::bail!(
             "refusing to inspect {}; the SQLite file set exceeds the {} byte snapshot limit",
             database.display(),
-            DATA_CLEAR_SNAPSHOT_MAX_BYTES
+            PURGE_SNAPSHOT_MAX_BYTES
         );
     }
     Ok(approximate_bytes)
@@ -548,7 +548,7 @@ fn catalog_file_descriptors_match(
 
 fn catalog_changed<T>() -> anyhow::Result<T> {
     Err(anyhow::anyhow!(
-        "Agentlog database file set changed while preparing a read-only clear preview; retry the command"
+        "Agentlog database file set changed while preparing a read-only purge preview; retry the command"
     ))
 }
 
@@ -584,8 +584,8 @@ mod tests {
     };
 
     use super::{
-        DATA_CLEAR_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, clear_data_shell,
-        diagnostics_shell, inspect_clear_target, inspect_clear_target_with_hook, list_shell,
+        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, diagnostics_shell,
+        inspect_purge_target, inspect_purge_target_with_hook, list_shell, purge_catalog_shell,
         sqlite_sidecar_path, sync_scanner, sync_shell,
     };
 
@@ -677,7 +677,7 @@ mod tests {
         files
     }
 
-    async fn scanned_data_clear_fixture() -> (TempDir, AppPaths, std::path::PathBuf) {
+    async fn scanned_purge_fixture() -> (TempDir, AppPaths, std::path::PathBuf) {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let agentlog_home = temporary.path().join("agentlog");
         let gemini_root = temporary.path().join("gemini");
@@ -771,8 +771,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_clear_preview_and_missing_confirmation_leave_all_inputs_unchanged() {
-        let (_temporary, paths, source) = scanned_data_clear_fixture().await;
+    async fn purge_preview_and_missing_confirmation_leave_all_inputs_unchanged() {
+        let (_temporary, paths, source) = scanned_purge_fixture().await;
         let writer = open_database(&paths.database_path)
             .await
             .expect("open catalog to retain live WAL sidecars");
@@ -784,8 +784,8 @@ mod tests {
         .expect("write catalog WAL frame");
         let live_shm = sqlite_sidecar_path(&paths.database_path, "-shm");
         assert!(live_shm.is_file(), "live WAL database has an SHM sidecar");
-        let private_target = inspect_clear_target(&paths.database_path)
-            .expect("copy private clear target")
+        let private_target = inspect_purge_target(&paths.database_path)
+            .expect("copy private purge target")
             .expect("catalog target exists");
         assert!(
             !sqlite_sidecar_path(&private_target.snapshot_database, "-shm").exists(),
@@ -796,18 +796,18 @@ mod tests {
         let config_before = fingerprint(&paths.config_path);
         let source_before = fingerprint(&source);
 
-        let dry_run = clear_data_shell(&paths, false)
+        let preview = purge_catalog_shell(&paths, false)
             .await
-            .expect("preview data clear");
-        assert_eq!(dry_run.sessions, 1);
-        assert_eq!(dry_run.transcript_items, 1);
-        assert!(dry_run.approximate_bytes > 0);
-        assert!(!dry_run.cleared);
+            .expect("preview purge");
+        assert_eq!(preview.sessions, 1);
+        assert_eq!(preview.transcript_items, 1);
+        assert!(preview.approximate_bytes > 0);
+        assert!(!preview.cleared);
         assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
 
-        let without_yes = clear_data_shell(&paths, false)
+        let without_yes = purge_catalog_shell(&paths, false)
             .await
-            .expect("reject unconfirmed clear");
+            .expect("reject unconfirmed purge");
         assert!(!without_yes.cleared);
         assert!(paths.database_path.is_file());
         assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
@@ -817,13 +817,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_clear_preview_rejects_a_file_set_presence_change_during_snapshot() {
-        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+    async fn purge_preview_rejects_a_file_set_presence_change_during_snapshot() {
+        let (temporary, paths, _source) = scanned_purge_fixture().await;
         let shm = sqlite_sidecar_path(&paths.database_path, "-shm");
         let moved_shm = temporary.path().join("moved-agentlog-shm");
         let shm_was_present = shm.exists();
 
-        let error = inspect_clear_target_with_hook(&paths.database_path, || {
+        let error = inspect_purge_target_with_hook(&paths.database_path, || {
             if shm_was_present {
                 fs::rename(&shm, &moved_shm).expect("move existing SHM during snapshot");
             } else {
@@ -836,25 +836,25 @@ mod tests {
     }
 
     #[test]
-    fn data_clear_snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
+    fn purge_snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let database = temporary.path().join("agentlog.sqlite3");
         let file = fs::File::create(&database).expect("create sparse database");
-        file.set_len(DATA_CLEAR_SNAPSHOT_MAX_BYTES + 1)
+        file.set_len(PURGE_SNAPSHOT_MAX_BYTES + 1)
             .expect("size sparse database");
 
         let error =
-            inspect_clear_target(&database).expect_err("reject oversized metadata before reading");
+            inspect_purge_target(&database).expect_err("reject oversized metadata before reading");
 
         assert!(format!("{error:#}").contains("exceeds the 536870912 byte snapshot limit"));
     }
 
     #[tokio::test]
-    async fn confirmed_data_clear_reports_counts_from_its_clear_transaction() {
-        let (_temporary, paths, _source) = scanned_data_clear_fixture().await;
-        let preview = clear_data_shell(&paths, false)
+    async fn confirmed_purge_reports_counts_from_its_transaction() {
+        let (_temporary, paths, _source) = scanned_purge_fixture().await;
+        let preview = purge_catalog_shell(&paths, false)
             .await
-            .expect("preview initial catalog");
+            .expect("preview initial catalog purge");
         assert_eq!(preview.sessions, 1);
         assert_eq!(preview.transcript_items, 1);
 
@@ -888,9 +888,9 @@ mod tests {
         .expect("insert intervening transcript item");
         writer.close().await;
 
-        let cleared = clear_data_shell(&paths, true)
+        let cleared = purge_catalog_shell(&paths, true)
             .await
-            .expect("clear current transaction contents");
+            .expect("purge current transaction contents");
         assert_eq!(cleared.sessions, 2);
         assert_eq!(cleared.transcript_items, 2);
         assert!(cleared.cleared);
@@ -898,16 +898,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn confirmed_data_clear_rejects_a_final_component_symlink() {
-        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+    async fn confirmed_purge_rejects_a_final_component_symlink() {
+        let (temporary, paths, _source) = scanned_purge_fixture().await;
         let real_database = temporary.path().join("real-agentlog.sqlite3");
         fs::rename(&paths.database_path, &real_database).expect("move real database");
         symlink(&real_database, &paths.database_path).expect("link database path");
         let real_before = fingerprint(&real_database);
 
-        let error = clear_data_shell(&paths, true)
+        let error = purge_catalog_shell(&paths, true)
             .await
-            .expect_err("reject final database symlink");
+            .expect_err("reject final database symlink during purge");
 
         assert!(format!("{error:#}").contains("symbolic-link component"));
         assert_eq!(fingerprint(&real_database), real_before);
@@ -915,30 +915,30 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn confirmed_data_clear_rejects_an_ancestor_symlink() {
-        let (temporary, paths, _source) = scanned_data_clear_fixture().await;
+    async fn confirmed_purge_rejects_an_ancestor_symlink() {
+        let (temporary, paths, _source) = scanned_purge_fixture().await;
         let alias = temporary.path().join("agentlog-alias");
         symlink(&paths.data_dir, &alias).expect("link Agentlog home");
         let aliased_paths = AppPaths::resolve(Some(alias)).expect("resolve aliased paths");
         let before = directory_fingerprint(&paths.data_dir);
 
-        let error = clear_data_shell(&aliased_paths, true)
+        let error = purge_catalog_shell(&aliased_paths, true)
             .await
-            .expect_err("reject Agentlog home symlink");
+            .expect_err("reject Agentlog home symlink during purge");
 
         assert!(format!("{error:#}").contains("symbolic-link component"));
         assert_eq!(directory_fingerprint(&paths.data_dir), before);
     }
 
     #[tokio::test]
-    async fn confirmed_data_clear_empties_only_catalog_and_a_fresh_scan_rebuilds_it() {
-        let (_temporary, paths, source) = scanned_data_clear_fixture().await;
+    async fn confirmed_purge_empties_only_catalog_and_sync_rebuilds_available_fixture() {
+        let (_temporary, paths, source) = scanned_purge_fixture().await;
         let config_before = fingerprint(&paths.config_path);
         let source_before = fingerprint(&source);
 
-        let cleared = clear_data_shell(&paths, true)
+        let cleared = purge_catalog_shell(&paths, true)
             .await
-            .expect("confirm data clear");
+            .expect("confirm purge");
         assert!(cleared.cleared);
         assert_eq!(cleared.sessions, 1);
         assert_eq!(cleared.transcript_items, 1);
@@ -949,19 +949,19 @@ mod tests {
         assert!(
             list_shell(&paths, 10)
                 .await
-                .expect("list cleared catalog")
+                .expect("list purged catalog")
                 .is_empty()
         );
         assert!(
             diagnostics_shell(&paths)
                 .await
-                .expect("list cleared diagnostics")
+                .expect("list purged diagnostics")
                 .is_empty()
         );
 
         let rebuilt = sync_shell(&paths)
             .await
-            .expect("fresh scan rebuilds catalog");
+            .expect("sync rebuilds available fixture");
         assert_eq!(rebuilt.sessions_available, 1);
         let sessions = list_shell(&paths, 10).await.expect("list rebuilt catalog");
         assert_eq!(sessions.len(), 1);
@@ -969,7 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_clear_rejects_a_lookalike_v1_database_without_changing_it() {
+    async fn purge_rejects_a_lookalike_v1_database_without_changing_it() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
@@ -997,7 +997,7 @@ mod tests {
         pool.close().await;
         let before = directory_fingerprint(&paths.data_dir);
 
-        let error = clear_data_shell(&paths, false)
+        let error = purge_catalog_shell(&paths, false)
             .await
             .expect_err("reject lookalike database");
         assert!(format!("{error:#}").contains("schema v1 fingerprint"));
@@ -1005,8 +1005,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_data_clear_fails_when_another_sqlite_writer_is_active() {
-        let (_temporary, paths, _source) = scanned_data_clear_fixture().await;
+    async fn confirmed_purge_fails_when_another_sqlite_writer_is_active() {
+        let (_temporary, paths, _source) = scanned_purge_fixture().await;
         let writer: SqlitePool = open_database(&paths.database_path)
             .await
             .expect("open competing writer");
@@ -1015,7 +1015,7 @@ mod tests {
             .await
             .expect("hold SQLite writer lock");
 
-        assert!(clear_data_shell(&paths, true).await.is_err());
+        assert!(purge_catalog_shell(&paths, true).await.is_err());
         transaction.rollback().await.expect("release writer lock");
         writer.close().await;
         assert_eq!(

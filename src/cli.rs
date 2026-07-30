@@ -6,7 +6,7 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
-    app::{clear_data_shell, list_shell, paths_report, show_shell, sync_shell},
+    app::{list_shell, paths_report, purge_catalog_shell, show_shell, sync_shell},
     display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
@@ -55,26 +55,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect or explicitly clear only the Agentlog-owned catalog database.
-    Data {
-        #[command(subcommand)]
-        command: DataCommand,
-    },
-    /// Browse already-cataloged sessions in an interactive terminal UI.
-    Browse,
-}
-
-#[derive(Debug, Subcommand)]
-enum DataCommand {
-    /// Report the catalog clear target; add --yes to clear its contents.
-    Clear {
-        /// Explicitly report without changing the catalog.
-        #[arg(long, conflicts_with = "yes")]
-        dry_run: bool,
-        /// Confirm clearing the reported Agentlog-owned catalog only.
+    /// Preview, or with --yes purge, the Agentlog-owned catalog database.
+    Purge {
+        /// Purge the reported Agentlog-owned catalog contents.
         #[arg(long)]
         yes: bool,
     },
+    /// Browse already-cataloged sessions in an interactive terminal UI.
+    Browse,
 }
 
 /// Parses process arguments and dispatches one command-line workflow.
@@ -97,34 +85,33 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Sync { json } => print_sync(&paths, json).await,
         Command::List { limit, json } => print_list(&paths, limit, json).await,
         Command::Show { session_id, json } => print_show(&paths, session_id, json).await,
-        Command::Data { command } => match command {
-            DataCommand::Clear { dry_run, yes } => print_data_clear(&paths, dry_run, yes).await,
-        },
+        Command::Purge { yes } => print_purge(&paths, yes).await,
         Command::Browse => tui::run(&paths).await,
     }
 }
 
-async fn print_data_clear(paths: &AppPaths, dry_run: bool, yes: bool) -> anyhow::Result<()> {
-    let summary = clear_data_shell(paths, yes).await?;
-    println!(
+async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
+    let summary = purge_catalog_shell(paths, yes).await?;
+    eprintln!(
         "Agentlog-owned database target: {}",
         visible_text(&summary.database.display().to_string())
     );
-    println!("Catalog sessions: {}", summary.sessions);
-    println!("Transcript items: {}", summary.transcript_items);
-    println!(
+    eprintln!("Catalog sessions: {}", summary.sessions);
+    eprintln!("Transcript items: {}", summary.transcript_items);
+    eprintln!(
         "Approximate database size: {} ({} bytes)",
         human_readable_bytes(summary.approximate_bytes),
         summary.approximate_bytes
     );
-    if dry_run {
-        println!("Dry run: no data was changed. Re-run with --yes to clear.");
-    } else if !yes {
-        println!("No data was changed. Re-run with --yes to clear.");
+    eprintln!(
+        "Warning: Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
+    );
+    if !yes {
+        eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm.");
     } else if summary.cleared {
-        println!("Data clear: cleared the reported Agentlog-owned catalog contents.");
+        eprintln!("Purge complete: cleared the reported Agentlog-owned catalog contents.");
     } else {
-        println!("Data clear: no Agentlog-owned database was present.");
+        eprintln!("Purge complete: no Agentlog-owned database was present.");
     }
     Ok(())
 }
@@ -309,7 +296,7 @@ fn print_visible_transcript(label: &str, content: &str) {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DataCommand, human_readable_bytes};
+    use super::{Cli, Command, human_readable_bytes};
 
     #[test]
     fn database_sizes_use_readable_binary_units() {
@@ -321,23 +308,25 @@ mod tests {
     }
 
     #[test]
-    fn data_clear_accepts_an_explicit_dry_run() {
-        let cli = Cli::try_parse_from(["agentlog", "data", "clear", "--dry-run"])
-            .expect("parse data clear dry-run");
+    fn purge_accepts_preview_and_explicit_confirmation() {
+        let preview = Cli::try_parse_from(["agentlog", "purge"]).expect("parse purge preview");
         assert!(matches!(
-            cli.command,
-            Some(Command::Data {
-                command: DataCommand::Clear {
-                    dry_run: true,
-                    yes: false
-                }
-            })
+            preview.command,
+            Some(Command::Purge { yes: false })
+        ));
+
+        let confirmed =
+            Cli::try_parse_from(["agentlog", "purge", "--yes"]).expect("parse confirmed purge");
+        assert!(matches!(
+            confirmed.command,
+            Some(Command::Purge { yes: true })
         ));
     }
 
     #[test]
-    fn data_clear_rejects_conflicting_confirmation_and_dry_run() {
-        assert!(Cli::try_parse_from(["agentlog", "data", "clear", "--dry-run", "--yes"]).is_err());
+    fn purge_rejects_legacy_data_clear_and_dry_run_forms() {
+        assert!(Cli::try_parse_from(["agentlog", "data", "clear"]).is_err());
+        assert!(Cli::try_parse_from(["agentlog", "purge", "--dry-run"]).is_err());
     }
 
     #[test]

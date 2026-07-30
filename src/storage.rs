@@ -574,7 +574,7 @@ fn verify_catalog_file_identity(
     }
 }
 
-/// Acquires `SQLite`'s writer serialization and clears every catalog row.
+/// Acquires `SQLite`'s writer serialization and purges every catalog row.
 ///
 /// Schema validation, retained-count collection, and row deletion happen in
 /// one `BEGIN IMMEDIATE` transaction. The schema itself remains so a later
@@ -584,14 +584,14 @@ fn verify_catalog_file_identity(
 ///
 /// Returns an error when another writer is active, the database is not the
 /// exact Agentlog v1 schema, or the transaction cannot be committed.
-pub(crate) async fn clear_existing_catalog(
+pub(crate) async fn purge_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
 ) -> Result<CatalogCounts, StorageError> {
-    clear_existing_catalog_with_hook(path, expected_identity, || {}).await
+    purge_existing_catalog_with_hook(path, expected_identity, || {}).await
 }
 
-async fn clear_existing_catalog_with_hook(
+async fn purge_existing_catalog_with_hook(
     path: &Path,
     expected_identity: CatalogFileIdentity,
     after_open: impl FnOnce(),
@@ -1409,9 +1409,9 @@ pub enum StorageError {
         #[source]
         source: std::io::Error,
     },
-    #[error("refusing to clear; Agentlog catalog path {path} {reason}")]
+    #[error("refusing to purge; Agentlog catalog path {path} {reason}")]
     UnsafeCatalogPath { path: PathBuf, reason: &'static str },
-    #[error("Agentlog catalog file identity changed while opening {path}; refusing to clear")]
+    #[error("Agentlog catalog file identity changed while opening {path}; refusing to purge")]
     CatalogFileIdentityChanged { path: PathBuf },
     #[error("catalog transcript ordinal exceeds SQLite integer range")]
     OrdinalOverflow,
@@ -1454,8 +1454,8 @@ mod tests {
 
     use super::{
         Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
-        SourceSnapshot, StorageError, clear_existing_catalog_with_hook, inspect_catalog_file_state,
-        list_catalog_sessions, list_catalog_source_diagnostics, open_database,
+        SourceSnapshot, StorageError, inspect_catalog_file_state, list_catalog_sessions,
+        list_catalog_source_diagnostics, open_database, purge_existing_catalog_with_hook,
         read_catalog_preview, read_catalog_preview_by_identity, record_source_failure,
         replace_source_snapshot,
     };
@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_rejects_a_database_identity_replaced_after_sqlite_open() {
+    async fn purge_rejects_a_database_identity_replaced_after_sqlite_open() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let database_path = temporary.path().join("agentlog.sqlite3");
         let original = open_database(&database_path)
@@ -1615,7 +1615,7 @@ mod tests {
         replacement.close().await;
         let displaced_path = temporary.path().join("displaced.sqlite3");
 
-        let error = clear_existing_catalog_with_hook(&database_path, expected_identity, || {
+        let error = purge_existing_catalog_with_hook(&database_path, expected_identity, || {
             fs::rename(&database_path, &displaced_path).expect("displace opened database");
             fs::rename(&replacement_path, &database_path).expect("replace database path");
         })

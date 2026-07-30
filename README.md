@@ -20,8 +20,8 @@ cargo run -- sync
 cargo run -- sync --json
 cargo run -- list
 cargo run -- show 1
-cargo run -- data clear --dry-run
-cargo run -- data clear --yes
+cargo run -- purge
+cargo run -- purge --yes
 cargo run -- browse
 ```
 
@@ -86,21 +86,21 @@ cargo run -- --home /tmp/agentlog-demo paths
 cargo run -- --home /tmp/agentlog-demo sync
 ```
 
-### Clearing the local catalog
+### Purging the local catalog
 
-`agentlog data clear --dry-run` reports the exact Agentlog-owned database path,
-catalog session count, transcript-item count, and approximate SQLite file-set
-size in human-readable IEC units (with the exact byte count) without changing
-any files. `agentlog data clear` is also non-destructive;
-add `--yes` only after reviewing that report to clear catalog rows while
-preserving the Agentlog-owned SQLite schema and files. Previewing privately
-copies only the bounded SQLite main/WAL contents, validates the complete
-main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh private SHM,
-so it never opens the live catalog. Confirmation reports counts collected by
-the same SQLite writer transaction that clears the rows; it fails instead of
-racing another active writer. The command never deletes configuration, provider
-sources, or raw provider logs. Run `agentlog sync` afterwards to build a fresh
-catalog from the unchanged provider-owned sources.
+`agentlog purge` previews the exact Agentlog-owned database path, catalog
+session count, transcript-item count, and approximate SQLite file-set size in
+human-readable IEC units (with the exact byte count), without changing files.
+Run `agentlog purge --yes` only after reviewing that report to purge catalog
+rows while preserving the Agentlog-owned SQLite schema and files. Previewing
+privately copies only the bounded SQLite main/WAL contents, validates the
+complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
+private SHM, so it never opens the live catalog. Confirmation reports counts
+collected by the same SQLite writer transaction that purges the rows; it fails
+instead of racing another active writer. The command never deletes
+configuration, provider sources, an external database, or raw provider logs.
+Catalog data may not be reconstructible: only provider logs that still exist
+and remain readable can be synchronized.
 
 Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
 `~/.codex`. Claude Code source discovery uses `providers.claude_root`, then
