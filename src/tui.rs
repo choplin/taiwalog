@@ -628,6 +628,7 @@ enum SyncStatus {
 
 #[derive(Clone, Debug)]
 struct SyncSummaryLine {
+    providers_failed: u8,
     refreshed_sources: u64,
     partial_sources: u64,
     failed_sources: u64,
@@ -681,6 +682,7 @@ impl BrowseState {
     fn finish_sync(&mut self, result: &anyhow::Result<SyncSummary>) {
         self.sync_status = match result {
             Ok(summary) => SyncStatus::Complete(SyncSummaryLine {
+                providers_failed: summary.providers_failed,
                 refreshed_sources: summary.sources_refreshed,
                 partial_sources: summary.sources_partial,
                 failed_sources: summary.sources_failed,
@@ -1323,7 +1325,8 @@ fn sync_status_line(state: &BrowseState) -> String {
         SyncStatus::Idle => "Sync: not started".to_owned(),
         SyncStatus::Running => "Sync: running; existing sessions remain available".to_owned(),
         SyncStatus::Complete(summary) => format!(
-            "Sync: sources={} partial={} failed={} missing={} sessions={}",
+            "Sync: providers_failed={} sources={} partial={} failed={} missing={} sessions={}",
+            summary.providers_failed,
             summary.refreshed_sources,
             summary.partial_sources,
             summary.failed_sources,
@@ -1716,11 +1719,13 @@ fn diagnostic_content(state: &BrowseState) -> (Vec<String>, Option<String>) {
             let mut ok = 0;
             let mut partial = 0;
             let mut error = 0;
+            let mut missing = 0;
             for diagnostic in diagnostics {
                 match diagnostic.diagnostic_status.as_str() {
                     "ok" => ok += 1,
                     "partial" => partial += 1,
                     "error" => error += 1,
+                    "missing" => missing += 1,
                     _ => {}
                 }
                 let attributed = selected.is_some_and(|identity| {
@@ -1751,7 +1756,7 @@ fn diagnostic_content(state: &BrowseState) -> (Vec<String>, Option<String>) {
             lines.insert(
                 0,
                 format!(
-                    "Sources: {} | ok={ok} partial={partial} error={error}",
+                    "Sources: {} | ok={ok} partial={partial} error={error} missing={missing}",
                     diagnostics.len()
                 ),
             );
@@ -2121,6 +2126,7 @@ mod tests {
             .send(Ok(SyncSummary {
                 schema_version: 1,
                 collectors_installed: 6,
+                providers_failed: 1,
                 sources_refreshed: 2,
                 sources_partial: 1,
                 sources_failed: 1,
@@ -2134,8 +2140,11 @@ mod tests {
         state.finish_sync(&result);
 
         assert_eq!(state.selected, selected);
-        let rendered = rendered_text(&mut state, 100, 24);
-        assert!(rendered.contains("sources=2 partial=1 failed=1 missing=0 sessions=1"));
+        let rendered = rendered_text(&mut state, 180, 24);
+        assert!(
+            rendered
+                .contains("providers_failed=1 sources=2 partial=1 failed=1 missing=0 sessions=1")
+        );
         assert!(rendered.contains("session-1"));
     }
 
@@ -2651,18 +2660,29 @@ mod tests {
             session_key: "key-1".to_owned(),
         });
 
-        state.diagnostics = Some(vec![CatalogSourceDiagnostic {
-            provider: "a\u{1b}]8;;bad\u{7}".to_owned(),
-            source_format: "jsonl".to_owned(),
-            source_locator: "/source/1\u{1b}[2J".to_owned(),
-            diagnostic_status: "error".to_owned(),
-            diagnostic_message: Some("broken\u{9b} input".to_owned()),
-            diagnostic_recorded_at: Some(1),
-            last_success_at: None,
-        }]);
+        state.diagnostics = Some(vec![
+            CatalogSourceDiagnostic {
+                provider: "a\u{1b}]8;;bad\u{7}".to_owned(),
+                source_format: "jsonl".to_owned(),
+                source_locator: "/source/1\u{1b}[2J".to_owned(),
+                diagnostic_status: "error".to_owned(),
+                diagnostic_message: Some("broken\u{9b} input".to_owned()),
+                diagnostic_recorded_at: Some(1),
+                last_success_at: None,
+            },
+            CatalogSourceDiagnostic {
+                provider: "gemini".to_owned(),
+                source_format: "jsonl".to_owned(),
+                source_locator: "/source/missing".to_owned(),
+                diagnostic_status: "missing".to_owned(),
+                diagnostic_message: Some("not discovered".to_owned()),
+                diagnostic_recorded_at: Some(2),
+                last_success_at: Some(1),
+            },
+        ]);
         state.overlay = Overlay::Diagnostics;
         let diagnostics = rendered_text(&mut state, 80, 24);
-        assert!(diagnostics.contains("Sources: 1"));
+        assert!(diagnostics.contains("Sources: 2 | ok=0 partial=0 error=1 missing=1"));
         assert!(diagnostics.contains("broken\\u{009B} input"));
         assert!(diagnostics.contains("> [a\\u{001B}]8;;bad\\u{0007}:jsonl]"));
         assert!(!diagnostics.contains('\u{1b}'));

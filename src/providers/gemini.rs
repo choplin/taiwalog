@@ -96,7 +96,7 @@ impl GeminiProvider {
         ProviderId::Gemini
     }
 
-    fn sources(&self) -> std::io::Result<Vec<GeminiSource>> {
+    fn sources(&self) -> std::io::Result<Vec<(GeminiSource, SourceIdentity)>> {
         discover(&self.root)
     }
 }
@@ -131,7 +131,7 @@ impl ProviderScanner for GeminiScanner {
 
 struct GeminiScan {
     candidate_sources: u64,
-    sources: std::vec::IntoIter<GeminiSource>,
+    sources: std::vec::IntoIter<(GeminiSource, SourceIdentity)>,
 }
 
 impl ProviderScan for GeminiScan {
@@ -140,13 +140,13 @@ impl ProviderScan for GeminiScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let outcome = self.sources.next().map(|source| {
-            let identity = identity(&source);
-            match parse(&source) {
-                Ok(snapshot) => SourceOutcome::Accepted(snapshot),
-                Err(message) => SourceOutcome::Failed { identity, message },
-            }
-        });
+        let outcome =
+            self.sources.next().map(
+                |(source, identity)| match parse(&source, identity.clone()) {
+                    Ok(snapshot) => SourceOutcome::Accepted(snapshot),
+                    Err(message) => SourceOutcome::Failed { identity, message },
+                },
+            );
         Box::pin(async move { Ok(outcome) })
     }
 }
@@ -198,17 +198,19 @@ pub async fn collect_gemini(
     })
 }
 
-fn discover(root: &Path) -> std::io::Result<Vec<GeminiSource>> {
+fn discover(root: &Path) -> std::io::Result<Vec<(GeminiSource, SourceIdentity)>> {
     let mut sources = Vec::new();
     visit(&root.join("tmp"), &mut |path| {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            sources.push(GeminiSource {
+            let source = GeminiSource {
                 path: path.to_path_buf(),
-            });
+            };
+            let identity = identity(&source);
+            sources.push((source, identity));
         }
         Ok(())
     })?;
-    sources.sort_by(|left, right| left.path.cmp(&right.path));
+    sources.sort_by(|left, right| left.0.path.cmp(&right.0.path));
     Ok(sources)
 }
 
@@ -252,12 +254,11 @@ fn identity(source: &GeminiSource) -> SourceIdentity {
     }
 }
 
-fn parse(source: &GeminiSource) -> Result<SourceSnapshot, &'static str> {
+fn parse(source: &GeminiSource, identity: SourceIdentity) -> Result<SourceSnapshot, &'static str> {
     let before = fingerprint(&source.path)?;
     if before.size > MAX_SOURCE_BYTES {
         return Err("source exceeds the supported size limit");
     }
-    let identity = identity(source);
     let mut session_key = None;
     let mut items = Vec::new();
     let mut text_bytes = 0;

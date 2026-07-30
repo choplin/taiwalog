@@ -101,7 +101,7 @@ impl CodexProvider {
         ProviderId::Codex
     }
 
-    fn sources(&self) -> std::io::Result<Vec<CodexSource>> {
+    fn sources(&self) -> std::io::Result<Vec<(CodexSource, SourceIdentity)>> {
         discover_sources(&self.root)
     }
 }
@@ -136,7 +136,7 @@ impl ProviderScanner for CodexScanner {
 
 struct CodexScan {
     candidate_sources: u64,
-    sources: std::vec::IntoIter<CodexSource>,
+    sources: std::vec::IntoIter<(CodexSource, SourceIdentity)>,
 }
 
 impl ProviderScan for CodexScan {
@@ -145,9 +145,8 @@ impl ProviderScan for CodexScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let outcome = self.sources.next().map(|source| {
-            let identity = source_identity(&source);
-            match parse_source(&source) {
+        let outcome = self.sources.next().map(|(source, identity)| {
+            match parse_source(&source, identity.clone()) {
                 Ok(snapshot) => SourceOutcome::Accepted(snapshot),
                 Err(message) => SourceOutcome::Failed { identity, message },
             }
@@ -249,24 +248,28 @@ pub async fn collect_codex(
     })
 }
 
-fn discover_sources(root: &Path) -> std::io::Result<Vec<CodexSource>> {
+fn discover_sources(root: &Path) -> std::io::Result<Vec<(CodexSource, SourceIdentity)>> {
     let mut sources = Vec::new();
     visit_jsonl_files(&root.join("sessions"), &mut |path| {
-        sources.push(CodexSource {
+        let source = CodexSource {
             path: path.to_path_buf(),
             format: CodexSourceFormat::CurrentSessionJsonl,
-        });
+        };
+        let identity = source_identity(&source);
+        sources.push((source, identity));
         Ok(())
     })?;
 
     let legacy = root.join("history.jsonl");
     if is_regular_file(&legacy)? {
-        sources.push(CodexSource {
+        let source = CodexSource {
             path: legacy,
             format: CodexSourceFormat::LegacyHistoryJsonl,
-        });
+        };
+        let identity = source_identity(&source);
+        sources.push((source, identity));
     }
-    sources.sort_by(|left, right| left.path.cmp(&right.path));
+    sources.sort_by(|left, right| left.0.path.cmp(&right.0.path));
     Ok(sources)
 }
 
@@ -332,12 +335,14 @@ fn source_identity(source: &CodexSource) -> SourceIdentity {
     }
 }
 
-fn parse_source(source: &CodexSource) -> Result<SourceSnapshot, &'static str> {
+fn parse_source(
+    source: &CodexSource,
+    identity: SourceIdentity,
+) -> Result<SourceSnapshot, &'static str> {
     let metadata = fs::metadata(&source.path).map_err(|_| "could not read provider source")?;
     if metadata.len() > MAX_SOURCE_BYTES {
         return Err("source exceeds the supported size limit");
     }
-    let identity = source_identity(source);
     match source.format {
         CodexSourceFormat::CurrentSessionJsonl => parse_current_source(&source.path, identity),
         CodexSourceFormat::LegacyHistoryJsonl => parse_legacy_source(&source.path, identity),
@@ -995,14 +1000,18 @@ mod tests {
     use sqlx::SqlitePool;
     use tempfile::TempDir;
 
-    use crate::storage::{
-        CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, open_database,
-        replace_source_snapshot,
+    use crate::{
+        providers::{ProviderScanner, SourceOutcome},
+        storage::{
+            CatalogItem, CatalogSession, SourceIdentity, SourceSnapshot, open_database,
+            replace_source_snapshot,
+        },
     };
 
     use super::{
-        CodexSource, CodexSourceFormat, MAX_ITEMS_PER_SESSION, MAX_SELECTED_TEXT_BYTES,
-        MAX_TEXT_BYTES, collect_codex, parse_current_source, source_identity, timestamp,
+        CodexProvider, CodexScanner, CodexSource, CodexSourceFormat, MAX_ITEMS_PER_SESSION,
+        MAX_SELECTED_TEXT_BYTES, MAX_TEXT_BYTES, collect_codex, parse_current_source,
+        source_identity, timestamp,
     };
 
     fn temporary() -> TempDir {
@@ -1018,6 +1027,38 @@ mod tests {
         open_database(&temporary.path().join("catalog.sqlite3"))
             .await
             .expect("open catalog")
+    }
+
+    #[tokio::test]
+    async fn discovery_identity_survives_a_delete_before_source_read() {
+        let temporary = temporary();
+        let root = temporary.path().join("codex");
+        let source = root.join("sessions/project/session.jsonl");
+        write(
+            &source,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\"}}\n",
+        );
+        let expected_locator = source
+            .canonicalize()
+            .expect("canonical source before race")
+            .to_string_lossy()
+            .into_owned();
+        let scanner = CodexScanner::new(CodexProvider::at_root(root));
+        let mut scan = scanner.start().expect("complete discovery");
+
+        fs::remove_file(&source).expect("simulate discovery-to-read delete");
+        let outcome = scan
+            .next_outcome()
+            .await
+            .expect("source outcome")
+            .expect("discovered source");
+
+        match outcome {
+            SourceOutcome::Failed { identity, .. } => {
+                assert_eq!(identity.canonical_locator, expected_locator);
+            }
+            SourceOutcome::Accepted(_) => panic!("deleted source must fail"),
+        }
     }
 
     #[tokio::test]

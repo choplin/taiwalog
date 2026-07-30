@@ -106,7 +106,7 @@ impl ClaudeProvider {
         ProviderId::Claude
     }
 
-    fn sources(&self) -> std::io::Result<Vec<ClaudeSource>> {
+    fn sources(&self) -> std::io::Result<Vec<(ClaudeSource, SourceIdentity)>> {
         discover_sources(&self.root)
     }
 }
@@ -141,7 +141,7 @@ impl ProviderScanner for ClaudeScanner {
 
 struct ClaudeScan {
     candidate_sources: u64,
-    sources: std::vec::IntoIter<ClaudeSource>,
+    sources: std::vec::IntoIter<(ClaudeSource, SourceIdentity)>,
 }
 
 impl ProviderScan for ClaudeScan {
@@ -150,9 +150,8 @@ impl ProviderScan for ClaudeScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let outcome = self.sources.next().map(|source| {
-            let identity = source_identity(&source);
-            match parse_source(&source) {
+        let outcome = self.sources.next().map(|(source, identity)| {
+            match parse_source(&source, identity.clone()) {
                 Ok(snapshot) => SourceOutcome::Accepted(snapshot),
                 Err(message) => SourceOutcome::Failed { identity, message },
             }
@@ -247,16 +246,18 @@ pub async fn collect_claude(
     })
 }
 
-fn discover_sources(root: &Path) -> std::io::Result<Vec<ClaudeSource>> {
+fn discover_sources(root: &Path) -> std::io::Result<Vec<(ClaudeSource, SourceIdentity)>> {
     let mut sources = Vec::new();
     visit_project_sources(&root.join("projects"), &mut |path, format| {
-        sources.push(ClaudeSource {
+        let source = ClaudeSource {
             path: path.to_path_buf(),
             format,
-        });
+        };
+        let identity = source_identity(&source);
+        sources.push((source, identity));
         Ok(())
     })?;
-    sources.sort_by(|left, right| left.path.cmp(&right.path));
+    sources.sort_by(|left, right| left.0.path.cmp(&right.0.path));
     Ok(sources)
 }
 
@@ -314,13 +315,15 @@ fn source_identity(source: &ClaudeSource) -> SourceIdentity {
     }
 }
 
-fn parse_source(source: &ClaudeSource) -> Result<SourceSnapshot, &'static str> {
+fn parse_source(
+    source: &ClaudeSource,
+    identity: SourceIdentity,
+) -> Result<SourceSnapshot, &'static str> {
     let before = source_fingerprint(&source.path)?;
     if before.size > MAX_SOURCE_BYTES {
         return Err("source exceeds the supported size limit");
     }
 
-    let identity = source_identity(source);
     let mut session_key = None;
     let mut cwd = None;
     let mut repository = None;

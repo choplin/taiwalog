@@ -116,11 +116,20 @@ impl OpenCodeProvider {
         ProviderId::OpenCode
     }
 
-    fn sources(&self) -> Vec<PathBuf> {
-        database_candidates(&self.roots)
-            .into_iter()
-            .filter(|path| path.is_file())
-            .collect()
+    fn sources(&self) -> std::io::Result<Vec<(PathBuf, SourceIdentity)>> {
+        let mut sources = Vec::new();
+        for path in database_candidates(&self.roots) {
+            match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let identity = source_identity(&path);
+                    sources.push((path, identity));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(sources)
     }
 }
 
@@ -143,7 +152,7 @@ impl ProviderScanner for OpenCodeScanner {
     }
 
     fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
-        let sources = self.provider.sources();
+        let sources = self.provider.sources()?;
         let candidate_sources = u64::try_from(sources.len()).unwrap_or(u64::MAX);
         Ok(Box::new(OpenCodeScan {
             candidate_sources,
@@ -154,7 +163,7 @@ impl ProviderScanner for OpenCodeScanner {
 
 struct OpenCodeScan {
     candidate_sources: u64,
-    sources: std::vec::IntoIter<PathBuf>,
+    sources: std::vec::IntoIter<(PathBuf, SourceIdentity)>,
 }
 
 impl ProviderScan for OpenCodeScan {
@@ -163,12 +172,11 @@ impl ProviderScan for OpenCodeScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let Some(path) = self.sources.next() else {
+        let Some((path, identity)) = self.sources.next() else {
             return Box::pin(async { Ok(None) });
         };
         Box::pin(async move {
-            let identity = source_identity(&path);
-            let outcome = match read_source(&path).await {
+            let outcome = match read_source(&path, identity.clone()).await {
                 Ok(snapshot) => SourceOutcome::Accepted(snapshot),
                 Err(message) => SourceOutcome::Failed { identity, message },
             };
@@ -263,7 +271,10 @@ fn source_identity(path: &Path) -> SourceIdentity {
     }
 }
 
-async fn read_source(path: &Path) -> Result<SourceSnapshot, &'static str> {
+async fn read_source(
+    path: &Path,
+    identity: SourceIdentity,
+) -> Result<SourceSnapshot, &'static str> {
     let snapshot = copy_read_snapshot(path)?;
     let options = SqliteConnectOptions::new()
         .filename(&snapshot.database_path)
@@ -274,7 +285,7 @@ async fn read_source(path: &Path) -> Result<SourceSnapshot, &'static str> {
         .await
         .map_err(|_| "could not open private OpenCode read snapshot")?;
 
-    let result = read_source_snapshot(&source, path).await;
+    let result = read_source_snapshot(&source, identity).await;
     source.close().await;
     result
 }
@@ -341,7 +352,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 
 async fn read_source_snapshot(
     source: &SqlitePool,
-    path: &Path,
+    identity: SourceIdentity,
 ) -> Result<SourceSnapshot, &'static str> {
     let mut transaction = source
         .begin()
@@ -381,7 +392,7 @@ async fn read_source_snapshot(
 
     let (sessions, partial_reason) = build_catalog_sessions(rows)?;
     Ok(SourceSnapshot {
-        identity: source_identity(path),
+        identity,
         diagnostic_status: if partial_reason.is_some() {
             "partial"
         } else {
@@ -893,9 +904,14 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use crate::storage::{open_database, read_catalog_preview};
+    use crate::storage::{
+        Catalog, CatalogScanError, SourceIdentity, SourceSnapshot, open_database,
+        read_catalog_preview, replace_source_snapshot,
+    };
 
-    use super::{MAX_ITEMS_PER_SESSION, MAX_TEXT_BYTES, collect_opencode};
+    use super::{
+        MAX_ITEMS_PER_SESSION, MAX_TEXT_BYTES, OpenCodeProvider, OpenCodeScanner, collect_opencode,
+    };
 
     #[derive(Debug, Eq, PartialEq)]
     struct SourceFileSnapshot {
@@ -919,6 +935,48 @@ mod tests {
             snapshot_file(&PathBuf::from(format!("{}-wal", path.display()))),
             snapshot_file(&PathBuf::from(format!("{}-shm", path.display()))),
         ]
+    }
+
+    #[tokio::test]
+    async fn incomplete_multi_root_discovery_preserves_last_good_without_marking_missing() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database_path = temporary.path().join("catalog.sqlite3");
+        let pool = open_database(&database_path).await.expect("open catalog");
+        replace_source_snapshot(
+            &pool,
+            &SourceSnapshot {
+                identity: SourceIdentity {
+                    provider: "opencode",
+                    source_format: "sqlite_catalog",
+                    canonical_locator: "test://last-good".to_owned(),
+                },
+                diagnostic_status: "ok",
+                diagnostic_message: None,
+                sessions: Vec::new(),
+            },
+        )
+        .await
+        .expect("store last-good source");
+        pool.close().await;
+
+        let oversized_component = "x".repeat(5_000);
+        let scanner = OpenCodeScanner::new(OpenCodeProvider::at_roots(vec![
+            temporary.path().join("absent"),
+            PathBuf::from("/private/tmp").join(oversized_component),
+        ]));
+        let catalog = Catalog::open(&database_path).await.expect("reopen catalog");
+        let error = catalog
+            .scan(&scanner)
+            .await
+            .expect_err("metadata failure must abort discovery");
+        assert!(matches!(error, CatalogScanError::Provider(_)));
+        let diagnostics = catalog
+            .source_diagnostics()
+            .await
+            .expect("last-good diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].diagnostic_status, "ok");
+        catalog.close().await;
     }
 
     async fn active_wal_source(root: &Path) -> (PathBuf, SqlitePool) {

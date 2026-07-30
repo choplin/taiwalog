@@ -29,8 +29,8 @@ cargo run -- browse
 sync in the background. Press `r` to request another sync; repeated requests
 while a sync is active do not start another one. The list remains available
 during sync, keeps its selection by provider/source/session key when rows are
-replaced, and reports bounded refreshed/partial/failed/missing/session counts
-when sync completes.
+replaced, and reports bounded provider-failure and
+refreshed/partial/failed/missing/session counts when sync completes.
 Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
 preview, `Esc` to return, and `q` to quit. Press `f` to refine by provider,
 repository, CWD, model, execution kind, and start date. Within each metadata

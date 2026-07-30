@@ -87,7 +87,7 @@ impl CursorProvider {
         ProviderId::Cursor
     }
 
-    fn sources(&self) -> std::io::Result<Vec<CursorSource>> {
+    fn sources(&self) -> std::io::Result<Vec<(CursorSource, SourceIdentity)>> {
         discover(&self.root)
     }
 }
@@ -122,7 +122,7 @@ impl ProviderScanner for CursorScanner {
 
 struct CursorScan {
     candidate_sources: u64,
-    sources: std::vec::IntoIter<CursorSource>,
+    sources: std::vec::IntoIter<(CursorSource, SourceIdentity)>,
 }
 
 impl ProviderScan for CursorScan {
@@ -131,13 +131,13 @@ impl ProviderScan for CursorScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let outcome = self.sources.next().map(|source| {
-            let identity = identity(&source);
-            match parse(&source) {
-                Ok(snapshot) => SourceOutcome::Accepted(snapshot),
-                Err(message) => SourceOutcome::Failed { identity, message },
-            }
-        });
+        let outcome =
+            self.sources.next().map(
+                |(source, identity)| match parse(&source, identity.clone()) {
+                    Ok(snapshot) => SourceOutcome::Accepted(snapshot),
+                    Err(message) => SourceOutcome::Failed { identity, message },
+                },
+            );
         Box::pin(async move { Ok(outcome) })
     }
 }
@@ -185,17 +185,19 @@ pub async fn collect_cursor(
         failed_sources: report.failed_sources,
     })
 }
-fn discover(root: &Path) -> std::io::Result<Vec<CursorSource>> {
+fn discover(root: &Path) -> std::io::Result<Vec<(CursorSource, SourceIdentity)>> {
     let mut sources = Vec::new();
     visit(&root.join("projects"), &mut |path| {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            sources.push(CursorSource {
+            let source = CursorSource {
                 path: path.to_path_buf(),
-            });
+            };
+            let identity = identity(&source);
+            sources.push((source, identity));
         }
         Ok(())
     })?;
-    sources.sort_by(|left, right| left.path.cmp(&right.path));
+    sources.sort_by(|left, right| left.0.path.cmp(&right.0.path));
     Ok(sources)
 }
 fn visit(
@@ -236,7 +238,7 @@ fn identity(source: &CursorSource) -> SourceIdentity {
             .into_owned(),
     }
 }
-fn parse(source: &CursorSource) -> Result<SourceSnapshot, &'static str> {
+fn parse(source: &CursorSource, identity: SourceIdentity) -> Result<SourceSnapshot, &'static str> {
     let before = fingerprint(&source.path)?;
     if before.size > MAX_SOURCE_BYTES {
         return Err("source exceeds the supported size limit");
@@ -311,7 +313,7 @@ fn parse(source: &CursorSource) -> Result<SourceSnapshot, &'static str> {
         Vec::new()
     };
     Ok(SourceSnapshot {
-        identity: identity(source),
+        identity,
         diagnostic_status: if partial.is_some() { "partial" } else { "ok" },
         diagnostic_message: partial.map(PartialReason::message),
         sessions,

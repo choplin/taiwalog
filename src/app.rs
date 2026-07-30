@@ -12,11 +12,11 @@ use serde::Serialize;
 
 use crate::{
     paths::AppPaths,
-    providers::{ProviderScanReport, installed, source_descriptions},
+    providers::{ProviderScanReport, ProviderScanner, installed, source_descriptions},
     storage::{
-        Catalog, CatalogFileIdentity, CatalogFileState, CatalogSessionPreview,
-        CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, clear_existing_catalog,
-        inspect_catalog_file_state, inspect_catalog_snapshot,
+        Catalog, CatalogFileIdentity, CatalogFileState, CatalogScanError, CatalogSessionPreview,
+        CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, StorageError,
+        clear_existing_catalog, inspect_catalog_file_state, inspect_catalog_snapshot,
     },
 };
 
@@ -27,6 +27,7 @@ const DATA_CLEAR_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub struct SyncSummary {
     pub schema_version: i64,
     pub collectors_installed: u8,
+    pub providers_failed: u8,
     pub sources_refreshed: u64,
     pub sources_partial: u64,
     pub sources_failed: u64,
@@ -49,6 +50,13 @@ pub struct ProviderSyncSummary {
     pub failure: Option<String>,
 }
 
+#[derive(Debug)]
+struct ProviderSyncResult {
+    provider: String,
+    report: ProviderScanReport,
+    failure: Option<String>,
+}
+
 /// Initializes the durable catalog and collects read-only provider sources.
 ///
 /// # Errors
@@ -61,71 +69,94 @@ pub async fn sync_shell(paths: &AppPaths) -> anyhow::Result<SyncSummary> {
     let mut sync_results = Vec::with_capacity(6);
     for scanner in installed(paths.provider_roots()) {
         match scanner {
-            Ok(scanner) => {
-                let provider = scanner.provider_id().as_str().to_owned();
-                match catalog.scan(&*scanner).await {
-                    Ok(report) => sync_results.push((provider, report, None)),
-                    Err(error) => sync_results.push((
-                        provider,
-                        ProviderScanReport::default(),
-                        Some(error.to_string()),
-                    )),
-                }
-            }
-            Err(error) => sync_results.push((
-                error.provider_id().as_str().to_owned(),
-                ProviderScanReport::default(),
-                Some(error.to_string()),
-            )),
+            Ok(scanner) => sync_results.push(sync_scanner(&catalog, scanner).await?),
+            Err(error) => sync_results.push(ProviderSyncResult {
+                provider: error.provider_id().as_str().to_owned(),
+                report: ProviderScanReport::default(),
+                failure: Some(error.to_string()),
+            }),
         }
     }
     let sessions_available = catalog.session_count().await?;
     let provider_session_counts = catalog.provider_session_counts().await?;
     catalog.close().await;
 
+    Ok(build_sync_summary(
+        &sync_results,
+        sessions_available,
+        &provider_session_counts,
+    ))
+}
+
+fn build_sync_summary(
+    sync_results: &[ProviderSyncResult],
+    sessions_available: u64,
+    provider_session_counts: &BTreeMap<String, u64>,
+) -> SyncSummary {
     let provider_summaries = sync_results
         .iter()
-        .map(|(provider, report, failure)| ProviderSyncSummary {
-            provider: provider.clone(),
-            candidate_sources: report.candidate_sources,
-            refreshed_sources: report.refreshed_sources,
-            partial_sources: report.partial_sources,
-            failed_sources: report.failed_sources,
-            missing_sources: report.missing_sources,
-            sessions_available: provider_sessions(&provider_session_counts, provider),
-            failure: failure.clone(),
+        .map(|result| ProviderSyncSummary {
+            provider: result.provider.clone(),
+            candidate_sources: result.report.candidate_sources,
+            refreshed_sources: result.report.refreshed_sources,
+            partial_sources: result.report.partial_sources,
+            failed_sources: result.report.failed_sources,
+            missing_sources: result.report.missing_sources,
+            sessions_available: provider_sessions(provider_session_counts, &result.provider),
+            failure: result.failure.clone(),
         })
         .collect::<Vec<_>>();
 
-    Ok(SyncSummary {
+    SyncSummary {
         schema_version: SCHEMA_VERSION,
-        collectors_installed: u8::try_from(
+        collectors_installed: u8::try_from(sync_results.len()).unwrap_or(u8::MAX),
+        providers_failed: u8::try_from(
             sync_results
                 .iter()
-                .filter(|(_, _, failure)| failure.is_none())
+                .filter(|result| result.failure.is_some())
                 .count(),
         )
         .unwrap_or(u8::MAX),
         sources_refreshed: sync_results
             .iter()
-            .map(|(_, report, _)| report.refreshed_sources)
+            .map(|result| result.report.refreshed_sources)
             .sum(),
         sources_partial: sync_results
             .iter()
-            .map(|(_, report, _)| report.partial_sources)
+            .map(|result| result.report.partial_sources)
             .sum(),
         sources_failed: sync_results
             .iter()
-            .map(|(_, report, _)| report.failed_sources)
+            .map(|result| result.report.failed_sources)
             .sum(),
         sources_missing: sync_results
             .iter()
-            .map(|(_, report, _)| report.missing_sources)
+            .map(|result| result.report.missing_sources)
             .sum(),
         sessions_available,
         provider_summaries,
         message: "Provider sources were read without modifying provider-owned files".to_owned(),
-    })
+    }
+}
+
+async fn sync_scanner(
+    catalog: &Catalog,
+    scanner: Box<dyn ProviderScanner>,
+) -> Result<ProviderSyncResult, StorageError> {
+    let provider = scanner.provider_id().as_str().to_owned();
+    match catalog.scan(&*scanner).await {
+        Ok(report) => Ok(ProviderSyncResult {
+            provider,
+            report,
+            failure: None,
+        }),
+        Err(CatalogScanError::Provider(error)) => Ok(ProviderSyncResult {
+            provider,
+            report: ProviderScanReport::default(),
+            failure: Some(error.to_string()),
+        }),
+        Err(CatalogScanError::Storage(error)) => Err(error),
+    }
 }
 
 fn provider_sessions(counts: &BTreeMap<String, u64>, provider: &str) -> u64 {
@@ -543,14 +574,74 @@ mod tests {
 
     use crate::{
         paths::AppPaths,
-        providers::opencode::create_test_database,
-        storage::{SCHEMA_VERSION, open_database},
+        providers::{
+            ProviderId, ProviderScan, ProviderScanError, ProviderScanFuture, ProviderScanReport,
+            ProviderScanner, SourceOutcome, opencode::create_test_database,
+        },
+        storage::{
+            Catalog, SCHEMA_VERSION, SourceIdentity, SourceSnapshot, StorageError, open_database,
+        },
     };
 
     use super::{
-        DATA_CLEAR_SNAPSHOT_MAX_BYTES, clear_data_shell, diagnostics_shell, inspect_clear_target,
-        inspect_clear_target_with_hook, list_shell, sqlite_sidecar_path, sync_shell,
+        DATA_CLEAR_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, clear_data_shell,
+        diagnostics_shell, inspect_clear_target, inspect_clear_target_with_hook, list_shell,
+        sqlite_sidecar_path, sync_scanner, sync_shell,
     };
+
+    struct ProviderFailureScanner;
+
+    impl ProviderScanner for ProviderFailureScanner {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "provider discovery denied",
+            )
+            .into())
+        }
+    }
+
+    struct StorageFailureScanner;
+
+    impl ProviderScanner for StorageFailureScanner {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+            Ok(Box::new(StorageFailureScan {
+                outcome: Some(SourceOutcome::Accepted(SourceSnapshot {
+                    identity: SourceIdentity {
+                        provider: "claude",
+                        source_format: "test",
+                        canonical_locator: "test://mismatch".to_owned(),
+                    },
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: Vec::new(),
+                })),
+            }))
+        }
+    }
+
+    struct StorageFailureScan {
+        outcome: Option<SourceOutcome>,
+    }
+
+    impl ProviderScan for StorageFailureScan {
+        fn candidate_sources(&self) -> u64 {
+            1
+        }
+
+        fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+            let outcome = self.outcome.take();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     struct FileFingerprint {
@@ -629,6 +720,54 @@ mod tests {
 
         assert!(diagnostics.is_empty());
         assert!(paths.database_path.is_file());
+    }
+
+    #[tokio::test]
+    async fn provider_failure_is_reported_without_becoming_a_source_failure() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
+            .await
+            .expect("open catalog");
+        let failed = sync_scanner(&catalog, Box::new(ProviderFailureScanner))
+            .await
+            .expect("provider failure is an observable sync result");
+        assert!(failed.failure.is_some());
+        assert_eq!(failed.report.failed_sources, 0);
+
+        let mut results = vec![failed];
+        for provider in ["claude", "opencode", "gemini", "cursor", "kimi"] {
+            results.push(ProviderSyncResult {
+                provider: provider.to_owned(),
+                report: ProviderScanReport::default(),
+                failure: None,
+            });
+        }
+        let summary = build_sync_summary(&results, 0, &std::collections::BTreeMap::new());
+        assert_eq!(summary.collectors_installed, 6);
+        assert_eq!(summary.providers_failed, 1);
+        assert_eq!(summary.sources_failed, 0);
+        let json = serde_json::to_value(&summary).expect("serialize provider failure summary");
+        assert_eq!(json["providers_failed"], 1);
+        catalog.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_failure_is_propagated_instead_of_reported_as_provider_completion() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
+            .await
+            .expect("open catalog");
+        let error = sync_scanner(&catalog, Box::new(StorageFailureScanner))
+            .await
+            .expect_err("storage failure must abort sync");
+        assert!(matches!(
+            error,
+            StorageError::ProviderIdentityMismatch {
+                expected: "codex",
+                found: "claude"
+            }
+        ));
+        catalog.close().await;
     }
 
     #[tokio::test]

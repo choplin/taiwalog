@@ -96,7 +96,7 @@ impl KimiProvider {
         ProviderId::Kimi
     }
 
-    fn sources(&self) -> std::io::Result<Vec<KimiSource>> {
+    fn sources(&self) -> std::io::Result<Vec<(KimiSource, SourceIdentity)>> {
         discover(&self.root)
     }
 }
@@ -134,7 +134,7 @@ impl ProviderScanner for KimiScanner {
 struct KimiScan {
     root: PathBuf,
     candidate_sources: u64,
-    sources: std::vec::IntoIter<KimiSource>,
+    sources: std::vec::IntoIter<(KimiSource, SourceIdentity)>,
     index: Result<IndexSnapshot, &'static str>,
 }
 
@@ -144,10 +144,9 @@ impl ProviderScan for KimiScan {
     }
 
     fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
-        let outcome = self.sources.next().map(|source| {
-            let identity = identity(&source);
+        let outcome = self.sources.next().map(|(source, identity)| {
             let parsed = match &self.index {
-                Ok(index) => parse(&self.root, &source, index),
+                Ok(index) => parse(&self.root, &source, identity.clone(), index),
                 Err(message) => Err(*message),
             };
             match parsed {
@@ -224,17 +223,18 @@ pub async fn collect_kimi(root: &Path, pool: &SqlitePool) -> Result<KimiScanRepo
     })
 }
 
-fn discover(root: &Path) -> std::io::Result<Vec<KimiSource>> {
+fn discover(root: &Path) -> std::io::Result<Vec<(KimiSource, SourceIdentity)>> {
     let mut sources = Vec::new();
     visit(&root.join("sessions"), &mut |path| {
         if path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl")
             && let Some(source) = wire_parts(root, path)
         {
-            sources.push(source);
+            let identity = identity(&source);
+            sources.push((source, identity));
         }
         Ok(())
     })?;
-    sources.sort_by(|left, right| left.wire.cmp(&right.wire));
+    sources.sort_by(|left, right| left.0.wire.cmp(&right.0.wire));
     Ok(sources)
 }
 
@@ -358,6 +358,7 @@ fn parse_index(root: &Path) -> Result<IndexSnapshot, &'static str> {
 fn parse(
     root: &Path,
     source: &KimiSource,
+    identity: SourceIdentity,
     index: &IndexSnapshot,
 ) -> Result<SourceSnapshot, &'static str> {
     if index
@@ -435,7 +436,7 @@ fn parse(
         .into_iter()
         .collect();
     Ok(SourceSnapshot {
-        identity: identity(source),
+        identity,
         diagnostic_status: if partial.is_some() { "partial" } else { "ok" },
         diagnostic_message: partial.map(PartialReason::message),
         sessions,

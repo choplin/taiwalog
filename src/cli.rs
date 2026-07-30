@@ -188,6 +188,7 @@ async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
     } else {
         eprintln!("Schema version: {}", summary.schema_version);
         eprintln!("Collectors installed: {}", summary.collectors_installed);
+        eprintln!("Providers failed: {}", summary.providers_failed);
         eprintln!("Sources refreshed: {}", summary.sources_refreshed);
         eprintln!("Sources partial: {}", summary.sources_partial);
         eprintln!("Sources failed: {}", summary.sources_failed);
