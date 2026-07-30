@@ -5,7 +5,7 @@
 //! modifying it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -31,6 +31,9 @@ const CREATE_SESSIONS: &str = "CREATE TABLE sessions (\n             id INTEGER 
 const CREATE_TRANSCRIPT_ITEMS: &str = "CREATE TABLE transcript_items (\n             id INTEGER PRIMARY KEY,\n             session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\n             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),\n             item_kind TEXT NOT NULL CHECK(item_kind IN ('user_text', 'assistant_text', 'tool_marker')),\n             content TEXT,\n             tool_name TEXT,\n             tool_status TEXT,\n             UNIQUE(session_id, ordinal),\n             CHECK((item_kind IN ('user_text', 'assistant_text') AND content IS NOT NULL AND tool_name IS NULL AND tool_status IS NULL)\n                OR (item_kind = 'tool_marker' AND content IS NULL AND tool_name IS NOT NULL))\n         )";
 const CREATE_SESSIONS_RECENT_INDEX: &str =
     "CREATE INDEX sessions_recent ON sessions(last_visible_event_at DESC, started_at DESC)";
+/// Durable v1 cannot add a `missing` diagnostic status. Keep the stored state
+/// compatible and project this exact marker as `missing` at read boundaries.
+const MISSING_SOURCE_DIAGNOSTIC: &str = "source was absent from a completed provider discovery";
 
 /// Agentlog's durable catalog and the use cases that preserve its invariants.
 pub struct Catalog {
@@ -124,7 +127,7 @@ impl Catalog {
         })
     }
 
-    /// Scans one provider and applies all source outcomes atomically.
+    /// Synchronizes one provider and applies all source outcomes atomically.
     ///
     /// The scanner owns provider-native discovery and interpretation. Catalog
     /// owns persistence, aggregate diagnostics, and the provider-wide
@@ -145,11 +148,13 @@ impl Catalog {
             ..ProviderScanReport::default()
         };
         let mut transaction = self.pool.begin().await.map_err(StorageError::Query)?;
+        let mut discovered = BTreeSet::new();
 
         while let Some(outcome) = scan.next_outcome().await? {
             match outcome {
                 SourceOutcome::Accepted(snapshot) => {
                     validate_scanner_identity(provider, &snapshot.identity)?;
+                    discovered.insert(source_key(&snapshot.identity));
                     let partial = snapshot.diagnostic_status == "partial";
                     replace_source_snapshot_in_transaction(&mut transaction, &snapshot).await?;
                     report.refreshed_sources += 1;
@@ -157,12 +162,16 @@ impl Catalog {
                 }
                 SourceOutcome::Failed { identity, message } => {
                     validate_scanner_identity(provider, &identity)?;
+                    discovered.insert(source_key(&identity));
                     record_source_failure_in_transaction(&mut transaction, &identity, message)
                         .await?;
                     report.failed_sources += 1;
                 }
             }
         }
+
+        report.missing_sources =
+            mark_missing_sources_in_transaction(&mut transaction, provider, &discovered).await?;
 
         transaction.commit().await.map_err(StorageError::Query)?;
         Ok(report)
@@ -253,6 +262,13 @@ impl Catalog {
     pub async fn close(self) {
         self.pool.close().await;
     }
+}
+
+fn source_key(identity: &SourceIdentity) -> (String, String) {
+    (
+        identity.source_format.to_owned(),
+        identity.canonical_locator.clone(),
+    )
 }
 
 fn validate_scanner_identity(
@@ -967,6 +983,49 @@ async fn record_source_diagnostic_in_transaction(
     Ok(())
 }
 
+/// Marks retained snapshots whose source was absent from a completed provider
+/// discovery. The source rows and their last-good sessions stay intact.
+async fn mark_missing_sources_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider: &str,
+    discovered: &BTreeSet<(String, String)>,
+) -> Result<u64, StorageError> {
+    let retained = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, source_format, canonical_locator
+         FROM sources
+         WHERE provider = ?",
+    )
+    .bind(provider)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(StorageError::Query)?;
+
+    let missing = retained
+        .into_iter()
+        .filter(|(_, source_format, locator)| {
+            !discovered.contains(&(source_format.clone(), locator.clone()))
+        })
+        .collect::<Vec<_>>();
+    let now = unix_timestamp()?;
+    for (source_id, _, _) in &missing {
+        sqlx::query(
+            "UPDATE sources
+             SET diagnostic_status = 'error',
+                 diagnostic_message = ?,
+                 diagnostic_recorded_at = ?
+             WHERE id = ?",
+        )
+        .bind(MISSING_SOURCE_DIAGNOSTIC)
+        .bind(now)
+        .bind(source_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(StorageError::Query)?;
+    }
+
+    u64::try_from(missing.len()).map_err(|_| StorageError::CountOutOfRange)
+}
+
 /// Lists normalized sessions across every successfully retained provider source.
 ///
 /// # Errors
@@ -989,7 +1048,12 @@ pub async fn list_catalog_sessions(
                 sessions.execution_kind,
                 sessions.started_at,
                 sessions.last_visible_event_at,
-                sources.diagnostic_status,
+                CASE
+                    WHEN sources.diagnostic_status = 'error'
+                     AND sources.diagnostic_message = 'source was absent from a completed provider discovery'
+                    THEN 'missing'
+                    ELSE sources.diagnostic_status
+                END AS diagnostic_status,
                 sources.last_success_at
          FROM sessions
          JOIN sources ON sources.id = sessions.source_id
@@ -1020,7 +1084,12 @@ pub async fn list_catalog_source_diagnostics(
         "SELECT provider,
                 source_format,
                 canonical_locator AS source_locator,
-                diagnostic_status,
+                CASE
+                    WHEN diagnostic_status = 'error'
+                     AND diagnostic_message = 'source was absent from a completed provider discovery'
+                    THEN 'missing'
+                    ELSE diagnostic_status
+                END AS diagnostic_status,
                 diagnostic_message,
                 diagnostic_recorded_at,
                 last_success_at
@@ -1058,7 +1127,12 @@ pub async fn read_catalog_preview(
                 sessions.execution_kind,
                 sessions.started_at,
                 sessions.last_visible_event_at,
-                sources.diagnostic_status,
+                CASE
+                    WHEN sources.diagnostic_status = 'error'
+                     AND sources.diagnostic_message = 'source was absent from a completed provider discovery'
+                    THEN 'missing'
+                    ELSE sources.diagnostic_status
+                END AS diagnostic_status,
                 sources.last_success_at
          FROM sessions
          JOIN sources ON sources.id = sessions.source_id
@@ -1099,7 +1173,12 @@ pub async fn read_catalog_preview_by_identity(
                 sessions.execution_kind,
                 sessions.started_at,
                 sessions.last_visible_event_at,
-                sources.diagnostic_status,
+                CASE
+                    WHEN sources.diagnostic_status = 'error'
+                     AND sources.diagnostic_message = 'source was absent from a completed provider discovery'
+                    THEN 'missing'
+                    ELSE sources.diagnostic_status
+                END AS diagnostic_status,
                 sources.last_success_at
          FROM sessions
          JOIN sources ON sources.id = sessions.source_id

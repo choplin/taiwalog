@@ -28,7 +28,7 @@ use ratatui::{
 use tokio::task::JoinHandle;
 
 use crate::{
-    app::{ScanSummary, diagnostics_shell, list_shell, scan_shell, show_shell_by_identity},
+    app::{SyncSummary, diagnostics_shell, list_shell, show_shell_by_identity, sync_shell},
     display::visible_text,
     paths::AppPaths,
     storage::{
@@ -48,7 +48,7 @@ const DAY_SECONDS: i64 = 24 * 60 * 60;
 
 static TERMINAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 
-/// Starts the interactive catalog browser and refreshes provider sources in the background.
+/// Starts the interactive catalog browser and synchronizes provider sources in the background.
 ///
 /// # Errors
 ///
@@ -59,29 +59,28 @@ pub async fn run(paths: &AppPaths) -> anyhow::Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut state = BrowseState::new(anchor_now);
     let mut preview_loader = PreviewLoader::new();
-    let mut refresh_loader = RefreshLoader::new();
+    let mut sync_loader = SyncLoader::new();
     if let Some(id) = load_sessions(paths, &mut state).await {
         preview_loader.request(paths, &state, id);
     }
-    refresh_loader.request(paths, &mut state);
+    sync_loader.request(paths, &mut state);
 
     loop {
         preview_loader.collect_ready(&mut state);
-        if let Some(result) = refresh_loader.collect_ready() {
-            state.finish_refresh(&result);
+        if let Some(result) = sync_loader.collect_ready() {
+            state.finish_sync(&result);
             preview_loader.clear();
             if let Some(id) = load_sessions(paths, &mut state).await {
                 preview_loader.request(paths, &state, id);
             }
         }
         terminal.draw(|frame| render(frame, &mut state))?;
-        if let Some(event) = poll_event(refresh_loader.wait_timeout(preview_loader.wait_timeout()))?
-        {
+        if let Some(event) = poll_event(sync_loader.wait_timeout(preview_loader.wait_timeout()))? {
             match update(&mut state, event) {
                 BrowseEffect::None => {}
                 BrowseEffect::Exit => break,
-                BrowseEffect::Refresh => {
-                    refresh_loader.request(paths, &mut state);
+                BrowseEffect::Sync => {
+                    sync_loader.request(paths, &mut state);
                 }
                 BrowseEffect::LoadSessions => {
                     preview_loader.clear();
@@ -97,17 +96,17 @@ pub async fn run(paths: &AppPaths) -> anyhow::Result<()> {
     terminal.finish().context("restore interactive terminal")
 }
 
-/// Coordinates one refresh at a time while the terminal remains responsive.
+/// Coordinates one synchronization at a time while the terminal remains responsive.
 ///
-/// Refresh deliberately has no queue or cancellation behaviour: a repeated
-/// request while the current scan is active is ignored. This keeps the catalog
+/// Synchronization deliberately has no queue or cancellation behaviour: a repeated
+/// request while the current sync is active is ignored. This keeps the catalog
 /// write boundary single-flight without introducing a general scheduler.
 #[derive(Debug, Default)]
-struct RefreshLoader {
-    result_receiver: Option<mpsc::Receiver<anyhow::Result<ScanSummary>>>,
+struct SyncLoader {
+    result_receiver: Option<mpsc::Receiver<anyhow::Result<SyncSummary>>>,
 }
 
-impl RefreshLoader {
+impl SyncLoader {
     fn new() -> Self {
         Self::default()
     }
@@ -116,17 +115,17 @@ impl RefreshLoader {
         if self.result_receiver.is_some() {
             return false;
         }
-        state.start_refresh();
+        state.start_sync();
         let paths = paths.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let spawned = thread::Builder::new()
-            .name("agentlog-refresh".to_owned())
+            .name("agentlog-sync".to_owned())
             .spawn(move || {
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(anyhow::Error::from)
-                    .and_then(|runtime| runtime.block_on(scan_shell(&paths)));
+                    .and_then(|runtime| runtime.block_on(sync_shell(&paths)));
                 let _ = sender.send(result);
             });
         match spawned {
@@ -135,13 +134,13 @@ impl RefreshLoader {
                 true
             }
             Err(error) => {
-                state.finish_refresh(&Err(anyhow::Error::from(error)));
+                state.finish_sync(&Err(anyhow::Error::from(error)));
                 false
             }
         }
     }
 
-    fn collect_ready(&mut self) -> Option<anyhow::Result<ScanSummary>> {
+    fn collect_ready(&mut self) -> Option<anyhow::Result<SyncSummary>> {
         let receiver = self.result_receiver.as_ref()?;
         match receiver.try_recv() {
             Ok(result) => {
@@ -151,9 +150,7 @@ impl RefreshLoader {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.result_receiver = None;
-                Some(Err(anyhow::anyhow!(
-                    "refresh worker ended without a result"
-                )))
+                Some(Err(anyhow::anyhow!("sync worker ended without a result")))
             }
         }
     }
@@ -585,7 +582,7 @@ enum Overlay {
 enum BrowseEffect {
     None,
     Exit,
-    Refresh,
+    Sync,
     LoadSessions,
     LoadPreview(i64),
     LoadDiagnostics,
@@ -612,7 +609,7 @@ struct BrowseState {
     preview_content_width: u16,
     preview_viewport_rows: usize,
     catalog_error: Option<String>,
-    refresh_status: RefreshStatus,
+    sync_status: SyncStatus,
     diagnostics: Option<Vec<CatalogSourceDiagnostic>>,
     diagnostics_error: Option<String>,
     diagnostics_scroll: u16,
@@ -621,19 +618,20 @@ struct BrowseState {
 }
 
 #[derive(Clone, Debug, Default)]
-enum RefreshStatus {
+enum SyncStatus {
     #[default]
     Idle,
     Running,
-    Complete(RefreshSummary),
+    Complete(SyncSummaryLine),
     Failed(String),
 }
 
 #[derive(Clone, Debug)]
-struct RefreshSummary {
+struct SyncSummaryLine {
     refreshed_sources: u64,
     partial_sources: u64,
     failed_sources: u64,
+    missing_sources: u64,
     sessions_available: u64,
 }
 
@@ -659,7 +657,7 @@ impl BrowseState {
             preview_content_width: 1,
             preview_viewport_rows: 1,
             catalog_error: None,
-            refresh_status: RefreshStatus::Idle,
+            sync_status: SyncStatus::Idle,
             diagnostics: None,
             diagnostics_error: None,
             diagnostics_scroll: 0,
@@ -677,18 +675,19 @@ impl BrowseState {
         self.preview_scroll = 0;
         self.selected_id()
     }
-    fn start_refresh(&mut self) {
-        self.refresh_status = RefreshStatus::Running;
+    fn start_sync(&mut self) {
+        self.sync_status = SyncStatus::Running;
     }
-    fn finish_refresh(&mut self, result: &anyhow::Result<ScanSummary>) {
-        self.refresh_status = match result {
-            Ok(summary) => RefreshStatus::Complete(RefreshSummary {
+    fn finish_sync(&mut self, result: &anyhow::Result<SyncSummary>) {
+        self.sync_status = match result {
+            Ok(summary) => SyncStatus::Complete(SyncSummaryLine {
                 refreshed_sources: summary.sources_refreshed,
                 partial_sources: summary.sources_partial,
                 failed_sources: summary.sources_failed,
+                missing_sources: summary.sources_missing,
                 sessions_available: summary.sessions_available,
             }),
-            Err(error) => RefreshStatus::Failed(format!("Refresh failed: {error:#}")),
+            Err(error) => SyncStatus::Failed(format!("Sync failed: {error:#}")),
         };
     }
     fn selected_session(&self) -> Option<&CatalogSessionSummary> {
@@ -984,7 +983,7 @@ fn group_sessions(sessions: &[CatalogSessionSummary], grouping: Grouping) -> Vec
 
 fn update(state: &mut BrowseState, event: BrowseEvent) -> BrowseEffect {
     if event == BrowseEvent::Reload {
-        return BrowseEffect::Refresh;
+        return BrowseEffect::Sync;
     }
     if state.catalog_error.is_some() {
         return match event {
@@ -1278,8 +1277,8 @@ fn render_browse(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
             "No matching sessions",
             "Adjust Refine filters or press C in Refine to clear them.",
             &format!(
-                "{} | f refine | ? help | ! diagnostics | r refresh | q quit",
-                refresh_status_line(state)
+                "{} | f refine | ? help | ! diagnostics | r sync | q quit",
+                sync_status_line(state)
             ),
         );
         return;
@@ -1319,20 +1318,19 @@ fn filter_summary(state: &BrowseState) -> String {
     }
 }
 
-fn refresh_status_line(state: &BrowseState) -> String {
-    match &state.refresh_status {
-        RefreshStatus::Idle => "Refresh: not started".to_owned(),
-        RefreshStatus::Running => {
-            "Refresh: scanning; existing sessions remain available".to_owned()
-        }
-        RefreshStatus::Complete(summary) => format!(
-            "Refresh: sources={} partial={} failed={} sessions={}",
+fn sync_status_line(state: &BrowseState) -> String {
+    match &state.sync_status {
+        SyncStatus::Idle => "Sync: not started".to_owned(),
+        SyncStatus::Running => "Sync: running; existing sessions remain available".to_owned(),
+        SyncStatus::Complete(summary) => format!(
+            "Sync: sources={} partial={} failed={} missing={} sessions={}",
             summary.refreshed_sources,
             summary.partial_sources,
             summary.failed_sources,
+            summary.missing_sources,
             summary.sessions_available
         ),
-        RefreshStatus::Failed(error) => visible_text(error),
+        SyncStatus::Failed(error) => visible_text(error),
     }
 }
 
@@ -1482,7 +1480,7 @@ fn render_session_list(frame: &mut Frame, area: Rect, state: &mut BrowseState, w
         .collect::<Vec<_>>();
     let title = format!(
         "{} | {} visible | {} | Group: {}",
-        refresh_status_line(state),
+        sync_status_line(state),
         state.filtered.len(),
         filter_summary(state),
         state.grouping.label()
@@ -1503,7 +1501,7 @@ fn render_session_list(frame: &mut Frame, area: Rect, state: &mut BrowseState, w
     state.list_offset = list_state.offset();
     frame.render_widget(
         Paragraph::new(
-            "f refine | ? help | ! diagnostics | j/k select | d/u half page | Enter preview | r refresh | q quit",
+            "f refine | ? help | ! diagnostics | j/k select | d/u half page | Enter preview | r sync | q quit",
         ),
         regions[1],
     );
@@ -1517,7 +1515,7 @@ fn render_full_preview(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
     render_preview(frame, regions[0], state, "Session preview");
     frame.render_widget(
         Paragraph::new(
-            "f refine | ? help | ! diagnostics | j/k scroll | d/u half page | PgUp/PgDn | g/G | r refresh | Esc back | q quit",
+            "f refine | ? help | ! diagnostics | j/k scroll | d/u half page | PgUp/PgDn | g/G | r sync | Esc back | q quit",
         ),
         regions[1],
     );
@@ -2096,47 +2094,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_is_single_flight_and_keeps_the_current_selection_visible() {
+    async fn sync_is_single_flight_and_keeps_the_current_selection_visible() {
         let mut state = BrowseState::new(10);
         state.replace_sessions(vec![session(1, "a", None, None, None, Some(1))]);
         let selected = state.selected.clone();
         let (ready, receiver) = mpsc::sync_channel(1);
-        let mut loader = RefreshLoader::new();
+        let mut loader = SyncLoader::new();
         loader.result_receiver = Some(receiver);
-        state.start_refresh();
-        assert!(matches!(state.refresh_status, RefreshStatus::Running));
+        state.start_sync();
+        assert!(matches!(state.sync_status, SyncStatus::Running));
         assert!(rendered_text(&mut state, 100, 24).contains("session-1"));
-        assert!(rendered_text(&mut state, 100, 24).contains("Refresh: scanning"));
+        assert!(rendered_text(&mut state, 100, 24).contains("Sync: running"));
 
         assert!(matches!(
             update(&mut state, BrowseEvent::Reload),
-            BrowseEffect::Refresh
+            BrowseEffect::Sync
         ));
         let temporary = tempfile::TempDir::new_in("/private/tmp").expect("temporary directory");
         let paths = AppPaths::resolve(Some(temporary.path().join("agentlog"))).expect("paths");
         assert!(
             !loader.request(&paths, &mut state),
-            "a re-request must not start a second scan"
+            "a repeated request must not start a second sync"
         );
 
         ready
-            .send(Ok(ScanSummary {
+            .send(Ok(SyncSummary {
                 schema_version: 1,
                 collectors_installed: 6,
                 sources_refreshed: 2,
                 sources_partial: 1,
                 sources_failed: 1,
+                sources_missing: 0,
                 sessions_available: 1,
                 provider_summaries: Vec::new(),
                 message: "done".to_owned(),
             }))
-            .expect("refresh task remains active");
-        let result = loader.collect_ready().expect("completed refresh result");
-        state.finish_refresh(&result);
+            .expect("sync task remains active");
+        let result = loader.collect_ready().expect("completed sync result");
+        state.finish_sync(&result);
 
         assert_eq!(state.selected, selected);
         let rendered = rendered_text(&mut state, 100, 24);
-        assert!(rendered.contains("sources=2 partial=1 failed=1 sessions=1"));
+        assert!(rendered.contains("sources=2 partial=1 failed=1 missing=0 sessions=1"));
         assert!(rendered.contains("session-1"));
     }
 
@@ -2479,10 +2478,7 @@ mod tests {
     fn reload_preserves_the_stable_selection_when_the_row_id_changes() {
         let mut state = BrowseState::new(10);
         state.replace_sessions(vec![session(1, "a", None, None, None, Some(1))]);
-        assert_eq!(
-            update(&mut state, BrowseEvent::Reload),
-            BrowseEffect::Refresh
-        );
+        assert_eq!(update(&mut state, BrowseEvent::Reload), BrowseEffect::Sync);
         let mut replacement = session(22, "a", None, None, None, Some(1));
         replacement.source_locator = "/source/1".to_owned();
         replacement.session_key = "key-1".to_owned();

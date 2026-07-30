@@ -16,8 +16,8 @@ Build and run the shell:
 
 ```sh
 cargo run -- paths
-cargo run -- scan
-cargo run -- scan --json
+cargo run -- sync
+cargo run -- sync --json
 cargo run -- list
 cargo run -- show 1
 cargo run -- data clear --dry-run
@@ -26,11 +26,11 @@ cargo run -- browse
 ```
 
 `browse` first shows the existing Agentlog catalog, then starts a read-only
-refresh in the background. Press `r` to request another refresh; repeated
-requests while a refresh is active do not start another scan. The list remains
-available during refresh, keeps its selection by provider/source/session key
-when rows are replaced, and reports bounded refreshed/partial/failed/session
-counts when the refresh completes.
+sync in the background. Press `r` to request another sync; repeated requests
+while a sync is active do not start another one. The list remains available
+during sync, keeps its selection by provider/source/session key when rows are
+replaced, and reports bounded refreshed/partial/failed/missing/session counts
+when sync completes.
 Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
 preview, `Esc` to return, and `q` to quit. Press `f` to refine by provider,
 repository, CWD, model, execution kind, and start date. Within each metadata
@@ -47,7 +47,7 @@ catalog interfaces.
 
 Run this only with an actual local catalog: at least two provider values, a
 repository or CWD value, and several sessions with different `started_at`
-values make every interaction observable. Run `cargo run -- scan` first, then
+values make every interaction observable. Run `cargo run -- sync` first, then
 `cargo run -- browse`; if the catalog lacks one of those values, verify the
 available layout, help, diagnostics, selection, and terminal restoration steps
 below rather than inventing a fixture.
@@ -83,7 +83,7 @@ not redirect Codex history discovery:
 
 ```sh
 cargo run -- --home /tmp/agentlog-demo paths
-cargo run -- --home /tmp/agentlog-demo scan
+cargo run -- --home /tmp/agentlog-demo sync
 ```
 
 ### Clearing the local catalog
@@ -99,7 +99,7 @@ main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh private SHM,
 so it never opens the live catalog. Confirmation reports counts collected by
 the same SQLite writer transaction that clears the rows; it fails instead of
 racing another active writer. The command never deletes configuration, provider
-sources, or raw provider logs. Run `agentlog scan` afterwards to build a fresh
+sources, or raw provider logs. Run `agentlog sync` afterwards to build a fresh
 catalog from the unchanged provider-owned sources.
 
 Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
@@ -111,9 +111,9 @@ discovery uses `providers.opencode_root`, then `XDG_DATA_HOME/opencode`, then
 is read through a bounded private snapshot of its SQLite database and WAL, so
 SQLite never opens the provider-owned files. Gemini CLI discovery uses
 `providers.gemini_root`, then `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini`; it
-scans JSONL files below `tmp` and uses the native `sessionId` as the session
+reads JSONL files below `tmp` and uses the native `sessionId` as the session
 identity.
-Cursor discovery uses `providers.cursor_root`, then `~/.cursor`; it scans JSONL
+Cursor discovery uses `providers.cursor_root`, then `~/.cursor`; it reads JSONL
 files below `projects`, including UUID- or otherwise arbitrarily named files,
 and uses the containing directory as the native session identity. Kimi Code
 discovery uses `providers.kimi_root`, then `KIMI_CODE_HOME`, then
@@ -133,13 +133,16 @@ cursor_root = "/absolute/path/to/cursor/config"
 kimi_root = "/absolute/path/to/kimi-code/config"
 ```
 
-`scan` creates fresh schema v1 and scans current Codex session JSONL, legacy
+`sync` creates fresh schema v1 and reads current Codex session JSONL, legacy
 `history.jsonl`, Claude Code project/subagent JSONL, the supported OpenCode
 SQLite catalog, Gemini CLI session JSONL, Cursor transcript JSONL, and Kimi
 Code session-indexed agent wire JSONL. Each source is replaced atomically after
 a successful read. A
 source-level failure records a diagnostic while retaining that source's
-last-good session snapshot; it does not block other sources. Malformed,
+last-good session snapshot; it does not block other sources or providers. A
+source absent from a successfully completed provider discovery is retained and
+reported as `missing`; provider-wide discovery failures never mark retained
+sources missing. Malformed,
 unsupported, or oversized sources are failures and preserve the last-good
 snapshot. Valid records that exceed catalog bounds are safely truncated and
 stored with a `partial` diagnostic. The collectors store only visible
@@ -152,7 +155,7 @@ Kimi have a 4 MiB record bound; Codex has a 1 MiB record bound. Gemini, Claude,
 Cursor, and Kimi bound visible text to 128 KiB per item, 2 MiB per source, and
 2,000 catalog items per source. Valid sources exceeding a selection bound are
 marked `partial`; the limits are safety boundaries and do not express a
-scan-speed target. Claude's 4 MiB record ceiling is the smallest whole-MiB bound
+sync-speed target. Claude's 4 MiB record ceiling is the smallest whole-MiB bound
 above the observed 3.14 MiB local maximum, while its 64 MiB source limit remains
 above the observed 16.9 MiB maximum.
 
@@ -162,13 +165,14 @@ session metadata and visible items use the same 512-byte identity, 128 KiB
 item, 2 MiB session-text, and 2,000-item limits as the normalized catalog.
 
 `list` and `show SESSION_ID` read only the already-cataloged SQLite data; they
-never rescan provider files. List and preview responses show each source's
+never synchronize provider files. List and preview responses show each source's
 diagnostic status, so an `error` status makes a retained last-good session
-explicitly stale. `show` emits at most 80 items and 4 KiB per text snippet.
+explicitly stale and `missing` identifies a source absent from completed
+discovery. `show` emits at most 80 items and 4 KiB per text snippet.
 
 The rebuildable catalog uses SQLite WAL with `synchronous=NORMAL`. A sudden
 power loss can lose recent catalog updates, but does not corrupt the catalog or
-affect provider-owned logs; a later `scan` rebuilds it.
+affect provider-owned logs; a later `sync` rebuilds it.
 
 ## Schema v1
 

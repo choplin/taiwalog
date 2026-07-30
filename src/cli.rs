@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
-    app::{clear_data_shell, list_shell, paths_report, scan_shell, show_shell},
+    app::{clear_data_shell, list_shell, paths_report, show_shell, sync_shell},
     display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
@@ -32,13 +32,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Refresh supported provider history without changing provider-owned files.
-    Scan {
+    /// Synchronize supported provider history without changing provider-owned files.
+    Sync {
         /// Emit a machine-readable result.
         #[arg(long)]
         json: bool,
     },
-    /// List already-cataloged sessions without scanning provider-owned files.
+    /// List already-cataloged sessions without synchronizing provider-owned files.
     List {
         /// Maximum number of sessions to display.
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=500))]
@@ -47,7 +47,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Preview one already-cataloged session without scanning provider-owned files.
+    /// Preview one already-cataloged session without synchronizing provider-owned files.
     Show {
         /// Catalog session ID from `agentlog list`.
         session_id: i64,
@@ -84,12 +84,17 @@ enum DataCommand {
 /// Returns an error when path resolution, an application workflow, or output
 /// serialization fails.
 pub async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let paths = AppPaths::resolve(cli.home).context("resolve Agentlog-owned paths")?;
+    let Cli { home, command } = Cli::parse();
+    let Some(command) = command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    let paths = AppPaths::resolve(home).context("resolve Agentlog-owned paths")?;
 
-    match cli.command.unwrap_or(Command::Scan { json: false }) {
+    match command {
         Command::Paths { json } => print_paths(&paths, json),
-        Command::Scan { json } => print_scan(&paths, json).await,
+        Command::Sync { json } => print_sync(&paths, json).await,
         Command::List { limit, json } => print_list(&paths, limit, json).await,
         Command::Show { session_id, json } => print_show(&paths, session_id, json).await,
         Command::Data { command } => match command {
@@ -176,29 +181,34 @@ fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn print_scan(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
-    let summary = scan_shell(paths).await?;
+async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
+    let summary = sync_shell(paths).await?;
     if json {
         println!("{}", serde_json::to_string(&summary)?);
     } else {
-        println!("Schema version: {}", summary.schema_version);
-        println!("Collectors installed: {}", summary.collectors_installed);
-        println!("Sources refreshed: {}", summary.sources_refreshed);
-        println!("Sources partial: {}", summary.sources_partial);
-        println!("Sources failed: {}", summary.sources_failed);
-        println!("Sessions available: {}", summary.sessions_available);
+        eprintln!("Schema version: {}", summary.schema_version);
+        eprintln!("Collectors installed: {}", summary.collectors_installed);
+        eprintln!("Sources refreshed: {}", summary.sources_refreshed);
+        eprintln!("Sources partial: {}", summary.sources_partial);
+        eprintln!("Sources failed: {}", summary.sources_failed);
+        eprintln!("Sources missing: {}", summary.sources_missing);
+        eprintln!("Sessions available: {}", summary.sessions_available);
         for provider in &summary.provider_summaries {
-            println!(
-                "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, sessions={}",
-                visible_text(provider.provider),
+            eprintln!(
+                "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}, sessions={}",
+                visible_text(&provider.provider),
                 provider.candidate_sources,
                 provider.refreshed_sources,
                 provider.partial_sources,
                 provider.failed_sources,
+                provider.missing_sources,
                 provider.sessions_available
             );
+            if let Some(failure) = &provider.failure {
+                eprintln!("  warning: {}", visible_text(failure));
+            }
         }
-        println!("Scan result: {}", visible_text(&summary.message));
+        eprintln!("Sync result: {}", visible_text(&summary.message));
     }
     Ok(())
 }
@@ -208,7 +218,7 @@ async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<
     if json {
         println!("{}", serde_json::to_string(&sessions)?);
     } else if sessions.is_empty() {
-        println!("No cataloged sessions. Run `agentlog scan` to refresh sources.");
+        println!("No cataloged sessions. Run `agentlog sync` to synchronize sources.");
     } else {
         for session in sessions {
             let title = session
@@ -327,5 +337,18 @@ mod tests {
     #[test]
     fn data_clear_rejects_conflicting_confirmation_and_dry_run() {
         assert!(Cli::try_parse_from(["agentlog", "data", "clear", "--dry-run", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn bare_root_keeps_the_command_empty_for_help_without_running_sync() {
+        let cli = Cli::try_parse_from(["agentlog"]).expect("parse bare root command");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn sync_is_accepted_and_scan_is_rejected() {
+        let sync = Cli::try_parse_from(["agentlog", "sync"]).expect("parse explicit sync command");
+        assert!(matches!(sync.command, Some(Command::Sync { json: false })));
+        assert!(Cli::try_parse_from(["agentlog", "scan"]).is_err());
     }
 }

@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::{
     paths::AppPaths,
-    providers::{installed, source_descriptions},
+    providers::{ProviderScanReport, installed, source_descriptions},
     storage::{
         Catalog, CatalogFileIdentity, CatalogFileState, CatalogSessionPreview,
         CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, clear_existing_catalog,
@@ -22,28 +22,31 @@ use crate::{
 
 const DATA_CLEAR_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Observable result of a read-only provider scan.
+/// Observable result of one read-only provider synchronization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ScanSummary {
+pub struct SyncSummary {
     pub schema_version: i64,
     pub collectors_installed: u8,
     pub sources_refreshed: u64,
     pub sources_partial: u64,
     pub sources_failed: u64,
+    pub sources_missing: u64,
     pub sessions_available: u64,
-    pub provider_summaries: Vec<ProviderScanSummary>,
+    pub provider_summaries: Vec<ProviderSyncSummary>,
     pub message: String,
 }
 
 /// Aggregate diagnostic counts for one explicit provider collector.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ProviderScanSummary {
-    pub provider: &'static str,
+pub struct ProviderSyncSummary {
+    pub provider: String,
     pub candidate_sources: u64,
     pub refreshed_sources: u64,
     pub partial_sources: u64,
     pub failed_sources: u64,
+    pub missing_sources: u64,
     pub sessions_available: u64,
+    pub failure: Option<String>,
 }
 
 /// Initializes the durable catalog and collects read-only provider sources.
@@ -52,47 +55,72 @@ pub struct ProviderScanSummary {
 ///
 /// Returns an error when Agentlog-owned storage cannot be created, opened, or
 /// queried.
-pub async fn scan_shell(paths: &AppPaths) -> anyhow::Result<ScanSummary> {
+pub async fn sync_shell(paths: &AppPaths) -> anyhow::Result<SyncSummary> {
     paths.ensure_data_dir()?;
     let catalog = Catalog::open(&paths.database_path).await?;
-    let mut scan_results = Vec::with_capacity(6);
+    let mut sync_results = Vec::with_capacity(6);
     for scanner in installed(paths.provider_roots()) {
-        let scanner = scanner?;
-        scan_results.push((
-            scanner.provider_id().as_str(),
-            catalog.scan(&*scanner).await?,
-        ));
+        match scanner {
+            Ok(scanner) => {
+                let provider = scanner.provider_id().as_str().to_owned();
+                match catalog.scan(&*scanner).await {
+                    Ok(report) => sync_results.push((provider, report, None)),
+                    Err(error) => sync_results.push((
+                        provider,
+                        ProviderScanReport::default(),
+                        Some(error.to_string()),
+                    )),
+                }
+            }
+            Err(error) => sync_results.push((
+                error.provider_id().as_str().to_owned(),
+                ProviderScanReport::default(),
+                Some(error.to_string()),
+            )),
+        }
     }
     let sessions_available = catalog.session_count().await?;
     let provider_session_counts = catalog.provider_session_counts().await?;
     catalog.close().await;
 
-    let provider_summaries = scan_results
+    let provider_summaries = sync_results
         .iter()
-        .map(|(provider, report)| ProviderScanSummary {
-            provider,
+        .map(|(provider, report, failure)| ProviderSyncSummary {
+            provider: provider.clone(),
             candidate_sources: report.candidate_sources,
             refreshed_sources: report.refreshed_sources,
             partial_sources: report.partial_sources,
             failed_sources: report.failed_sources,
+            missing_sources: report.missing_sources,
             sessions_available: provider_sessions(&provider_session_counts, provider),
+            failure: failure.clone(),
         })
         .collect::<Vec<_>>();
 
-    Ok(ScanSummary {
+    Ok(SyncSummary {
         schema_version: SCHEMA_VERSION,
-        collectors_installed: u8::try_from(scan_results.len()).unwrap_or(u8::MAX),
-        sources_refreshed: scan_results
+        collectors_installed: u8::try_from(
+            sync_results
+                .iter()
+                .filter(|(_, _, failure)| failure.is_none())
+                .count(),
+        )
+        .unwrap_or(u8::MAX),
+        sources_refreshed: sync_results
             .iter()
-            .map(|(_, report)| report.refreshed_sources)
+            .map(|(_, report, _)| report.refreshed_sources)
             .sum(),
-        sources_partial: scan_results
+        sources_partial: sync_results
             .iter()
-            .map(|(_, report)| report.partial_sources)
+            .map(|(_, report, _)| report.partial_sources)
             .sum(),
-        sources_failed: scan_results
+        sources_failed: sync_results
             .iter()
-            .map(|(_, report)| report.failed_sources)
+            .map(|(_, report, _)| report.failed_sources)
+            .sum(),
+        sources_missing: sync_results
+            .iter()
+            .map(|(_, report, _)| report.missing_sources)
             .sum(),
         sessions_available,
         provider_summaries,
@@ -521,7 +549,7 @@ mod tests {
 
     use super::{
         DATA_CLEAR_SNAPSHOT_MAX_BYTES, clear_data_shell, diagnostics_shell, inspect_clear_target,
-        inspect_clear_target_with_hook, list_shell, scan_shell, sqlite_sidecar_path,
+        inspect_clear_target_with_hook, list_shell, sqlite_sidecar_path, sync_shell,
     };
 
     #[derive(Debug, Eq, PartialEq)]
@@ -582,7 +610,7 @@ mod tests {
         );
         fs::write(agentlog_home.join("config.toml"), config).expect("write config");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
-        let scan = scan_shell(&paths).await.expect("scan fixture source");
+        let scan = sync_shell(&paths).await.expect("sync fixture source");
         assert_eq!(scan.sessions_available, 1);
 
         (temporary, paths, source)
@@ -792,7 +820,7 @@ mod tests {
                 .is_empty()
         );
 
-        let rebuilt = scan_shell(&paths)
+        let rebuilt = sync_shell(&paths)
             .await
             .expect("fresh scan rebuilds catalog");
         assert_eq!(rebuilt.sessions_available, 1);
@@ -861,7 +889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_scan_creates_catalog_and_reports_empty_codex_collection() {
+    async fn shell_sync_creates_catalog_and_reports_empty_codex_collection() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
@@ -880,13 +908,14 @@ mod tests {
         .expect("write config");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
 
-        let summary = scan_shell(&paths).await.expect("run shell scan");
+        let summary = sync_shell(&paths).await.expect("run shell sync");
 
         assert_eq!(summary.schema_version, SCHEMA_VERSION);
         assert_eq!(summary.collectors_installed, 6);
         assert_eq!(summary.sources_refreshed, 0);
         assert_eq!(summary.sources_partial, 0);
         assert_eq!(summary.sources_failed, 0);
+        assert_eq!(summary.sources_missing, 0);
         assert_eq!(summary.sessions_available, 0);
         assert_eq!(summary.provider_summaries.len(), 6);
         assert!(
@@ -928,7 +957,7 @@ mod tests {
         .expect("write config");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
 
-        let summary = scan_shell(&paths).await.expect("run shell scan");
+        let summary = sync_shell(&paths).await.expect("run shell sync");
 
         assert_eq!(summary.sources_refreshed, 1);
         assert_eq!(summary.sources_failed, 1);
@@ -939,7 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_refresh_keeps_a_source_last_good_session_in_the_catalog() {
+    async fn a_failed_sync_keeps_a_source_last_good_session_in_the_catalog() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let agentlog_home = temporary.path().join("agentlog");
         let gemini_root = temporary.path().join("gemini");
@@ -967,11 +996,11 @@ mod tests {
         .expect("write config");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
 
-        let first = scan_shell(&paths).await.expect("initial scan");
+        let first = sync_shell(&paths).await.expect("initial sync");
         assert_eq!(first.sessions_available, 1);
         fs::write(&source, "not JSON\n").expect("make source malformed");
 
-        let refresh = scan_shell(&paths).await.expect("failing refresh");
+        let refresh = sync_shell(&paths).await.expect("failing sync");
         assert_eq!(refresh.sources_failed, 1);
         assert_eq!(refresh.sessions_available, 1);
         let sessions = super::list_shell(&paths, 10)
@@ -980,6 +1009,64 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].source_diagnostic_status, "error");
         assert_eq!(sessions[0].title.as_deref(), Some("last good request"));
+    }
+
+    #[tokio::test]
+    async fn a_disappeared_source_is_retained_and_diagnosed_missing() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let agentlog_home = temporary.path().join("agentlog");
+        let gemini_root = temporary.path().join("gemini");
+        let source = gemini_root.join("tmp/session.jsonl");
+        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir_all(source.parent().expect("Gemini source parent"))
+            .expect("create Gemini directory");
+        fs::write(
+            &source,
+            "{\"sessionId\":\"session\"}\n{\"type\":\"user\",\"content\":\"retained request\"}\n",
+        )
+        .expect("write valid Gemini source");
+        fs::write(
+            agentlog_home.join("config.toml"),
+            format!(
+                "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
+                temporary.path().join("empty-codex").display(),
+                temporary.path().join("empty-claude").display(),
+                temporary.path().join("empty-opencode").display(),
+                gemini_root.display(),
+                temporary.path().join("empty-cursor").display(),
+                temporary.path().join("empty-kimi").display(),
+            ),
+        )
+        .expect("write config");
+        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+
+        assert_eq!(
+            sync_shell(&paths)
+                .await
+                .expect("initial sync")
+                .sessions_available,
+            1
+        );
+        fs::remove_file(&source).expect("remove provider-owned fixture");
+
+        let summary = sync_shell(&paths).await.expect("sync after disappearance");
+        assert_eq!(summary.sources_missing, 1);
+        assert_eq!(summary.sources_failed, 0);
+        assert_eq!(summary.sessions_available, 1);
+        let json = serde_json::to_value(&summary).expect("serialize sync summary");
+        assert_eq!(json["sources_missing"], 1);
+
+        let sessions = list_shell(&paths, 10).await.expect("list retained session");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_diagnostic_status, "missing");
+        assert_eq!(sessions[0].title.as_deref(), Some("retained request"));
+        let diagnostics = diagnostics_shell(&paths).await.expect("read diagnostics");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.provider == "gemini"
+                && diagnostic.diagnostic_status == "missing"
+                && diagnostic.diagnostic_message.as_deref()
+                    == Some("source was absent from a completed provider discovery")
+        }));
     }
 
     #[tokio::test]
@@ -1028,7 +1115,7 @@ mod tests {
         .expect("write config");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
 
-        let summary = scan_shell(&paths).await.expect("run scan");
+        let summary = sync_shell(&paths).await.expect("run sync");
 
         assert_eq!(summary.sessions_available, 2);
         assert_eq!(
@@ -1050,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_scan_accepts_one_representative_source_from_each_provider() {
+    async fn one_sync_accepts_one_representative_source_from_each_provider() {
         let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
         let home = temporary.path().join("agentlog");
         let codex = temporary.path().join("codex");
@@ -1121,7 +1208,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let paths = AppPaths::resolve(Some(home)).expect("paths");
-        let summary = scan_shell(&paths).await.expect("scan");
+        let summary = sync_shell(&paths).await.expect("sync");
         assert_eq!(summary.sources_refreshed, 6);
         assert_eq!(summary.sources_failed, 0);
         assert_eq!(summary.sessions_available, 6);

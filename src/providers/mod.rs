@@ -142,6 +142,7 @@ pub struct ProviderScanReport {
     pub refreshed_sources: u64,
     pub partial_sources: u64,
     pub failed_sources: u64,
+    pub missing_sources: u64,
 }
 
 /// A provider-specific adapter that starts one Agentlog scan.
@@ -212,4 +213,20 @@ pub enum ProviderRootError {
     KimiHomeUnavailable,
     #[error("Kimi root must be a nonempty absolute path, got {path}")]
     InvalidKimiRoot { path: PathBuf },
+}
+
+impl ProviderRootError {
+    #[must_use]
+    pub const fn provider_id(&self) -> ProviderId {
+        match self {
+            Self::CodexHomeUnavailable | Self::InvalidCodexRoot { .. } => ProviderId::Codex,
+            Self::ClaudeHomeUnavailable | Self::InvalidClaudeRoot { .. } => ProviderId::Claude,
+            Self::OpenCodeHomeUnavailable | Self::InvalidOpenCodeRoot { .. } => {
+                ProviderId::OpenCode
+            }
+            Self::GeminiHomeUnavailable | Self::InvalidGeminiRoot { .. } => ProviderId::Gemini,
+            Self::CursorHomeUnavailable | Self::InvalidCursorRoot { .. } => ProviderId::Cursor,
+            Self::KimiHomeUnavailable | Self::InvalidKimiRoot { .. } => ProviderId::Kimi,
+        }
+    }
 }
