@@ -423,7 +423,9 @@ impl SyncProgressReporter {
 /// A plain report is safer for a terminal without a declared terminal type, a
 /// dumb terminal, or when the user has explicitly disabled terminal styling.
 fn terminal_control_allowed(stderr_is_terminal: bool, term: Option<&str>, no_color: bool) -> bool {
-    stderr_is_terminal && term.is_some_and(|term| term != "dumb") && !no_color
+    stderr_is_terminal
+        && term.is_some_and(|term| !term.trim_ascii().is_empty() && term != "dumb")
+        && !no_color
 }
 
 impl Drop for SyncProgressReporter {
@@ -620,6 +622,8 @@ mod tests {
         for (stderr_is_terminal, term, no_color) in [
             (false, Some("xterm-256color"), false),
             (true, None, false),
+            (true, Some(""), false),
+            (true, Some(" \t"), false),
             (true, Some("dumb"), false),
             (true, Some("xterm-256color"), true),
         ] {
