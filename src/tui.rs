@@ -28,7 +28,10 @@ use ratatui::{
 use tokio::task::JoinHandle;
 
 use crate::{
-    app::{SyncSummary, diagnostics_shell, list_shell, show_shell_by_identity, sync_shell},
+    app::{
+        SyncProgress, SyncSummary, diagnostics_shell, list_shell, show_shell_by_identity,
+        sync_shell_with_progress,
+    },
     display::visible_text,
     paths::AppPaths,
     storage::{
@@ -67,6 +70,7 @@ pub async fn run(paths: &AppPaths) -> anyhow::Result<()> {
 
     loop {
         preview_loader.collect_ready(&mut state);
+        sync_loader.collect_progress(&mut state);
         if let Some(result) = sync_loader.collect_ready() {
             state.finish_sync(&result);
             preview_loader.clear();
@@ -104,6 +108,7 @@ pub async fn run(paths: &AppPaths) -> anyhow::Result<()> {
 #[derive(Debug, Default)]
 struct SyncLoader {
     result_receiver: Option<mpsc::Receiver<anyhow::Result<SyncSummary>>>,
+    progress_receiver: Option<mpsc::Receiver<SyncProgress>>,
 }
 
 impl SyncLoader {
@@ -118,6 +123,7 @@ impl SyncLoader {
         state.start_sync();
         let paths = paths.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (progress_sender, progress_receiver) = mpsc::sync_channel(64);
         let spawned = thread::Builder::new()
             .name("agentlog-sync".to_owned())
             .spawn(move || {
@@ -125,12 +131,21 @@ impl SyncLoader {
                     .enable_all()
                     .build()
                     .map_err(anyhow::Error::from)
-                    .and_then(|runtime| runtime.block_on(sync_shell(&paths)));
+                    .and_then(|runtime| {
+                        runtime.block_on(sync_shell_with_progress(&paths, |progress| {
+                            if matches!(progress, SyncProgress::SourceStaged { .. }) {
+                                let _ = progress_sender.try_send(progress);
+                            } else {
+                                let _ = progress_sender.send(progress);
+                            }
+                        }))
+                    });
                 let _ = sender.send(result);
             });
         match spawned {
             Ok(_) => {
                 self.result_receiver = Some(receiver);
+                self.progress_receiver = Some(progress_receiver);
                 true
             }
             Err(error) => {
@@ -145,13 +160,24 @@ impl SyncLoader {
         match receiver.try_recv() {
             Ok(result) => {
                 self.result_receiver = None;
+                self.progress_receiver = None;
                 Some(result)
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.result_receiver = None;
+                self.progress_receiver = None;
                 Some(Err(anyhow::anyhow!("sync worker ended without a result")))
             }
+        }
+    }
+
+    fn collect_progress(&mut self, state: &mut BrowseState) {
+        let Some(receiver) = self.progress_receiver.as_ref() else {
+            return;
+        };
+        while let Ok(progress) = receiver.try_recv() {
+            state.apply_sync_progress(progress);
         }
     }
 
@@ -621,7 +647,7 @@ struct BrowseState {
 enum SyncStatus {
     #[default]
     Idle,
-    Running,
+    Running(SyncProgressLine),
     Complete(SyncSummaryLine),
     Failed(String),
 }
@@ -634,6 +660,13 @@ struct SyncSummaryLine {
     failed_sources: u64,
     missing_sources: u64,
     sessions_available: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SyncProgressLine {
+    provider: Option<String>,
+    processed_sources: u64,
+    candidate_sources: u64,
 }
 
 impl BrowseState {
@@ -677,7 +710,41 @@ impl BrowseState {
         self.selected_id()
     }
     fn start_sync(&mut self) {
-        self.sync_status = SyncStatus::Running;
+        self.sync_status = SyncStatus::Running(SyncProgressLine::default());
+    }
+    fn apply_sync_progress(&mut self, progress: SyncProgress) {
+        match progress {
+            SyncProgress::ProviderStarted {
+                provider,
+                candidate_sources,
+            } => {
+                self.sync_status = SyncStatus::Running(SyncProgressLine {
+                    provider: Some(provider),
+                    processed_sources: 0,
+                    candidate_sources,
+                });
+            }
+            SyncProgress::SourceStaged {
+                provider,
+                processed_sources,
+                candidate_sources,
+            } => {
+                self.sync_status = SyncStatus::Running(SyncProgressLine {
+                    provider: Some(provider),
+                    processed_sources,
+                    candidate_sources,
+                });
+            }
+            SyncProgress::ProviderCompleted {
+                provider, report, ..
+            } => {
+                self.sync_status = SyncStatus::Running(SyncProgressLine {
+                    provider: Some(provider),
+                    processed_sources: report.refreshed_sources + report.failed_sources,
+                    candidate_sources: report.candidate_sources,
+                });
+            }
+        }
     }
     fn finish_sync(&mut self, result: &anyhow::Result<SyncSummary>) {
         self.sync_status = match result {
@@ -1323,7 +1390,15 @@ fn filter_summary(state: &BrowseState) -> String {
 fn sync_status_line(state: &BrowseState) -> String {
     match &state.sync_status {
         SyncStatus::Idle => "Sync: not started".to_owned(),
-        SyncStatus::Running => "Sync: running; existing sessions remain available".to_owned(),
+        SyncStatus::Running(progress) => match &progress.provider {
+            Some(provider) => format!(
+                "Sync: {} {}/{} sources processed; existing sessions remain available",
+                visible_text(provider),
+                progress.processed_sources,
+                progress.candidate_sources
+            ),
+            None => "Sync: starting; existing sessions remain available".to_owned(),
+        },
         SyncStatus::Complete(summary) => format!(
             "Sync: providers_failed={} sources={} partial={} failed={} missing={} sessions={}",
             summary.providers_failed,
@@ -2107,9 +2182,9 @@ mod tests {
         let mut loader = SyncLoader::new();
         loader.result_receiver = Some(receiver);
         state.start_sync();
-        assert!(matches!(state.sync_status, SyncStatus::Running));
+        assert!(matches!(state.sync_status, SyncStatus::Running(_)));
         assert!(rendered_text(&mut state, 100, 24).contains("session-1"));
-        assert!(rendered_text(&mut state, 100, 24).contains("Sync: running"));
+        assert!(rendered_text(&mut state, 100, 24).contains("Sync: starting"));
 
         assert!(matches!(
             update(&mut state, BrowseEvent::Reload),
@@ -2146,6 +2221,20 @@ mod tests {
                 .contains("providers_failed=1 sources=2 partial=1 failed=1 missing=0 sessions=1")
         );
         assert!(rendered.contains("session-1"));
+    }
+
+    #[test]
+    fn sync_status_exposes_current_provider_and_processed_sources() {
+        let mut state = BrowseState::new(10);
+        state.start_sync();
+        state.apply_sync_progress(SyncProgress::SourceStaged {
+            provider: "claude".to_owned(),
+            processed_sources: 4,
+            candidate_sources: 10,
+        });
+
+        let rendered = rendered_text(&mut state, 180, 24);
+        assert!(rendered.contains("Sync: claude 4/10 sources processed"));
     }
 
     #[tokio::test]

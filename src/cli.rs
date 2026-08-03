@@ -1,12 +1,19 @@
 //! Command-line transport for Agentlog application workflows.
 
-use std::path::PathBuf;
+use std::{
+    fs::OpenOptions,
+    io::{BufRead, BufReader, IsTerminal, Write},
+    path::PathBuf,
+};
 
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
-    app::{list_shell, paths_report, purge_catalog_shell, show_shell, sync_shell},
+    app::{
+        SyncProgress, list_shell, paths_report, purge_catalog_shell, show_shell,
+        sync_shell_with_progress,
+    },
     display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
@@ -91,7 +98,27 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
-    let summary = purge_catalog_shell(paths, yes).await?;
+    if yes {
+        let summary = purge_catalog_shell(paths, true).await?;
+        print_purge_report(&summary);
+        print_purge_completion(&summary);
+        return Ok(());
+    }
+
+    let preview = purge_catalog_shell(paths, false).await?;
+    print_purge_report(&preview);
+    match confirm_purge_from_terminal(&preview)? {
+        Some(true) => {
+            let summary = purge_catalog_shell(paths, true).await?;
+            print_purge_completion(&summary);
+        }
+        Some(false) => eprintln!("Purge canceled; no changes were made."),
+        None => eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm."),
+    }
+    Ok(())
+}
+
+fn print_purge_report(summary: &crate::app::PurgeSummary) {
     eprintln!(
         "Agentlog-owned database target: {}",
         visible_text(&summary.database.display().to_string())
@@ -106,14 +133,46 @@ async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
     eprintln!(
         "Warning: Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
     );
-    if !yes {
-        eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm.");
-    } else if summary.cleared {
-        eprintln!("Purge complete: cleared the reported Agentlog-owned catalog contents.");
+}
+
+fn print_purge_completion(summary: &crate::app::PurgeSummary) {
+    if summary.cleared {
+        eprintln!(
+            "Purge complete: cleared {} catalog sessions and {} transcript items from the locked catalog state ({}; {} bytes).",
+            summary.sessions,
+            summary.transcript_items,
+            human_readable_bytes(summary.approximate_bytes),
+            summary.approximate_bytes
+        );
     } else {
         eprintln!("Purge complete: no Agentlog-owned database was present.");
     }
-    Ok(())
+}
+
+/// Prompts only through the controlling terminal, never through piped input.
+///
+/// An unavailable terminal intentionally leaves purge in preview-only mode.
+fn confirm_purge_from_terminal(summary: &crate::app::PurgeSummary) -> anyhow::Result<Option<bool>> {
+    let Ok(mut terminal) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        return Ok(None);
+    };
+    write!(
+        terminal,
+        "Purge {} catalog sessions and {} transcript items now? [y/N] ",
+        summary.sessions, summary.transcript_items
+    )?;
+    terminal.flush()?;
+
+    let mut answer = String::new();
+    let mut reader = BufReader::new(terminal.try_clone()?);
+    if reader.read_line(&mut answer)? == 0 {
+        return Ok(Some(false));
+    }
+    Ok(Some(purge_confirmation_answer(Some(&answer))))
+}
+
+fn purge_confirmation_answer(answer: Option<&str>) -> bool {
+    matches!(answer.map(str::trim), Some("y" | "Y" | "yes" | "YES"))
 }
 
 fn human_readable_bytes(bytes: u64) -> String {
@@ -169,7 +228,8 @@ fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
 }
 
 async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
-    let summary = sync_shell(paths).await?;
+    let mut reporter = SyncProgressReporter::new();
+    let summary = sync_shell_with_progress(paths, |progress| reporter.report(progress)).await?;
     if json {
         println!("{}", serde_json::to_string(&summary)?);
     } else {
@@ -199,6 +259,102 @@ async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         eprintln!("Sync result: {}", visible_text(&summary.message));
     }
     Ok(())
+}
+
+/// Writes compact synchronization progress to stderr without touching stdout.
+struct SyncProgressReporter {
+    interactive: bool,
+    live_line_active: bool,
+}
+
+impl SyncProgressReporter {
+    fn new() -> Self {
+        Self {
+            interactive: std::io::stderr().is_terminal(),
+            live_line_active: false,
+        }
+    }
+
+    fn report(&mut self, progress: SyncProgress) {
+        match progress {
+            SyncProgress::ProviderStarted {
+                provider,
+                candidate_sources,
+            } => {
+                if self.interactive {
+                    self.replace_live_line(&format!(
+                        "[~] Provider {}: 0/{} sources processed",
+                        visible_text(&provider),
+                        candidate_sources
+                    ));
+                } else {
+                    eprintln!(
+                        "[~] Provider {}: starting {} candidate sources",
+                        visible_text(&provider),
+                        candidate_sources
+                    );
+                }
+            }
+            SyncProgress::SourceStaged {
+                provider,
+                processed_sources,
+                candidate_sources,
+            } => {
+                if self.interactive {
+                    self.replace_live_line(&format!(
+                        "[~] Provider {}: {}/{} sources processed",
+                        visible_text(&provider),
+                        processed_sources,
+                        candidate_sources
+                    ));
+                }
+            }
+            SyncProgress::ProviderCompleted {
+                provider,
+                report,
+                failure,
+            } => {
+                self.clear_live_line();
+                if let Some(failure) = failure {
+                    eprintln!(
+                        "[!] Provider {}: failed ({})",
+                        visible_text(&provider),
+                        visible_text(&failure)
+                    );
+                } else {
+                    eprintln!(
+                        "[+] Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}",
+                        visible_text(&provider),
+                        report.candidate_sources,
+                        report.refreshed_sources,
+                        report.partial_sources,
+                        report.failed_sources,
+                        report.missing_sources
+                    );
+                }
+            }
+        }
+    }
+
+    fn replace_live_line(&mut self, line: &str) {
+        eprint!("\r\x1b[2K{line}");
+        let _ = std::io::stderr().flush();
+        self.live_line_active = true;
+    }
+
+    fn clear_live_line(&mut self) {
+        if self.live_line_active {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+            self.live_line_active = false;
+        }
+    }
+}
+
+impl Drop for SyncProgressReporter {
+    fn drop(&mut self) {
+        self.clear_live_line();
+    }
 }
 
 async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<()> {
@@ -296,7 +452,7 @@ fn print_visible_transcript(label: &str, content: &str) {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, human_readable_bytes};
+    use super::{Cli, Command, human_readable_bytes, purge_confirmation_answer};
 
     #[test]
     fn database_sizes_use_readable_binary_units() {
@@ -327,6 +483,15 @@ mod tests {
     fn purge_rejects_legacy_data_clear_and_dry_run_forms() {
         assert!(Cli::try_parse_from(["agentlog", "data", "clear"]).is_err());
         assert!(Cli::try_parse_from(["agentlog", "purge", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn purge_confirmation_defaults_to_no() {
+        assert!(!purge_confirmation_answer(None));
+        assert!(!purge_confirmation_answer(Some("\n")));
+        assert!(!purge_confirmation_answer(Some("n\n")));
+        assert!(purge_confirmation_answer(Some("y\n")));
+        assert!(purge_confirmation_answer(Some("yes\n")));
     }
 
     #[test]

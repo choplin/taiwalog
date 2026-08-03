@@ -156,3 +156,25 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
     assert!(!agentlog(&home, &["data", "clear"]).status.success());
     assert!(!agentlog(&home, &["purge", "--dry-run"]).status.success());
 }
+
+#[test]
+fn sync_process_keeps_json_stdout_clean_and_bounds_noninteractive_progress() {
+    let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+    let home = temporary.path().join("agentlog");
+    fs::create_dir(&home).expect("create Agentlog home");
+    write_provider_fixture(&temporary, &home);
+
+    let output = agentlog(&home, &["sync", "--json"]);
+
+    assert!(output.status.success());
+    let summary = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .expect("sync JSON remains the complete stdout product");
+    assert_eq!(summary["sources_refreshed"], 1);
+    let report = String::from_utf8(output.stderr).expect("UTF-8 sync report");
+    assert!(report.contains("[~] Provider gemini: starting 1 candidate sources"));
+    assert!(report.contains("[+] Provider gemini: candidates=1, refreshed=1"));
+    assert!(
+        report.lines().count() <= 12,
+        "noninteractive progress reports once per provider start and completion"
+    );
+}

@@ -40,6 +40,22 @@ pub struct Catalog {
     pool: SqlitePool,
 }
 
+/// Observable progress while one provider's catalog transaction is assembled.
+///
+/// A source is reported only after its replacement or failure diagnostic has
+/// been written to the open catalog transaction. The provider completion is
+/// emitted by the application layer after this transaction commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogScanProgress {
+    /// Provider discovery has completed and the candidate count is known.
+    Started { candidate_sources: u64 },
+    /// One source outcome has been written to the open transaction.
+    SourceStaged {
+        processed_sources: u64,
+        candidate_sources: u64,
+    },
+}
+
 /// Counts retained in an existing, validated Agentlog catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogCounts {
@@ -148,12 +164,36 @@ impl Catalog {
         &self,
         scanner: &dyn ProviderScanner,
     ) -> Result<ProviderScanReport, CatalogScanError> {
+        self.scan_with_progress(scanner, |_| {}).await
+    }
+
+    /// Synchronizes one provider while reporting transaction staging progress.
+    ///
+    /// The callback never receives provider-owned locators or transcript data.
+    /// It is invoked after each source outcome has been staged successfully,
+    /// but before the provider-wide transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider discovery or iteration fails, a scanner
+    /// reports an inconsistent provider identity, or a catalog write fails.
+    pub async fn scan_with_progress<F>(
+        &self,
+        scanner: &dyn ProviderScanner,
+        mut on_progress: F,
+    ) -> Result<ProviderScanReport, CatalogScanError>
+    where
+        F: FnMut(CatalogScanProgress),
+    {
         let provider = scanner.provider_id().as_str();
         let mut scan = scanner.start()?;
         let mut report = ProviderScanReport {
             candidate_sources: scan.candidate_sources(),
             ..ProviderScanReport::default()
         };
+        on_progress(CatalogScanProgress::Started {
+            candidate_sources: report.candidate_sources,
+        });
         let mut transaction = self.pool.begin().await.map_err(StorageError::Query)?;
         let mut discovered = BTreeSet::new();
 
@@ -175,6 +215,10 @@ impl Catalog {
                     report.failed_sources += 1;
                 }
             }
+            on_progress(CatalogScanProgress::SourceStaged {
+                processed_sources: report.refreshed_sources + report.failed_sources,
+                candidate_sources: report.candidate_sources,
+            });
         }
 
         report.missing_sources =

@@ -15,9 +15,9 @@ use crate::{
     paths::AppPaths,
     providers::{ProviderScanReport, ProviderScanner, installed, source_descriptions},
     storage::{
-        Catalog, CatalogFileIdentity, CatalogFileState, CatalogScanError, CatalogSessionPreview,
-        CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, StorageError,
-        inspect_catalog_file_state, inspect_catalog_snapshot, purge_existing_catalog,
+        Catalog, CatalogFileIdentity, CatalogFileState, CatalogScanError, CatalogScanProgress,
+        CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION,
+        StorageError, inspect_catalog_file_state, inspect_catalog_snapshot, purge_existing_catalog,
     },
 };
 
@@ -58,6 +58,31 @@ struct ProviderSyncResult {
     failure: Option<String>,
 }
 
+/// Bounded synchronization progress that is safe to display to users.
+///
+/// Progress intentionally exposes provider names and aggregate counts only;
+/// provider-owned source paths and transcript content remain private.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncProgress {
+    /// A provider's source discovery has completed.
+    ProviderStarted {
+        provider: String,
+        candidate_sources: u64,
+    },
+    /// A source outcome has been staged in the provider transaction.
+    SourceStaged {
+        provider: String,
+        processed_sources: u64,
+        candidate_sources: u64,
+    },
+    /// A provider transaction has committed, or provider setup failed.
+    ProviderCompleted {
+        provider: String,
+        report: ProviderScanReport,
+        failure: Option<String>,
+    },
+}
+
 /// Initializes the durable catalog and collects read-only provider sources.
 ///
 /// # Errors
@@ -65,17 +90,48 @@ struct ProviderSyncResult {
 /// Returns an error when Agentlog-owned storage cannot be created, opened, or
 /// queried.
 pub async fn sync_shell(paths: &AppPaths) -> anyhow::Result<SyncSummary> {
+    sync_shell_with_progress(paths, |_| {}).await
+}
+
+/// Synchronizes provider history while exposing bounded aggregate progress.
+///
+/// The callback observes source staging only after the catalog write succeeds.
+/// Provider completion is emitted only after the provider transaction commits.
+///
+/// # Errors
+///
+/// Returns an error when Agentlog-owned storage cannot be created, opened, or
+/// queried.
+pub async fn sync_shell_with_progress<F>(
+    paths: &AppPaths,
+    mut on_progress: F,
+) -> anyhow::Result<SyncSummary>
+where
+    F: FnMut(SyncProgress),
+{
     paths.ensure_data_dir()?;
     let catalog = Catalog::open(&paths.database_path).await?;
     let mut sync_results = Vec::with_capacity(6);
     for scanner in installed(paths.provider_roots()) {
         match scanner {
-            Ok(scanner) => sync_results.push(sync_scanner(&catalog, scanner).await?),
-            Err(error) => sync_results.push(ProviderSyncResult {
-                provider: error.provider_id().as_str().to_owned(),
-                report: ProviderScanReport::default(),
-                failure: Some(error.to_string()),
-            }),
+            Ok(scanner) => {
+                let result =
+                    sync_scanner_with_progress(&catalog, scanner, &mut on_progress).await?;
+                sync_results.push(result);
+            }
+            Err(error) => {
+                let result = ProviderSyncResult {
+                    provider: error.provider_id().as_str().to_owned(),
+                    report: ProviderScanReport::default(),
+                    failure: Some(error.to_string()),
+                };
+                on_progress(SyncProgress::ProviderCompleted {
+                    provider: result.provider.clone(),
+                    report: result.report.clone(),
+                    failure: result.failure.clone(),
+                });
+                sync_results.push(result);
+            }
         }
     }
     let sessions_available = catalog.session_count().await?;
@@ -140,22 +196,70 @@ fn build_sync_summary(
     }
 }
 
+#[cfg(test)]
 async fn sync_scanner(
     catalog: &Catalog,
     scanner: Box<dyn ProviderScanner>,
 ) -> Result<ProviderSyncResult, StorageError> {
+    sync_scanner_with_progress(catalog, scanner, &mut |_| {}).await
+}
+
+async fn sync_scanner_with_progress<F>(
+    catalog: &Catalog,
+    scanner: Box<dyn ProviderScanner>,
+    on_progress: &mut F,
+) -> Result<ProviderSyncResult, StorageError>
+where
+    F: FnMut(SyncProgress),
+{
     let provider = scanner.provider_id().as_str().to_owned();
-    match catalog.scan(&*scanner).await {
-        Ok(report) => Ok(ProviderSyncResult {
-            provider,
-            report,
-            failure: None,
-        }),
-        Err(CatalogScanError::Provider(error)) => Ok(ProviderSyncResult {
-            provider,
-            report: ProviderScanReport::default(),
-            failure: Some(error.to_string()),
-        }),
+    match catalog
+        .scan_with_progress(&*scanner, |progress| match progress {
+            CatalogScanProgress::Started { candidate_sources } => {
+                on_progress(SyncProgress::ProviderStarted {
+                    provider: provider.clone(),
+                    candidate_sources,
+                });
+            }
+            CatalogScanProgress::SourceStaged {
+                processed_sources,
+                candidate_sources,
+            } => {
+                on_progress(SyncProgress::SourceStaged {
+                    provider: provider.clone(),
+                    processed_sources,
+                    candidate_sources,
+                });
+            }
+        })
+        .await
+    {
+        Ok(report) => {
+            let result = ProviderSyncResult {
+                provider,
+                report,
+                failure: None,
+            };
+            on_progress(SyncProgress::ProviderCompleted {
+                provider: result.provider.clone(),
+                report: result.report.clone(),
+                failure: None,
+            });
+            Ok(result)
+        }
+        Err(CatalogScanError::Provider(error)) => {
+            let result = ProviderSyncResult {
+                provider,
+                report: ProviderScanReport::default(),
+                failure: Some(error.to_string()),
+            };
+            on_progress(SyncProgress::ProviderCompleted {
+                provider: result.provider.clone(),
+                report: result.report.clone(),
+                failure: result.failure.clone(),
+            });
+            Ok(result)
+        }
         Err(CatalogScanError::Storage(error)) => Err(error),
     }
 }
@@ -608,10 +712,11 @@ mod tests {
     };
 
     use super::{
-        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, build_sync_summary, catalog_file_set_size,
-        diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
+        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, SyncProgress, build_sync_summary,
+        catalog_file_set_size, diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
         inspect_purge_target_with_hook, list_shell, purge_catalog_shell,
-        purge_catalog_shell_with_hooks, sqlite_sidecar_path, sync_scanner, sync_shell,
+        purge_catalog_shell_with_hooks, sqlite_sidecar_path, sync_scanner,
+        sync_scanner_with_progress, sync_shell,
     };
 
     struct ProviderFailureScanner;
@@ -658,6 +763,44 @@ mod tests {
     }
 
     impl ProviderScan for StorageFailureScan {
+        fn candidate_sources(&self) -> u64 {
+            1
+        }
+
+        fn next_outcome(&mut self) -> ProviderScanFuture<'_> {
+            let outcome = self.outcome.take();
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    struct ProgressScanner;
+
+    impl ProviderScanner for ProgressScanner {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn start(&self) -> Result<Box<dyn ProviderScan + '_>, ProviderScanError> {
+            Ok(Box::new(ProgressScan {
+                outcome: Some(SourceOutcome::Accepted(SourceSnapshot {
+                    identity: SourceIdentity {
+                        provider: "codex",
+                        source_format: "test",
+                        canonical_locator: "test://progress".to_owned(),
+                    },
+                    diagnostic_status: "ok",
+                    diagnostic_message: None,
+                    sessions: Vec::new(),
+                })),
+            }))
+        }
+    }
+
+    struct ProgressScan {
+        outcome: Option<SourceOutcome>,
+    }
+
+    impl ProviderScan for ProgressScan {
         fn candidate_sources(&self) -> u64 {
             1
         }
@@ -792,6 +935,50 @@ mod tests {
                 found: "claude"
             }
         ));
+        catalog.close().await;
+    }
+
+    #[tokio::test]
+    async fn sync_progress_reports_staged_sources_before_committed_provider_completion() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
+            .await
+            .expect("open catalog");
+        let mut progress = Vec::new();
+
+        let result =
+            sync_scanner_with_progress(&catalog, Box::new(ProgressScanner), &mut |event| {
+                progress.push(event);
+            })
+            .await
+            .expect("synchronize progress fixture");
+
+        assert_eq!(result.report.refreshed_sources, 1);
+        assert_eq!(
+            progress,
+            vec![
+                SyncProgress::ProviderStarted {
+                    provider: "codex".to_owned(),
+                    candidate_sources: 1,
+                },
+                SyncProgress::SourceStaged {
+                    provider: "codex".to_owned(),
+                    processed_sources: 1,
+                    candidate_sources: 1,
+                },
+                SyncProgress::ProviderCompleted {
+                    provider: "codex".to_owned(),
+                    report: ProviderScanReport {
+                        candidate_sources: 1,
+                        refreshed_sources: 1,
+                        partial_sources: 0,
+                        failed_sources: 0,
+                        missing_sources: 0,
+                    },
+                    failure: None,
+                },
+            ]
+        );
         catalog.close().await;
     }
 

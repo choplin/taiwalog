@@ -26,7 +26,9 @@ cargo run -- browse
 ```
 
 `browse` first shows the existing Agentlog catalog, then starts a read-only
-sync in the background. Press `r` to request another sync; repeated requests
+sync in the background. Its status line names the current provider and reports
+processed/candidate source counts without exposing source paths or log content.
+Press `r` to request another sync; repeated requests
 while a sync is active do not start another one. The list remains available
 during sync, keeps its selection by provider/source/session key when rows are
 replaced, and reports bounded provider-failure and
@@ -86,13 +88,21 @@ cargo run -- --home /tmp/agentlog-demo paths
 cargo run -- --home /tmp/agentlog-demo sync
 ```
 
+`sync` reports provider start and completion to stderr. In an interactive
+terminal, its current provider and processed/candidate source counts update in
+place; redirected runs keep a bounded start/completion record. `sync --json`
+keeps its machine-readable result on stdout.
+
 ### Purging the local catalog
 
 `agentlog purge` previews the exact Agentlog-owned database path, catalog
 session count, transcript-item count, and approximate SQLite file-set size in
 human-readable IEC units (with the exact byte count), without changing files.
-Run `agentlog purge --yes` only after reviewing that report to purge catalog
-rows while preserving the Agentlog-owned SQLite schema and files. Previewing
+When a controlling terminal is available, it then asks for a default-No
+confirmation and a `y` answer purges in the same invocation. In noninteractive
+use it remains preview-only; use `agentlog purge --yes` to skip the prompt and
+purge catalog rows while preserving the Agentlog-owned SQLite schema and files.
+Previewing
 privately copies only the bounded SQLite main/WAL contents, validates the
 complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
 private SHM, so it never opens the live catalog. Confirmation reports counts
