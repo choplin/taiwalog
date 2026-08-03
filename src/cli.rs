@@ -1,9 +1,8 @@
 //! Command-line transport for Agentlog application workflows.
 
 use std::{
-    fs::File,
     fs::OpenOptions,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, IsTerminal},
     path::PathBuf,
 };
 
@@ -156,41 +155,41 @@ fn print_purge_completion(summary: &crate::app::PurgeSummary) {
 ///
 /// An unavailable terminal intentionally leaves purge in preview-only mode.
 fn confirm_purge_from_terminal(summary: &crate::app::PurgeSummary) -> anyhow::Result<Option<bool>> {
-    let Some(mut terminal) = interactive_terminal() else {
+    if !interactive_terminal() {
         return Ok(None);
-    };
-    loop {
-        eprint!(
-            "Purge {} catalog sources, {} sessions, and {} transcript items now? [y/N] ",
-            summary.sources, summary.sessions, summary.transcript_items
-        );
-        io::stderr().flush()?;
-        let answer = read_bounded_prompt_line(&mut terminal)?;
-        match purge_confirmation_answer(answer.as_deref()) {
-            PromptAnswer::Yes => return Ok(Some(true)),
-            PromptAnswer::No => return Ok(Some(false)),
-            PromptAnswer::Invalid => {
-                eprintln!("Please answer `y`/`yes` or `n`/`no`.");
-            }
-        }
     }
+
+    cliclack::confirm(purge_confirmation_message(summary))
+        .initial_value(false)
+        .interact()
+        .map(Some)
+        .context("confirm catalog purge")
 }
 
-fn interactive_terminal() -> Option<File> {
+fn purge_confirmation_message(summary: &crate::app::PurgeSummary) -> String {
+    format!(
+        "Purge {} catalog sources, {} sessions, and {} transcript items now?",
+        summary.sources, summary.sessions, summary.transcript_items
+    )
+}
+
+fn interactive_terminal() -> bool {
     let stdin = io::stdin().is_terminal();
     let stdout = io::stdout().is_terminal();
     let stderr = io::stderr().is_terminal();
     if !(stdin && stdout && stderr) {
-        return None;
+        return false;
     }
-    let terminal = OpenOptions::new().read(true).open("/dev/tty").ok()?;
-    let foreground = rustix::termios::tcgetpgrp(&terminal).ok()? == rustix::process::getpgrp();
+    let Ok(terminal) = OpenOptions::new().read(true).open("/dev/tty") else {
+        return false;
+    };
+    let foreground = rustix::termios::tcgetpgrp(&terminal)
+        .is_ok_and(|group| group == rustix::process::getpgrp());
     PromptEligibility {
         stdio: [stdin, stdout, stderr],
         foreground,
     }
     .allows_prompt()
-    .then_some(terminal)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,47 +202,6 @@ impl PromptEligibility {
     const fn allows_prompt(self) -> bool {
         self.stdio[0] && self.stdio[1] && self.stdio[2] && self.foreground
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PromptAnswer {
-    Yes,
-    No,
-    Invalid,
-}
-
-fn purge_confirmation_answer(answer: Option<&str>) -> PromptAnswer {
-    let Some(answer) = answer.map(str::trim) else {
-        return PromptAnswer::No;
-    };
-    if answer.is_empty() || answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("no") {
-        PromptAnswer::No
-    } else if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        PromptAnswer::Yes
-    } else {
-        PromptAnswer::Invalid
-    }
-}
-
-fn read_bounded_prompt_line(reader: &mut impl Read) -> io::Result<Option<String>> {
-    const MAX_ANSWER_BYTES: usize = 16;
-    let mut answer = Vec::with_capacity(MAX_ANSWER_BYTES);
-    let mut truncated = false;
-    let mut byte = [0_u8; 1];
-    loop {
-        match reader.read(&mut byte)? {
-            0 if answer.is_empty() && !truncated => return Ok(None),
-            0 => break,
-            1 if byte[0] == b'\n' => break,
-            1 if answer.len() < MAX_ANSWER_BYTES => answer.push(byte[0]),
-            1 => truncated = true,
-            _ => unreachable!("single-byte read returned more than one byte"),
-        }
-    }
-    if truncated {
-        return Ok(Some("<answer too long>".to_owned()));
-    }
-    Ok(Some(String::from_utf8_lossy(&answer).into_owned()))
 }
 
 fn human_readable_bytes(bytes: u64) -> String {
@@ -335,14 +293,14 @@ async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
 /// Writes compact synchronization progress to stderr without touching stdout.
 struct SyncProgressReporter {
     interactive: bool,
-    live_line_active: bool,
+    active: Option<cliclack::ProgressBar>,
 }
 
 impl SyncProgressReporter {
     fn new() -> Self {
         Self {
             interactive: std::io::stderr().is_terminal(),
-            live_line_active: false,
+            active: None,
         }
     }
 
@@ -350,10 +308,12 @@ impl SyncProgressReporter {
         match progress {
             SyncProgress::ProviderDiscovering { provider } => {
                 if self.interactive {
-                    self.replace_live_line(&format!(
-                        "[~] Provider {}: discovering sources",
+                    let progress = cliclack::spinner();
+                    progress.start(format!(
+                        "Provider {}: discovering sources",
                         visible_text(&provider)
                     ));
+                    self.active = Some(progress);
                 } else {
                     eprintln!(
                         "[~] Provider {}: discovering sources",
@@ -366,11 +326,17 @@ impl SyncProgressReporter {
                 candidate_sources,
             } => {
                 if self.interactive {
-                    self.replace_live_line(&format!(
-                        "[~] Provider {}: 0/{} sources processed",
+                    self.stop_active(format!(
+                        "Provider {}: discovered {} candidate sources",
                         visible_text(&provider),
                         candidate_sources
                     ));
+                    let progress = cliclack::progress_bar(candidate_sources);
+                    progress.start(format!(
+                        "Provider {}: synchronizing sources",
+                        visible_text(&provider)
+                    ));
+                    self.active = Some(progress);
                 } else {
                     eprintln!(
                         "[~] Provider {}: starting {} candidate sources",
@@ -380,17 +346,14 @@ impl SyncProgressReporter {
                 }
             }
             SyncProgress::SourceStaged {
-                provider,
+                provider: _,
                 processed_sources,
-                candidate_sources,
+                candidate_sources: _,
             } => {
                 if self.interactive {
-                    self.replace_live_line(&format!(
-                        "[~] Provider {}: {}/{} sources processed",
-                        visible_text(&provider),
-                        processed_sources,
-                        candidate_sources
-                    ));
+                    if let Some(progress) = &self.active {
+                        progress.set_position(processed_sources);
+                    }
                 }
             }
             SyncProgress::ProviderCompleted {
@@ -398,16 +361,15 @@ impl SyncProgressReporter {
                 report,
                 failure,
             } => {
-                self.clear_live_line();
                 if let Some(failure) = failure {
-                    eprintln!(
-                        "[!] Provider {}: failed ({})",
+                    self.error_active(format!(
+                        "Provider {}: failed ({})",
                         visible_text(&provider),
                         visible_text(&failure)
-                    );
+                    ));
                 } else {
-                    eprintln!(
-                        "[+] Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}",
+                    let message = format!(
+                        "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}",
                         visible_text(&provider),
                         report.candidate_sources,
                         report.refreshed_sources,
@@ -415,29 +377,46 @@ impl SyncProgressReporter {
                         report.failed_sources,
                         report.missing_sources
                     );
+                    if self.interactive {
+                        self.complete_active(message);
+                    } else {
+                        eprintln!("[+] {message}");
+                    }
                 }
             }
         }
     }
 
-    fn replace_live_line(&mut self, line: &str) {
-        eprint!("\r\x1b[2K{line}");
-        let _ = std::io::stderr().flush();
-        self.live_line_active = true;
+    fn stop_active(&mut self, message: String) {
+        if let Some(progress) = self.active.take() {
+            progress.stop(message);
+        } else {
+            eprintln!("[~] {message}");
+        }
     }
 
-    fn clear_live_line(&mut self) {
-        if self.live_line_active {
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
-            self.live_line_active = false;
+    fn error_active(&mut self, message: String) {
+        if let Some(progress) = self.active.take() {
+            progress.error(message);
+        } else {
+            eprintln!("[!] {message}");
+        }
+    }
+
+    fn complete_active(&mut self, message: String) {
+        if let Some(progress) = self.active.take() {
+            progress.stop(message);
+        } else {
+            eprintln!("[+] {message}");
         }
     }
 }
 
 impl Drop for SyncProgressReporter {
     fn drop(&mut self) {
-        self.clear_live_line();
+        if let Some(progress) = self.active.take() {
+            progress.clear();
+        }
     }
 }
 
@@ -537,8 +516,7 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, PromptAnswer, PromptEligibility, human_readable_bytes,
-        purge_confirmation_answer, read_bounded_prompt_line,
+        Cli, Command, PromptEligibility, human_readable_bytes, purge_confirmation_message,
     };
 
     #[test]
@@ -573,15 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn purge_confirmation_defaults_to_no() {
-        assert_eq!(purge_confirmation_answer(None), PromptAnswer::No);
-        assert_eq!(purge_confirmation_answer(Some("\n")), PromptAnswer::No);
-        assert_eq!(purge_confirmation_answer(Some("No\n")), PromptAnswer::No);
-        assert_eq!(purge_confirmation_answer(Some("Y\n")), PromptAnswer::Yes);
-        assert_eq!(purge_confirmation_answer(Some("YeS\n")), PromptAnswer::Yes);
+    fn purge_confirmation_message_names_the_previewed_blast_radius() {
+        let summary = crate::app::PurgeSummary {
+            database: std::path::PathBuf::from("/tmp/agentlog.sqlite3"),
+            sources: 2,
+            sessions: 3,
+            transcript_items: 5,
+            approximate_bytes: 0,
+            cleared: false,
+        };
         assert_eq!(
-            purge_confirmation_answer(Some("maybe\n")),
-            PromptAnswer::Invalid
+            purge_confirmation_message(&summary),
+            "Purge 2 catalog sources, 3 sessions, and 5 transcript items now?"
         );
     }
 
@@ -612,21 +593,6 @@ mod tests {
         ] {
             assert!(!ineligible.allows_prompt());
         }
-    }
-
-    #[test]
-    fn purge_prompt_line_buffer_is_bounded() {
-        let mut input = std::io::Cursor::new(format!("{}\ny\n", "x".repeat(1_024)));
-        let first = read_bounded_prompt_line(&mut input).expect("read oversized answer");
-        let second = read_bounded_prompt_line(&mut input).expect("read following answer");
-        assert_eq!(
-            purge_confirmation_answer(first.as_deref()),
-            PromptAnswer::Invalid
-        );
-        assert_eq!(
-            purge_confirmation_answer(second.as_deref()),
-            PromptAnswer::Yes
-        );
     }
 
     #[test]
