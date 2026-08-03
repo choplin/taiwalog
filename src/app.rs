@@ -373,7 +373,7 @@ pub struct PurgeSummary {
     pub cleared: bool,
 }
 
-/// A purge preview whose private token binds later confirmation to exact bytes.
+/// A purge preview whose private token binds confirmation to exact content.
 pub struct PurgePreview {
     pub summary: PurgeSummary,
     token: PurgePreviewToken,
@@ -639,12 +639,12 @@ fn inspect_purge_target_with_hook(
     let wal = files
         .iter()
         .find(|file| file.suffix == Some("-wal"))
-        .map(|file| file.bytes.clone());
+        .map(|file| file.bytes.as_slice());
 
     Ok(Some(PurgeTarget {
         approximate_bytes,
         database_identity: main.state.identity,
-        content_token: CatalogContentToken::new(main.bytes.clone(), wal),
+        content_token: CatalogContentToken::new(&main.bytes, wal),
         _snapshot_directory: snapshot_directory,
         snapshot_database,
     }))

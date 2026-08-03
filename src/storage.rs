@@ -16,6 +16,7 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -65,18 +66,18 @@ pub struct CatalogCounts {
     pub transcript_items: u64,
 }
 
-/// Exact data-bearing bytes approved by an interactive purge preview.
+/// Constant-size cryptographic digests of content approved by a purge preview.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogContentToken {
-    database: Vec<u8>,
-    wal: Option<Vec<u8>>,
+    database: [u8; 32],
+    wal: Option<[u8; 32]>,
 }
 
 impl CatalogContentToken {
-    pub(crate) fn new(database: Vec<u8>, wal: Option<Vec<u8>>) -> Self {
+    pub(crate) fn new(database: &[u8], wal: Option<&[u8]>) -> Self {
         Self {
-            database,
-            wal: normalize_wal(wal),
+            database: sha256(database),
+            wal: wal.filter(|bytes| !bytes.is_empty()).map(sha256),
         }
     }
 }
@@ -749,17 +750,17 @@ fn verify_catalog_content(
     expected: &CatalogContentToken,
     max_bytes: u64,
 ) -> Result<(), StorageError> {
-    let database = read_bounded_catalog_component(path, max_bytes)?.ok_or_else(|| {
+    let database = hash_bounded_catalog_component(path, max_bytes)?.ok_or_else(|| {
         StorageError::CatalogPreviewChanged {
             path: path.to_path_buf(),
         }
     })?;
-    let remaining = max_bytes.saturating_sub(u64::try_from(database.len()).unwrap_or(u64::MAX));
-    let wal = normalize_wal(read_bounded_catalog_component(
+    let remaining = max_bytes.saturating_sub(database.length);
+    let wal = normalize_wal_digest(hash_bounded_catalog_component(
         &sqlite_sidecar_path(path, "-wal"),
         remaining,
     )?);
-    if database == expected.database && wal == expected.wal {
+    if database.digest == expected.database && wal == expected.wal {
         Ok(())
     } else {
         Err(StorageError::CatalogPreviewChanged {
@@ -768,14 +769,25 @@ fn verify_catalog_content(
     }
 }
 
-fn normalize_wal(wal: Option<Vec<u8>>) -> Option<Vec<u8>> {
-    wal.filter(|bytes| !bytes.is_empty())
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
-fn read_bounded_catalog_component(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HashedCatalogComponent {
+    digest: [u8; 32],
+    length: u64,
+}
+
+fn normalize_wal_digest(wal: Option<HashedCatalogComponent>) -> Option<[u8; 32]> {
+    wal.filter(|component| component.length != 0)
+        .map(|component| component.digest)
+}
+
+fn hash_bounded_catalog_component(
     path: &Path,
     max_bytes: u64,
-) -> Result<Option<Vec<u8>>, StorageError> {
+) -> Result<Option<HashedCatalogComponent>, StorageError> {
     let Some(expected_state) = inspect_catalog_file_state(path)? else {
         return Ok(None);
     };
@@ -804,21 +816,51 @@ fn read_bounded_catalog_component(
             path: path.to_path_buf(),
         });
     }
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
+    let mut file = file;
+    let mut hasher = Sha256::new();
+    let mut remaining = expected_state.length;
+    let mut buffer = [0_u8; 16 * 1024];
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
+            StorageError::CatalogFileSetSizeOverflow {
+                path: path.to_path_buf(),
+            }
+        })?;
+        let read =
+            file.read(&mut buffer[..limit])
+                .map_err(|source| StorageError::CatalogPathIo {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if read == 0 {
+            return Err(StorageError::CatalogPreviewChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        hasher.update(&buffer[..read]);
+        let read = u64::try_from(read).map_err(|_| StorageError::CatalogFileSetSizeOverflow {
+            path: path.to_path_buf(),
+        })?;
+        remaining -= read;
+    }
+    let mut trailing = [0_u8; 1];
+    if file
+        .read(&mut trailing)
         .map_err(|source| StorageError::CatalogPathIo {
             path: path.to_path_buf(),
             source,
-        })?;
-    if u64::try_from(bytes.len()).ok() != Some(expected_state.length)
+        })?
+        != 0
         || inspect_catalog_file_state(path)? != Some(expected_state)
     {
         return Err(StorageError::CatalogPreviewChanged {
             path: path.to_path_buf(),
         });
     }
-    Ok(Some(bytes))
+    Ok(Some(HashedCatalogComponent {
+        digest: hasher.finalize().into(),
+        length: expected_state.length,
+    }))
 }
 
 fn inspect_catalog_file_set_size(path: &Path, max_bytes: u64) -> Result<u64, StorageError> {
@@ -1684,11 +1726,12 @@ mod tests {
     };
 
     use super::{
-        Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
-        SourceSnapshot, StorageError, inspect_catalog_file_state, list_catalog_sessions,
-        list_catalog_source_diagnostics, open_database, purge_existing_catalog_with_hooks,
-        read_catalog_preview, read_catalog_preview_by_identity, record_source_failure,
-        replace_source_snapshot,
+        Catalog, CatalogContentToken, CatalogItem, CatalogScanError, CatalogSession,
+        SCHEMA_VERSION, SourceIdentity, SourceSnapshot, StorageError, inspect_catalog_file_state,
+        list_catalog_sessions, list_catalog_source_diagnostics, open_database,
+        purge_existing_catalog_with_hooks, read_catalog_preview, read_catalog_preview_by_identity,
+        record_source_failure, replace_source_snapshot, sqlite_sidecar_path,
+        verify_catalog_content,
     };
 
     struct MismatchedScanner;
@@ -1788,6 +1831,53 @@ mod tests {
             wal: read_optional(PathBuf::from(format!("{}-wal", path.display()))),
             shm: read_optional(PathBuf::from(format!("{}-shm", path.display()))),
         }
+    }
+
+    #[test]
+    fn catalog_content_token_matches_unchanged_main_and_rejects_mismatch() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = temporary.path().join("agentlog.sqlite3");
+        fs::write(&database, b"previewed-main").expect("write previewed main");
+        let token = CatalogContentToken::new(b"previewed-main", None);
+
+        verify_catalog_content(&database, &token, 1024).expect("match unchanged main");
+        fs::write(&database, b"different-main").expect("replace main contents");
+        assert!(matches!(
+            verify_catalog_content(&database, &token, 1024),
+            Err(StorageError::CatalogPreviewChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_content_token_normalizes_empty_wal_and_rejects_wal_changes() {
+        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let database = temporary.path().join("agentlog.sqlite3");
+        let wal = sqlite_sidecar_path(&database, "-wal");
+        fs::write(&database, b"main").expect("write main");
+
+        let no_wal = CatalogContentToken::new(b"main", None);
+        fs::write(&wal, b"").expect("create empty WAL");
+        verify_catalog_content(&database, &no_wal, 1024)
+            .expect("absent and empty WAL are equivalent");
+        fs::write(&wal, b"appeared").expect("write appearing WAL");
+        assert!(matches!(
+            verify_catalog_content(&database, &no_wal, 1024),
+            Err(StorageError::CatalogPreviewChanged { .. })
+        ));
+
+        let with_wal = CatalogContentToken::new(b"main", Some(b"previewed-wal"));
+        fs::write(&wal, b"previewed-wal").expect("write previewed WAL");
+        verify_catalog_content(&database, &with_wal, 1024).expect("match unchanged WAL");
+        fs::write(&wal, b"different-wal").expect("change WAL contents");
+        assert!(matches!(
+            verify_catalog_content(&database, &with_wal, 1024),
+            Err(StorageError::CatalogPreviewChanged { .. })
+        ));
+        fs::remove_file(&wal).expect("remove WAL");
+        assert!(matches!(
+            verify_catalog_content(&database, &with_wal, 1024),
+            Err(StorageError::CatalogPreviewChanged { .. })
+        ));
     }
 
     #[tokio::test]

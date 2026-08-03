@@ -108,9 +108,10 @@ SQLite schema and files. Previewing privately copies only the bounded SQLite
 main/WAL contents, validates the
 complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
 private SHM, so it never opens the live catalog. Interactive confirmation also
-retains the previewed main/WAL bytes and compares them after acquiring the
-SQLite writer lock; if they changed, it deletes nothing and asks for a new
-preview. Confirmation reports counts and current file-set size measured after
+retains constant-size SHA-256 digests of the previewed main/WAL content and
+compares them after acquiring the SQLite writer lock; if they changed, it
+deletes nothing and asks for a new preview. Confirmation reports counts and
+current file-set size measured after
 acquiring the same writer serialization used to purge the rows; it fails
 instead of racing another active writer. The command never deletes
 configuration, provider sources, an external database, or raw provider logs.
