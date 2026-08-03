@@ -1,6 +1,7 @@
 //! Command-line transport for Agentlog application workflows.
 
 use std::{
+    env,
     fs::OpenOptions,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -298,8 +299,13 @@ struct SyncProgressReporter {
 
 impl SyncProgressReporter {
     fn new() -> Self {
+        let term = env::var("TERM").ok();
         Self {
-            interactive: std::io::stderr().is_terminal(),
+            interactive: terminal_control_allowed(
+                std::io::stderr().is_terminal(),
+                term.as_deref(),
+                env::var_os("NO_COLOR").is_some(),
+            ),
             active: None,
         }
     }
@@ -412,6 +418,14 @@ impl SyncProgressReporter {
     }
 }
 
+/// Returns whether stderr supports the live cursor control used by cliclack.
+///
+/// A plain report is safer for a terminal without a declared terminal type, a
+/// dumb terminal, or when the user has explicitly disabled terminal styling.
+fn terminal_control_allowed(stderr_is_terminal: bool, term: Option<&str>, no_color: bool) -> bool {
+    stderr_is_terminal && term.is_some_and(|term| term != "dumb") && !no_color
+}
+
 impl Drop for SyncProgressReporter {
     fn drop(&mut self) {
         if let Some(progress) = self.active.take() {
@@ -517,6 +531,7 @@ mod tests {
 
     use super::{
         Cli, Command, PromptEligibility, human_readable_bytes, purge_confirmation_message,
+        terminal_control_allowed,
     };
 
     #[test]
@@ -592,6 +607,26 @@ mod tests {
             },
         ] {
             assert!(!ineligible.allows_prompt());
+        }
+    }
+
+    #[test]
+    fn sync_progress_uses_cliclack_only_with_terminal_control() {
+        assert!(terminal_control_allowed(
+            true,
+            Some("xterm-256color"),
+            false
+        ));
+        for (stderr_is_terminal, term, no_color) in [
+            (false, Some("xterm-256color"), false),
+            (true, None, false),
+            (true, Some("dumb"), false),
+            (true, Some("xterm-256color"), true),
+        ] {
+            assert!(
+                !terminal_control_allowed(stderr_is_terminal, term, no_color),
+                "stderr_tty={stderr_is_terminal}, term={term:?}, no_color={no_color} must use plain progress"
+            );
         }
     }
 
