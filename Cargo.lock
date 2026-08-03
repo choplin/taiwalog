@@ -10,6 +10,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sqlx",

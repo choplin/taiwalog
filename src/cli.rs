@@ -1,8 +1,9 @@
 //! Command-line transport for Agentlog application workflows.
 
 use std::{
+    fs::File,
     fs::OpenOptions,
-    io::{BufRead, BufReader, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
 };
 
@@ -11,8 +12,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::{
     app::{
-        SyncProgress, list_shell, paths_report, purge_catalog_shell, show_shell,
-        sync_shell_with_progress,
+        SyncProgress, list_shell, paths_report, preview_purge_catalog, purge_catalog_shell,
+        purge_previewed_catalog, show_shell, sync_shell_with_progress,
     },
     display::visible_text,
     paths::AppPaths,
@@ -62,7 +63,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Preview, or with --yes purge, the Agentlog-owned catalog database.
+    /// Preview and interactively confirm, or with --yes purge, the Agentlog-owned catalog.
     Purge {
         /// Purge the reported Agentlog-owned catalog contents.
         #[arg(long)]
@@ -105,11 +106,11 @@ async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let preview = purge_catalog_shell(paths, false).await?;
-    print_purge_report(&preview);
-    match confirm_purge_from_terminal(&preview)? {
+    let preview = preview_purge_catalog(paths).await?;
+    print_purge_report(&preview.summary);
+    match confirm_purge_from_terminal(&preview.summary)? {
         Some(true) => {
-            let summary = purge_catalog_shell(paths, true).await?;
+            let summary = purge_previewed_catalog(paths, preview).await?;
             print_purge_completion(&summary);
         }
         Some(false) => eprintln!("Purge canceled; no changes were made."),
@@ -123,6 +124,7 @@ fn print_purge_report(summary: &crate::app::PurgeSummary) {
         "Agentlog-owned database target: {}",
         visible_text(&summary.database.display().to_string())
     );
+    eprintln!("Catalog sources: {}", summary.sources);
     eprintln!("Catalog sessions: {}", summary.sessions);
     eprintln!("Transcript items: {}", summary.transcript_items);
     eprintln!(
@@ -138,7 +140,8 @@ fn print_purge_report(summary: &crate::app::PurgeSummary) {
 fn print_purge_completion(summary: &crate::app::PurgeSummary) {
     if summary.cleared {
         eprintln!(
-            "Purge complete: cleared {} catalog sessions and {} transcript items from the locked catalog state ({}; {} bytes).",
+            "Purge complete: cleared {} catalog sources, {} sessions, and {} transcript items from the locked catalog state ({}; {} bytes).",
+            summary.sources,
             summary.sessions,
             summary.transcript_items,
             human_readable_bytes(summary.approximate_bytes),
@@ -153,26 +156,94 @@ fn print_purge_completion(summary: &crate::app::PurgeSummary) {
 ///
 /// An unavailable terminal intentionally leaves purge in preview-only mode.
 fn confirm_purge_from_terminal(summary: &crate::app::PurgeSummary) -> anyhow::Result<Option<bool>> {
-    let Ok(mut terminal) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+    let Some(mut terminal) = interactive_terminal() else {
         return Ok(None);
     };
-    write!(
-        terminal,
-        "Purge {} catalog sessions and {} transcript items now? [y/N] ",
-        summary.sessions, summary.transcript_items
-    )?;
-    terminal.flush()?;
-
-    let mut answer = String::new();
-    let mut reader = BufReader::new(terminal.try_clone()?);
-    if reader.read_line(&mut answer)? == 0 {
-        return Ok(Some(false));
+    loop {
+        eprint!(
+            "Purge {} catalog sources, {} sessions, and {} transcript items now? [y/N] ",
+            summary.sources, summary.sessions, summary.transcript_items
+        );
+        io::stderr().flush()?;
+        let answer = read_bounded_prompt_line(&mut terminal)?;
+        match purge_confirmation_answer(answer.as_deref()) {
+            PromptAnswer::Yes => return Ok(Some(true)),
+            PromptAnswer::No => return Ok(Some(false)),
+            PromptAnswer::Invalid => {
+                eprintln!("Please answer `y`/`yes` or `n`/`no`.");
+            }
+        }
     }
-    Ok(Some(purge_confirmation_answer(Some(&answer))))
 }
 
-fn purge_confirmation_answer(answer: Option<&str>) -> bool {
-    matches!(answer.map(str::trim), Some("y" | "Y" | "yes" | "YES"))
+fn interactive_terminal() -> Option<File> {
+    let stdin = io::stdin().is_terminal();
+    let stdout = io::stdout().is_terminal();
+    let stderr = io::stderr().is_terminal();
+    if !(stdin && stdout && stderr) {
+        return None;
+    }
+    let terminal = OpenOptions::new().read(true).open("/dev/tty").ok()?;
+    let foreground = rustix::termios::tcgetpgrp(&terminal).ok()? == rustix::process::getpgrp();
+    PromptEligibility {
+        stdio: [stdin, stdout, stderr],
+        foreground,
+    }
+    .allows_prompt()
+    .then_some(terminal)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PromptEligibility {
+    stdio: [bool; 3],
+    foreground: bool,
+}
+
+impl PromptEligibility {
+    const fn allows_prompt(self) -> bool {
+        self.stdio[0] && self.stdio[1] && self.stdio[2] && self.foreground
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptAnswer {
+    Yes,
+    No,
+    Invalid,
+}
+
+fn purge_confirmation_answer(answer: Option<&str>) -> PromptAnswer {
+    let Some(answer) = answer.map(str::trim) else {
+        return PromptAnswer::No;
+    };
+    if answer.is_empty() || answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("no") {
+        PromptAnswer::No
+    } else if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        PromptAnswer::Yes
+    } else {
+        PromptAnswer::Invalid
+    }
+}
+
+fn read_bounded_prompt_line(reader: &mut impl Read) -> io::Result<Option<String>> {
+    const MAX_ANSWER_BYTES: usize = 16;
+    let mut answer = Vec::with_capacity(MAX_ANSWER_BYTES);
+    let mut truncated = false;
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte)? {
+            0 if answer.is_empty() && !truncated => return Ok(None),
+            0 => break,
+            1 if byte[0] == b'\n' => break,
+            1 if answer.len() < MAX_ANSWER_BYTES => answer.push(byte[0]),
+            1 => truncated = true,
+            _ => unreachable!("single-byte read returned more than one byte"),
+        }
+    }
+    if truncated {
+        return Ok(Some("<answer too long>".to_owned()));
+    }
+    Ok(Some(String::from_utf8_lossy(&answer).into_owned()))
 }
 
 fn human_readable_bytes(bytes: u64) -> String {
@@ -277,7 +348,20 @@ impl SyncProgressReporter {
 
     fn report(&mut self, progress: SyncProgress) {
         match progress {
-            SyncProgress::ProviderStarted {
+            SyncProgress::ProviderDiscovering { provider } => {
+                if self.interactive {
+                    self.replace_live_line(&format!(
+                        "[~] Provider {}: discovering sources",
+                        visible_text(&provider)
+                    ));
+                } else {
+                    eprintln!(
+                        "[~] Provider {}: discovering sources",
+                        visible_text(&provider)
+                    );
+                }
+            }
+            SyncProgress::ProviderCandidates {
                 provider,
                 candidate_sources,
             } => {
@@ -452,7 +536,10 @@ fn print_visible_transcript(label: &str, content: &str) {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, human_readable_bytes, purge_confirmation_answer};
+    use super::{
+        Cli, Command, PromptAnswer, PromptEligibility, human_readable_bytes,
+        purge_confirmation_answer, read_bounded_prompt_line,
+    };
 
     #[test]
     fn database_sizes_use_readable_binary_units() {
@@ -487,11 +574,59 @@ mod tests {
 
     #[test]
     fn purge_confirmation_defaults_to_no() {
-        assert!(!purge_confirmation_answer(None));
-        assert!(!purge_confirmation_answer(Some("\n")));
-        assert!(!purge_confirmation_answer(Some("n\n")));
-        assert!(purge_confirmation_answer(Some("y\n")));
-        assert!(purge_confirmation_answer(Some("yes\n")));
+        assert_eq!(purge_confirmation_answer(None), PromptAnswer::No);
+        assert_eq!(purge_confirmation_answer(Some("\n")), PromptAnswer::No);
+        assert_eq!(purge_confirmation_answer(Some("No\n")), PromptAnswer::No);
+        assert_eq!(purge_confirmation_answer(Some("Y\n")), PromptAnswer::Yes);
+        assert_eq!(purge_confirmation_answer(Some("YeS\n")), PromptAnswer::Yes);
+        assert_eq!(
+            purge_confirmation_answer(Some("maybe\n")),
+            PromptAnswer::Invalid
+        );
+    }
+
+    #[test]
+    fn purge_prompt_requires_all_three_standard_streams_to_be_terminals() {
+        let eligible = PromptEligibility {
+            stdio: [true, true, true],
+            foreground: true,
+        };
+        assert!(eligible.allows_prompt());
+        for ineligible in [
+            PromptEligibility {
+                stdio: [false, true, true],
+                ..eligible
+            },
+            PromptEligibility {
+                stdio: [true, false, true],
+                ..eligible
+            },
+            PromptEligibility {
+                stdio: [true, true, false],
+                ..eligible
+            },
+            PromptEligibility {
+                foreground: false,
+                ..eligible
+            },
+        ] {
+            assert!(!ineligible.allows_prompt());
+        }
+    }
+
+    #[test]
+    fn purge_prompt_line_buffer_is_bounded() {
+        let mut input = std::io::Cursor::new(format!("{}\ny\n", "x".repeat(1_024)));
+        let first = read_bounded_prompt_line(&mut input).expect("read oversized answer");
+        let second = read_bounded_prompt_line(&mut input).expect("read following answer");
+        assert_eq!(
+            purge_confirmation_answer(first.as_deref()),
+            PromptAnswer::Invalid
+        );
+        assert_eq!(
+            purge_confirmation_answer(second.as_deref()),
+            PromptAnswer::Yes
+        );
     }
 
     #[test]

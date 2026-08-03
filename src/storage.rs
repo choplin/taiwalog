@@ -6,7 +6,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -48,7 +49,7 @@ pub struct Catalog {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogScanProgress {
     /// Provider discovery has completed and the candidate count is known.
-    Started { candidate_sources: u64 },
+    CandidatesDiscovered { candidate_sources: u64 },
     /// One source outcome has been written to the open transaction.
     SourceStaged {
         processed_sources: u64,
@@ -59,8 +60,25 @@ pub enum CatalogScanProgress {
 /// Counts retained in an existing, validated Agentlog catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogCounts {
+    pub sources: u64,
     pub sessions: u64,
     pub transcript_items: u64,
+}
+
+/// Exact data-bearing bytes approved by an interactive purge preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogContentToken {
+    database: Vec<u8>,
+    wal: Option<Vec<u8>>,
+}
+
+impl CatalogContentToken {
+    pub(crate) fn new(database: Vec<u8>, wal: Option<Vec<u8>>) -> Self {
+        Self {
+            database,
+            wal: normalize_wal(wal),
+        }
+    }
 }
 
 /// Counts and file-set size observed while the purge writer lock is held.
@@ -191,7 +209,7 @@ impl Catalog {
             candidate_sources: scan.candidate_sources(),
             ..ProviderScanReport::default()
         };
-        on_progress(CatalogScanProgress::Started {
+        on_progress(CatalogScanProgress::CandidatesDiscovered {
             candidate_sources: report.candidate_sources,
         });
         let mut transaction = self.pool.begin().await.map_err(StorageError::Query)?;
@@ -515,11 +533,13 @@ pub async fn inspect_catalog_snapshot(path: &Path) -> Result<CatalogCounts, Stor
         .map_err(StorageError::Connect)?;
 
     validate_existing_schema(&pool).await?;
+    let sources = count_rows(&pool, "sources").await?;
     let sessions = count_rows(&pool, "sessions").await?;
     let transcript_items = count_rows(&pool, "transcript_items").await?;
     pool.close().await;
 
     Ok(CatalogCounts {
+        sources,
         sessions,
         transcript_items,
     })
@@ -638,12 +658,14 @@ fn verify_catalog_file_identity(
 pub(crate) async fn purge_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
+    expected_content: Option<&CatalogContentToken>,
     max_file_set_bytes: u64,
     after_measurement: impl FnOnce(CatalogPurgeResult),
 ) -> Result<CatalogPurgeResult, StorageError> {
     purge_existing_catalog_with_hooks(
         path,
         expected_identity,
+        expected_content,
         max_file_set_bytes,
         || {},
         after_measurement,
@@ -654,6 +676,7 @@ pub(crate) async fn purge_existing_catalog(
 async fn purge_existing_catalog_with_hooks(
     path: &Path,
     expected_identity: CatalogFileIdentity,
+    expected_content: Option<&CatalogContentToken>,
     max_file_set_bytes: u64,
     after_open: impl FnOnce(),
     after_measurement: impl FnOnce(CatalogPurgeResult),
@@ -681,8 +704,16 @@ async fn purge_existing_catalog_with_hooks(
         .await
         .map_err(StorageError::Query)?;
     verify_catalog_file_identity(path, expected_identity)?;
+    if let Some(expected_content) = expected_content
+        && let Err(error) = verify_catalog_content(path, expected_content, max_file_set_bytes)
+    {
+        transaction.rollback().await.map_err(StorageError::Query)?;
+        pool.close().await;
+        return Err(error);
+    }
     validate_existing_schema_in_transaction(&mut transaction).await?;
     let counts = CatalogCounts {
+        sources: count_rows_in_transaction(&mut transaction, "sources").await?,
         sessions: count_rows_in_transaction(&mut transaction, "sessions").await?,
         transcript_items: count_rows_in_transaction(&mut transaction, "transcript_items").await?,
     };
@@ -711,6 +742,83 @@ async fn purge_existing_catalog_with_hooks(
     transaction.commit().await.map_err(StorageError::Query)?;
     pool.close().await;
     Ok(result)
+}
+
+fn verify_catalog_content(
+    path: &Path,
+    expected: &CatalogContentToken,
+    max_bytes: u64,
+) -> Result<(), StorageError> {
+    let database = read_bounded_catalog_component(path, max_bytes)?.ok_or_else(|| {
+        StorageError::CatalogPreviewChanged {
+            path: path.to_path_buf(),
+        }
+    })?;
+    let remaining = max_bytes.saturating_sub(u64::try_from(database.len()).unwrap_or(u64::MAX));
+    let wal = normalize_wal(read_bounded_catalog_component(
+        &sqlite_sidecar_path(path, "-wal"),
+        remaining,
+    )?);
+    if database == expected.database && wal == expected.wal {
+        Ok(())
+    } else {
+        Err(StorageError::CatalogPreviewChanged {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn normalize_wal(wal: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    wal.filter(|bytes| !bytes.is_empty())
+}
+
+fn read_bounded_catalog_component(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let Some(expected_state) = inspect_catalog_file_state(path)? else {
+        return Ok(None);
+    };
+    if expected_state.length > max_bytes {
+        return Err(StorageError::CatalogFileSetTooLarge {
+            path: path.to_path_buf(),
+            bytes: expected_state.length,
+            max_bytes,
+        });
+    }
+    let file = File::open(path).map_err(|source| StorageError::CatalogPathIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let opened_state = CatalogFileState::from_metadata(
+        path,
+        &file
+            .metadata()
+            .map_err(|source| StorageError::CatalogPathIo {
+                path: path.to_path_buf(),
+                source,
+            })?,
+    )?;
+    if opened_state != expected_state {
+        return Err(StorageError::CatalogPreviewChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| StorageError::CatalogPathIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(bytes.len()).ok() != Some(expected_state.length)
+        || inspect_catalog_file_state(path)? != Some(expected_state)
+    {
+        return Err(StorageError::CatalogPreviewChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(Some(bytes))
 }
 
 fn inspect_catalog_file_set_size(path: &Path, max_bytes: u64) -> Result<u64, StorageError> {
@@ -804,6 +912,7 @@ async fn count_rows_in_transaction(
 
 fn count_query(table: &'static str) -> &'static str {
     match table {
+        "sources" => "SELECT COUNT(*) FROM sources",
         "sessions" => "SELECT COUNT(*) FROM sessions",
         "transcript_items" => "SELECT COUNT(*) FROM transcript_items",
         _ => unreachable!("only catalog tables are counted"),
@@ -1521,6 +1630,10 @@ pub enum StorageError {
     UnsafeCatalogPath { path: PathBuf, reason: &'static str },
     #[error("Agentlog catalog file identity changed while opening {path}; refusing to purge")]
     CatalogFileIdentityChanged { path: PathBuf },
+    #[error(
+        "Agentlog catalog changed after the purge preview at {path}; no data was deleted; rerun `agentlog purge` to review the updated catalog"
+    )]
+    CatalogPreviewChanged { path: PathBuf },
     #[error("Agentlog catalog file-set size exceeds the supported range at {path}")]
     CatalogFileSetSizeOverflow { path: PathBuf },
     #[error(
@@ -1736,6 +1849,7 @@ mod tests {
         let error = purge_existing_catalog_with_hooks(
             &database_path,
             expected_identity,
+            None,
             u64::MAX,
             || {
                 fs::rename(&database_path, &displaced_path).expect("displace opened database");
@@ -1782,6 +1896,7 @@ mod tests {
         let error = purge_existing_catalog_with_hooks(
             &database_path,
             expected_identity,
+            None,
             0,
             || {},
             |_| panic!("oversized file set must fail before the measurement hook"),

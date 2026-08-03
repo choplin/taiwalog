@@ -99,6 +99,7 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
         "Agentlog-owned database target: {}",
         database.display()
     )));
+    assert!(preview_report.contains("Catalog sources: 1"));
     assert!(preview_report.contains("Catalog sessions: 1"));
     assert!(preview_report.contains("Transcript items: 1"));
     let size_line = preview_report
@@ -126,7 +127,7 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
     assert!(confirmed.status.success());
     assert!(confirmed.stdout.is_empty());
     let completion_report = String::from_utf8(confirmed.stderr).expect("UTF-8 completion report");
-    assert!(completion_report.contains("Purge complete:"));
+    assert!(completion_report.contains("Purge complete: cleared 1 catalog sources"));
     assert!(completion_report.contains(
         "Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
     ));
@@ -172,9 +173,10 @@ fn sync_process_keeps_json_stdout_clean_and_bounds_noninteractive_progress() {
     assert_eq!(summary["sources_refreshed"], 1);
     let report = String::from_utf8(output.stderr).expect("UTF-8 sync report");
     assert!(report.contains("[~] Provider gemini: starting 1 candidate sources"));
+    assert!(report.contains("[~] Provider gemini: discovering sources"));
     assert!(report.contains("[+] Provider gemini: candidates=1, refreshed=1"));
     assert!(
-        report.lines().count() <= 12,
-        "noninteractive progress reports once per provider start and completion"
+        report.lines().count() <= 18,
+        "noninteractive progress reports bounded provider discovery, candidate, and completion events"
     );
 }

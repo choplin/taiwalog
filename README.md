@@ -88,29 +88,34 @@ cargo run -- --home /tmp/agentlog-demo paths
 cargo run -- --home /tmp/agentlog-demo sync
 ```
 
-`sync` reports provider start and completion to stderr. In an interactive
-terminal, its current provider and processed/candidate source counts update in
-place; redirected runs keep a bounded start/completion record. `sync --json`
-keeps its machine-readable result on stdout.
+`sync` reports provider discovery, candidate counts, and completion to stderr.
+In an interactive terminal, its current provider and processed/candidate source
+counts update in place; redirected runs keep a bounded per-provider record.
+`sync --json` keeps its machine-readable result on stdout.
 
 ### Purging the local catalog
 
 `agentlog purge` previews the exact Agentlog-owned database path, catalog
-session count, transcript-item count, and approximate SQLite file-set size in
-human-readable IEC units (with the exact byte count), without changing files.
-When a controlling terminal is available, it then asks for a default-No
-confirmation and a `y` answer purges in the same invocation. In noninteractive
-use it remains preview-only; use `agentlog purge --yes` to skip the prompt and
-purge catalog rows while preserving the Agentlog-owned SQLite schema and files.
-Previewing
-privately copies only the bounded SQLite main/WAL contents, validates the
+source count, session count, transcript-item count, and approximate SQLite
+file-set size in human-readable IEC units (with the exact byte count), without
+changing files.
+When all three standard streams are terminals and the process is in the
+controlling terminal's foreground process group, it then asks for a default-No
+confirmation and a `y` answer purges in the same invocation. Captured,
+redirected, or background use remains preview-only; use `agentlog purge --yes`
+to skip the prompt and purge catalog rows while preserving the Agentlog-owned
+SQLite schema and files. Previewing privately copies only the bounded SQLite
+main/WAL contents, validates the
 complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
-private SHM, so it never opens the live catalog. Confirmation reports counts
-and current file-set size measured after acquiring the same SQLite writer
-serialization used to purge the rows; it fails instead of racing another active
-writer. The command never deletes configuration, provider sources, an external
-database, or raw provider logs. Catalog data may not be reconstructible: only
-provider logs that still exist and remain readable can be synchronized.
+private SHM, so it never opens the live catalog. Interactive confirmation also
+retains the previewed main/WAL bytes and compares them after acquiring the
+SQLite writer lock; if they changed, it deletes nothing and asks for a new
+preview. Confirmation reports counts and current file-set size measured after
+acquiring the same writer serialization used to purge the rows; it fails
+instead of racing another active writer. The command never deletes
+configuration, provider sources, an external database, or raw provider logs.
+Catalog data may not be reconstructible: only provider logs that still exist
+and remain readable can be synchronized.
 
 Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
 `~/.codex`. Claude Code source discovery uses `providers.claude_root`, then

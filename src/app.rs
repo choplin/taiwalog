@@ -15,9 +15,10 @@ use crate::{
     paths::AppPaths,
     providers::{ProviderScanReport, ProviderScanner, installed, source_descriptions},
     storage::{
-        Catalog, CatalogFileIdentity, CatalogFileState, CatalogScanError, CatalogScanProgress,
-        CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION,
-        StorageError, inspect_catalog_file_state, inspect_catalog_snapshot, purge_existing_catalog,
+        Catalog, CatalogContentToken, CatalogFileIdentity, CatalogFileState, CatalogScanError,
+        CatalogScanProgress, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
+        SCHEMA_VERSION, StorageError, inspect_catalog_file_state, inspect_catalog_snapshot,
+        purge_existing_catalog,
     },
 };
 
@@ -64,8 +65,10 @@ struct ProviderSyncResult {
 /// provider-owned source paths and transcript content remain private.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncProgress {
+    /// Provider discovery is in progress and its candidate count is not known.
+    ProviderDiscovering { provider: String },
     /// A provider's source discovery has completed.
-    ProviderStarted {
+    ProviderCandidates {
         provider: String,
         candidate_sources: u64,
     },
@@ -120,6 +123,9 @@ where
                 sync_results.push(result);
             }
             Err(error) => {
+                on_progress(SyncProgress::ProviderDiscovering {
+                    provider: error.provider_id().as_str().to_owned(),
+                });
                 let result = ProviderSyncResult {
                     provider: error.provider_id().as_str().to_owned(),
                     report: ProviderScanReport::default(),
@@ -213,10 +219,13 @@ where
     F: FnMut(SyncProgress),
 {
     let provider = scanner.provider_id().as_str().to_owned();
+    on_progress(SyncProgress::ProviderDiscovering {
+        provider: provider.clone(),
+    });
     match catalog
         .scan_with_progress(&*scanner, |progress| match progress {
-            CatalogScanProgress::Started { candidate_sources } => {
-                on_progress(SyncProgress::ProviderStarted {
+            CatalogScanProgress::CandidatesDiscovered { candidate_sources } => {
+                on_progress(SyncProgress::ProviderCandidates {
                     provider: provider.clone(),
                     candidate_sources,
                 });
@@ -357,10 +366,103 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PurgeSummary {
     pub database: PathBuf,
+    pub sources: u64,
     pub sessions: u64,
     pub transcript_items: u64,
     pub approximate_bytes: u64,
     pub cleared: bool,
+}
+
+/// A purge preview whose private token binds later confirmation to exact bytes.
+pub struct PurgePreview {
+    pub summary: PurgeSummary,
+    token: PurgePreviewToken,
+}
+
+enum PurgePreviewToken {
+    Absent,
+    Present {
+        database_identity: CatalogFileIdentity,
+        content: CatalogContentToken,
+    },
+}
+
+/// Builds a read-only purge preview and retains its exact-content token.
+///
+/// # Errors
+///
+/// Returns an error when the catalog cannot be copied and validated safely.
+pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgePreview> {
+    let Some(target) = inspect_purge_target(&paths.database_path)? else {
+        return Ok(PurgePreview {
+            summary: empty_purge_summary(paths),
+            token: PurgePreviewToken::Absent,
+        });
+    };
+    let counts = inspect_catalog_snapshot(&target.snapshot_database)
+        .await
+        .with_context(|| {
+            format!(
+                "validate private snapshot of Agentlog-owned database {}",
+                paths.database_path.display()
+            )
+        })?;
+    Ok(PurgePreview {
+        summary: PurgeSummary {
+            database: paths.database_path.clone(),
+            sources: counts.sources,
+            sessions: counts.sessions,
+            transcript_items: counts.transcript_items,
+            approximate_bytes: target.approximate_bytes,
+            cleared: false,
+        },
+        token: PurgePreviewToken::Present {
+            database_identity: target.database_identity,
+            content: target.content_token,
+        },
+    })
+}
+
+/// Purges only when the locked catalog still matches an interactive preview.
+///
+/// # Errors
+///
+/// Returns an error without deleting data when the catalog changed after the
+/// preview or when the purge cannot acquire writer serialization.
+pub async fn purge_previewed_catalog(
+    paths: &AppPaths,
+    preview: PurgePreview,
+) -> anyhow::Result<PurgeSummary> {
+    match preview.token {
+        PurgePreviewToken::Absent => {
+            if inspect_catalog_file_state(&paths.database_path)?.is_some() {
+                anyhow::bail!(
+                    "Agentlog catalog changed after the purge preview; no data was deleted; rerun `agentlog purge` to review the updated catalog"
+                );
+            }
+            Ok(empty_purge_summary(paths))
+        }
+        PurgePreviewToken::Present {
+            database_identity,
+            content,
+        } => {
+            let result = purge_existing_catalog(
+                &paths.database_path,
+                database_identity,
+                Some(&content),
+                PURGE_SNAPSHOT_MAX_BYTES,
+                |_| {},
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "purge previewed Agentlog-owned database {}",
+                    paths.database_path.display()
+                )
+            })?;
+            Ok(purge_result_summary(paths, result))
+        }
+    }
 }
 
 /// Reports, and when explicitly confirmed purges, only the Agentlog-owned
@@ -406,6 +508,7 @@ where
         let result = purge_existing_catalog(
             &paths.database_path,
             target.database_identity,
+            None,
             PURGE_SNAPSHOT_MAX_BYTES,
             after_measurement,
         )
@@ -416,13 +519,7 @@ where
                 paths.database_path.display()
             )
         })?;
-        return Ok(PurgeSummary {
-            database: paths.database_path.clone(),
-            sessions: result.counts.sessions,
-            transcript_items: result.counts.transcript_items,
-            approximate_bytes: result.approximate_bytes,
-            cleared: true,
-        });
+        return Ok(purge_result_summary(paths, result));
     }
 
     let Some(target) = inspect_purge_target(&paths.database_path)? else {
@@ -438,6 +535,7 @@ where
         })?;
     Ok(PurgeSummary {
         database: paths.database_path.clone(),
+        sources: counts.sources,
         sessions: counts.sessions,
         transcript_items: counts.transcript_items,
         approximate_bytes: target.approximate_bytes,
@@ -448,6 +546,7 @@ where
 fn empty_purge_summary(paths: &AppPaths) -> PurgeSummary {
     PurgeSummary {
         database: paths.database_path.clone(),
+        sources: 0,
         sessions: 0,
         transcript_items: 0,
         approximate_bytes: 0,
@@ -455,9 +554,25 @@ fn empty_purge_summary(paths: &AppPaths) -> PurgeSummary {
     }
 }
 
+fn purge_result_summary(
+    paths: &AppPaths,
+    result: crate::storage::CatalogPurgeResult,
+) -> PurgeSummary {
+    PurgeSummary {
+        database: paths.database_path.clone(),
+        sources: result.counts.sources,
+        sessions: result.counts.sessions,
+        transcript_items: result.counts.transcript_items,
+        approximate_bytes: result.approximate_bytes,
+        cleared: true,
+    }
+}
+
 #[derive(Debug)]
 struct PurgeTarget {
     approximate_bytes: u64,
+    database_identity: CatalogFileIdentity,
+    content_token: CatalogContentToken,
     _snapshot_directory: tempfile::TempDir,
     snapshot_database: PathBuf,
 }
@@ -517,8 +632,19 @@ fn inspect_purge_target_with_hook(
     after_copy();
     validate_catalog_file_set(database, &files)?;
 
+    let main = files
+        .iter()
+        .find(|file| file.is_main)
+        .context("catalog file set is missing its main database")?;
+    let wal = files
+        .iter()
+        .find(|file| file.suffix == Some("-wal"))
+        .map(|file| file.bytes.clone());
+
     Ok(Some(PurgeTarget {
         approximate_bytes,
+        database_identity: main.state.identity,
+        content_token: CatalogContentToken::new(main.bytes.clone(), wal),
         _snapshot_directory: snapshot_directory,
         snapshot_database,
     }))
@@ -714,8 +840,8 @@ mod tests {
     use super::{
         PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, SyncProgress, build_sync_summary,
         catalog_file_set_size, diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
-        inspect_purge_target_with_hook, list_shell, purge_catalog_shell,
-        purge_catalog_shell_with_hooks, sqlite_sidecar_path, sync_scanner,
+        inspect_purge_target_with_hook, list_shell, preview_purge_catalog, purge_catalog_shell,
+        purge_catalog_shell_with_hooks, purge_previewed_catalog, sqlite_sidecar_path, sync_scanner,
         sync_scanner_with_progress, sync_shell,
     };
 
@@ -957,7 +1083,10 @@ mod tests {
         assert_eq!(
             progress,
             vec![
-                SyncProgress::ProviderStarted {
+                SyncProgress::ProviderDiscovering {
+                    provider: "codex".to_owned(),
+                },
+                SyncProgress::ProviderCandidates {
                     provider: "codex".to_owned(),
                     candidate_sources: 1,
                 },
@@ -1026,6 +1155,79 @@ mod tests {
         assert_eq!(fingerprint(&paths.config_path), config_before);
         assert_eq!(fingerprint(&source), source_before);
         writer.close().await;
+    }
+
+    #[tokio::test]
+    async fn previewed_purge_rejects_an_intervening_sync_commit_without_deleting_it() {
+        let (_temporary, paths, source) = scanned_purge_fixture().await;
+        let preview = preview_purge_catalog(&paths)
+            .await
+            .expect("preview catalog before sync");
+
+        fs::write(
+            source
+                .parent()
+                .expect("Gemini source directory")
+                .join("intervening.jsonl"),
+            "{\"sessionId\":\"intervening-session\"}\n{\"type\":\"user\",\"content\":\"new request\"}\n",
+        )
+        .expect("write provider source added after preview");
+        sync_shell(&paths).await.expect("commit intervening sync");
+        let error = purge_previewed_catalog(&paths, preview)
+            .await
+            .expect_err("reject catalog changed since preview");
+
+        assert!(format!("{error:#}").contains("rerun `agentlog purge`"));
+        let sessions = list_shell(&paths, 10)
+            .await
+            .expect("read catalog after rejected purge");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "intervening sync result remains cataloged"
+        );
+    }
+
+    #[tokio::test]
+    async fn previewed_purge_clears_the_unchanged_exact_catalog() {
+        let (_temporary, paths, _source) = scanned_purge_fixture().await;
+        let preview = preview_purge_catalog(&paths)
+            .await
+            .expect("preview unchanged catalog");
+
+        let cleared = purge_previewed_catalog(&paths, preview)
+            .await
+            .expect("purge exact previewed catalog");
+
+        assert_eq!(cleared.sources, 1);
+        assert_eq!(cleared.sessions, 1);
+        assert_eq!(cleared.transcript_items, 1);
+        assert!(cleared.cleared);
+    }
+
+    #[tokio::test]
+    async fn purge_preview_counts_zero_session_diagnostic_sources() {
+        let (_temporary, paths, _source) = scanned_purge_fixture().await;
+        let writer = open_database(&paths.database_path)
+            .await
+            .expect("open catalog for diagnostic source");
+        sqlx::query(
+            "INSERT INTO sources (
+                 provider, source_format, canonical_locator, diagnostic_status, diagnostic_message
+             ) VALUES ('test', 'test', 'test://zero-session', 'error', 'unreadable')",
+        )
+        .execute(&writer)
+        .await
+        .expect("insert zero-session diagnostic source");
+        writer.close().await;
+
+        let preview = preview_purge_catalog(&paths)
+            .await
+            .expect("preview diagnostic source");
+
+        assert_eq!(preview.summary.sources, 2);
+        assert_eq!(preview.summary.sessions, 1);
+        assert_eq!(preview.summary.transcript_items, 1);
     }
 
     #[tokio::test]

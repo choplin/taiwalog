@@ -666,7 +666,7 @@ struct SyncSummaryLine {
 struct SyncProgressLine {
     provider: Option<String>,
     processed_sources: u64,
-    candidate_sources: u64,
+    candidate_sources: Option<u64>,
 }
 
 impl BrowseState {
@@ -714,14 +714,21 @@ impl BrowseState {
     }
     fn apply_sync_progress(&mut self, progress: SyncProgress) {
         match progress {
-            SyncProgress::ProviderStarted {
+            SyncProgress::ProviderDiscovering { provider } => {
+                self.sync_status = SyncStatus::Running(SyncProgressLine {
+                    provider: Some(provider),
+                    processed_sources: 0,
+                    candidate_sources: None,
+                });
+            }
+            SyncProgress::ProviderCandidates {
                 provider,
                 candidate_sources,
             } => {
                 self.sync_status = SyncStatus::Running(SyncProgressLine {
                     provider: Some(provider),
                     processed_sources: 0,
-                    candidate_sources,
+                    candidate_sources: Some(candidate_sources),
                 });
             }
             SyncProgress::SourceStaged {
@@ -732,7 +739,7 @@ impl BrowseState {
                 self.sync_status = SyncStatus::Running(SyncProgressLine {
                     provider: Some(provider),
                     processed_sources,
-                    candidate_sources,
+                    candidate_sources: Some(candidate_sources),
                 });
             }
             SyncProgress::ProviderCompleted {
@@ -741,7 +748,7 @@ impl BrowseState {
                 self.sync_status = SyncStatus::Running(SyncProgressLine {
                     provider: Some(provider),
                     processed_sources: report.refreshed_sources + report.failed_sources,
-                    candidate_sources: report.candidate_sources,
+                    candidate_sources: Some(report.candidate_sources),
                 });
             }
         }
@@ -1391,11 +1398,15 @@ fn sync_status_line(state: &BrowseState) -> String {
     match &state.sync_status {
         SyncStatus::Idle => "Sync: not started".to_owned(),
         SyncStatus::Running(progress) => match &progress.provider {
-            Some(provider) => format!(
+            Some(provider) if progress.candidate_sources.is_some() => format!(
                 "Sync: {} {}/{} sources processed; existing sessions remain available",
                 visible_text(provider),
                 progress.processed_sources,
-                progress.candidate_sources
+                progress.candidate_sources.unwrap_or(0)
+            ),
+            Some(provider) => format!(
+                "Sync: {} discovering sources; existing sessions remain available",
+                visible_text(provider)
             ),
             None => "Sync: starting; existing sessions remain available".to_owned(),
         },
@@ -2235,6 +2246,24 @@ mod tests {
 
         let rendered = rendered_text(&mut state, 180, 24);
         assert!(rendered.contains("Sync: claude 4/10 sources processed"));
+    }
+
+    #[test]
+    fn sync_discovery_replaces_the_previous_provider_completion() {
+        let mut state = BrowseState::new(10);
+        state.start_sync();
+        state.apply_sync_progress(SyncProgress::ProviderCompleted {
+            provider: "codex".to_owned(),
+            report: crate::providers::ProviderScanReport::default(),
+            failure: None,
+        });
+        state.apply_sync_progress(SyncProgress::ProviderDiscovering {
+            provider: "claude".to_owned(),
+        });
+
+        let status = sync_status_line(&state);
+        assert!(status.contains("claude discovering sources"));
+        assert!(!status.contains("codex"));
     }
 
     #[tokio::test]
