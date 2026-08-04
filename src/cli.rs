@@ -99,64 +99,103 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
+    let prompt_eligible = !yes && interactive_terminal();
+    let rich_report = prompt_eligible || cliclack_chrome_allowed();
+
+    if rich_report {
+        cliclack::intro("Purge Agentlog catalog").context("start purge report")?;
+    }
+
     if yes {
         let summary = purge_catalog_shell(paths, true).await?;
-        print_purge_report(&summary);
-        print_purge_completion(&summary);
+        print_purge_report(&summary, "Purged catalog", rich_report)?;
+        print_purge_completion(&summary, rich_report)?;
         return Ok(());
     }
 
     let preview = preview_purge_catalog(paths).await?;
-    print_purge_report(&preview.summary);
-    match confirm_purge_from_terminal(&preview.summary)? {
+    print_purge_report(&preview.summary, "Catalog preview", rich_report)?;
+    match confirm_purge_from_terminal(&preview.summary, prompt_eligible)? {
         Some(true) => {
             let summary = purge_previewed_catalog(paths, preview).await?;
-            print_purge_completion(&summary);
+            print_purge_completion(&summary, rich_report)?;
+        }
+        Some(false) if rich_report => {
+            cliclack::outro_cancel("Purge canceled; no changes were made.")
+                .context("finish canceled purge report")?;
         }
         Some(false) => eprintln!("Purge canceled; no changes were made."),
-        None => eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm."),
+        None if rich_report => {
+            cliclack::outro_cancel(
+                "No changes were made. Re-run with `agentlog purge --yes` to confirm.",
+            )
+            .context("finish unconfirmed purge report")?;
+        }
+        None => {
+            eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm.");
+        }
     }
     Ok(())
 }
 
-fn print_purge_report(summary: &crate::app::PurgeSummary) {
-    eprintln!(
-        "Agentlog-owned database target: {}",
-        visible_text(&summary.database.display().to_string())
-    );
-    eprintln!("Catalog sources: {}", summary.sources);
-    eprintln!("Catalog sessions: {}", summary.sessions);
-    eprintln!("Transcript items: {}", summary.transcript_items);
-    eprintln!(
-        "Approximate database size: {} ({} bytes)",
+fn print_purge_report(
+    summary: &crate::app::PurgeSummary,
+    heading: &str,
+    rich_report: bool,
+) -> anyhow::Result<()> {
+    let body = format!(
+        "Agentlog-owned database target: {}\nCatalog sources: {}\nCatalog sessions: {}\nTranscript items: {}\nApproximate database size: {} ({} bytes)",
+        visible_text(&summary.database.display().to_string()),
+        summary.sources,
+        summary.sessions,
+        summary.transcript_items,
         human_readable_bytes(summary.approximate_bytes),
         summary.approximate_bytes
     );
-    eprintln!(
-        "Warning: Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
-    );
+    let warning = "Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized.";
+
+    if rich_report {
+        cliclack::note(heading, body).context("write purge catalog report")?;
+        cliclack::log::warning(cliclack::termwrap(warning, 3)).context("write purge warning")?;
+    } else {
+        eprintln!("{body}");
+        eprintln!("Warning: {warning}");
+    }
+    Ok(())
 }
 
-fn print_purge_completion(summary: &crate::app::PurgeSummary) {
-    if summary.cleared {
-        eprintln!(
+fn print_purge_completion(
+    summary: &crate::app::PurgeSummary,
+    rich_report: bool,
+) -> anyhow::Result<()> {
+    let message = if summary.cleared {
+        format!(
             "Purge complete: cleared {} catalog sources, {} sessions, and {} transcript items from the locked catalog state ({}; {} bytes).",
             summary.sources,
             summary.sessions,
             summary.transcript_items,
             human_readable_bytes(summary.approximate_bytes),
             summary.approximate_bytes
-        );
+        )
     } else {
-        eprintln!("Purge complete: no Agentlog-owned database was present.");
+        "Purge complete: no Agentlog-owned database was present.".to_owned()
+    };
+    if rich_report {
+        cliclack::outro(message).context("finish purge report")?;
+    } else {
+        eprintln!("{message}");
     }
+    Ok(())
 }
 
 /// Prompts only through the controlling terminal, never through piped input.
 ///
 /// An unavailable terminal intentionally leaves purge in preview-only mode.
-fn confirm_purge_from_terminal(summary: &crate::app::PurgeSummary) -> anyhow::Result<Option<bool>> {
-    if !interactive_terminal() {
+fn confirm_purge_from_terminal(
+    summary: &crate::app::PurgeSummary,
+    prompt_eligible: bool,
+) -> anyhow::Result<Option<bool>> {
+    if !prompt_eligible {
         return Ok(None);
     }
 
@@ -165,6 +204,11 @@ fn confirm_purge_from_terminal(summary: &crate::app::PurgeSummary) -> anyhow::Re
         .interact()
         .map(Some)
         .context("confirm catalog purge")
+}
+
+fn cliclack_chrome_allowed() -> bool {
+    let term = env::var("TERM").ok();
+    terminal_chrome_allowed(io::stderr().is_terminal(), term.as_deref())
 }
 
 fn purge_confirmation_message(summary: &crate::app::PurgeSummary) -> String {
@@ -259,9 +303,18 @@ fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
 
 async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
     let mut reporter = SyncProgressReporter::new();
+    if reporter.interactive {
+        cliclack::intro("Synchronize provider history").context("start sync report")?;
+    }
     let summary = sync_shell_with_progress(paths, |progress| reporter.report(progress)).await?;
     if json {
+        if reporter.interactive {
+            cliclack::outro(format!("Sync result: {}", visible_text(&summary.message)))
+                .context("finish sync report")?;
+        }
         println!("{}", serde_json::to_string(&summary)?);
+    } else if reporter.interactive {
+        print_rich_sync_summary(&summary)?;
     } else {
         eprintln!("Schema version: {}", summary.schema_version);
         eprintln!("Collectors installed: {}", summary.collectors_installed);
@@ -288,6 +341,38 @@ async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
         }
         eprintln!("Sync result: {}", visible_text(&summary.message));
     }
+    Ok(())
+}
+
+fn print_rich_sync_summary(summary: &crate::app::SyncSummary) -> anyhow::Result<()> {
+    let mut lines = vec![
+        format!("Schema version: {}", summary.schema_version),
+        format!("Collectors installed: {}", summary.collectors_installed),
+        format!("Providers failed: {}", summary.providers_failed),
+        format!("Sources refreshed: {}", summary.sources_refreshed),
+        format!("Sources partial: {}", summary.sources_partial),
+        format!("Sources failed: {}", summary.sources_failed),
+        format!("Sources missing: {}", summary.sources_missing),
+        format!("Sessions available: {}", summary.sessions_available),
+    ];
+    for provider in &summary.provider_summaries {
+        lines.push(format!(
+            "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}, sessions={}",
+            visible_text(&provider.provider),
+            provider.candidate_sources,
+            provider.refreshed_sources,
+            provider.partial_sources,
+            provider.failed_sources,
+            provider.missing_sources,
+            provider.sessions_available
+        ));
+        if let Some(failure) = &provider.failure {
+            lines.push(format!("  Warning: {}", visible_text(failure)));
+        }
+    }
+    cliclack::note("Sync summary", lines.join("\n")).context("write sync summary")?;
+    cliclack::outro(format!("Sync result: {}", visible_text(&summary.message)))
+        .context("finish sync report")?;
     Ok(())
 }
 
@@ -423,9 +508,11 @@ impl SyncProgressReporter {
 /// A plain report is safer for a terminal without a declared terminal type, a
 /// dumb terminal, or when the user has explicitly disabled terminal styling.
 fn terminal_control_allowed(stderr_is_terminal: bool, term: Option<&str>, no_color: bool) -> bool {
-    stderr_is_terminal
-        && term.is_some_and(|term| !term.trim_ascii().is_empty() && term != "dumb")
-        && !no_color
+    terminal_chrome_allowed(stderr_is_terminal, term) && !no_color
+}
+
+fn terminal_chrome_allowed(stderr_is_terminal: bool, term: Option<&str>) -> bool {
+    stderr_is_terminal && term.is_some_and(|term| !term.trim_ascii().is_empty() && term != "dumb")
 }
 
 impl Drop for SyncProgressReporter {
@@ -533,7 +620,7 @@ mod tests {
 
     use super::{
         Cli, Command, PromptEligibility, human_readable_bytes, purge_confirmation_message,
-        terminal_control_allowed,
+        terminal_chrome_allowed, terminal_control_allowed,
     };
 
     #[test]
@@ -631,6 +718,20 @@ mod tests {
                 !terminal_control_allowed(stderr_is_terminal, term, no_color),
                 "stderr_tty={stderr_is_terminal}, term={term:?}, no_color={no_color} must use plain progress"
             );
+        }
+    }
+
+    #[test]
+    fn static_cliclack_chrome_requires_a_capable_stderr_terminal() {
+        assert!(terminal_chrome_allowed(true, Some("xterm-256color")));
+        for (stderr_is_terminal, term) in [
+            (false, Some("xterm-256color")),
+            (true, None),
+            (true, Some("")),
+            (true, Some(" \t")),
+            (true, Some("dumb")),
+        ] {
+            assert!(!terminal_chrome_allowed(stderr_is_terminal, term));
         }
     }
 
