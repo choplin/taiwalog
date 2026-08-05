@@ -1,4 +1,4 @@
-//! The small application workflows available before collectors are installed.
+//! Application workflows for Agentlog's local catalog and six read-only collectors.
 
 use std::{
     collections::BTreeMap,

@@ -13,7 +13,7 @@ use std::{
 use anyhow::Context;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -222,29 +222,38 @@ fn poll_event(timeout: Duration) -> io::Result<Option<BrowseEvent>> {
         return Ok(None);
     }
     match event::read()? {
-        Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(match key.code {
-            KeyCode::Char('q') => BrowseEvent::Quit,
-            KeyCode::Char('r') => BrowseEvent::Reload,
-            KeyCode::Char('f') => BrowseEvent::OpenRefine,
-            KeyCode::Char('?') => BrowseEvent::OpenHelp,
-            KeyCode::Char('!') => BrowseEvent::OpenDiagnostics,
-            KeyCode::Char('j') | KeyCode::Down => BrowseEvent::Down,
-            KeyCode::Char('k') | KeyCode::Up => BrowseEvent::Up,
-            KeyCode::Char('d') => BrowseEvent::HalfPageDown,
-            KeyCode::Char('u') => BrowseEvent::HalfPageUp,
-            KeyCode::Char('g') | KeyCode::Home => BrowseEvent::Top,
-            KeyCode::Char('G') | KeyCode::End => BrowseEvent::Bottom,
-            KeyCode::PageDown => BrowseEvent::PageDown,
-            KeyCode::PageUp => BrowseEvent::PageUp,
-            KeyCode::Char(' ') => BrowseEvent::Toggle,
-            KeyCode::Tab | KeyCode::Enter => BrowseEvent::Next,
-            KeyCode::BackTab => BrowseEvent::Previous,
-            KeyCode::Char('x') => BrowseEvent::ClearCurrent,
-            KeyCode::Char('C') => BrowseEvent::ClearAll,
-            KeyCode::Esc => BrowseEvent::Back,
-            _ => BrowseEvent::Ignore,
-        })),
+        Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(browse_event_from_key(key))),
         _ => Ok(Some(BrowseEvent::Ignore)),
+    }
+}
+
+fn browse_event_from_key(key: KeyEvent) -> BrowseEvent {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return BrowseEvent::Quit;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => BrowseEvent::Quit,
+        KeyCode::Char('r') => BrowseEvent::Reload,
+        KeyCode::Char('f') => BrowseEvent::OpenRefine,
+        KeyCode::Char('?') => BrowseEvent::OpenHelp,
+        KeyCode::Char('!') => BrowseEvent::OpenDiagnostics,
+        KeyCode::Char('j') | KeyCode::Down => BrowseEvent::Down,
+        KeyCode::Char('k') | KeyCode::Up => BrowseEvent::Up,
+        KeyCode::Char('d') => BrowseEvent::HalfPageDown,
+        KeyCode::Char('u') => BrowseEvent::HalfPageUp,
+        KeyCode::Char('g') | KeyCode::Home => BrowseEvent::Top,
+        KeyCode::Char('G') | KeyCode::End => BrowseEvent::Bottom,
+        KeyCode::PageDown => BrowseEvent::PageDown,
+        KeyCode::PageUp => BrowseEvent::PageUp,
+        KeyCode::Char(' ') => BrowseEvent::Toggle,
+        KeyCode::Tab | KeyCode::Enter => BrowseEvent::Next,
+        KeyCode::BackTab => BrowseEvent::Previous,
+        KeyCode::Char('x') => BrowseEvent::ClearCurrent,
+        KeyCode::Char('C') => BrowseEvent::ClearAll,
+        KeyCode::Esc => BrowseEvent::Back,
+        _ => BrowseEvent::Ignore,
     }
 }
 
@@ -2137,6 +2146,36 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn control_c_key_exits_every_browse_surface() {
+        let control_c =
+            browse_event_from_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(control_c, BrowseEvent::Quit);
+        assert_eq!(
+            browse_event_from_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            BrowseEvent::Quit
+        );
+
+        let mut browse = BrowseState::new(10);
+        assert_eq!(update(&mut browse, control_c), BrowseEffect::Exit);
+
+        let mut preview = BrowseState::new(10);
+        preview.view = View::Preview;
+        assert_eq!(update(&mut preview, control_c), BrowseEffect::Exit);
+
+        let mut refine = BrowseState::new(10);
+        refine.overlay = Overlay::Refine(RefineStep::Provider);
+        assert_eq!(update(&mut refine, control_c), BrowseEffect::Exit);
+
+        let mut help = BrowseState::new(10);
+        help.overlay = Overlay::Help;
+        assert_eq!(update(&mut help, control_c), BrowseEffect::Exit);
+
+        let mut diagnostics = BrowseState::new(10);
+        diagnostics.overlay = Overlay::Diagnostics;
+        assert_eq!(update(&mut diagnostics, control_c), BrowseEffect::Exit);
     }
 
     struct DropSignal(Arc<AtomicBool>);

@@ -78,8 +78,8 @@ impl AppPaths {
         &self.home
     }
 
-    /// Explicit provider-owned roots from the optional config. Collectors use
-    /// them only as read-only discovery roots in later commits.
+    /// Explicit provider-owned roots from the optional config. The six
+    /// collectors use them only as read-only discovery roots.
     #[must_use]
     pub fn provider_roots(&self) -> &ProviderRoots {
         &self.provider_roots

@@ -99,8 +99,9 @@ below rather than inventing a fixture.
    and press `Esc`. Expect the same list selection and list context. Finally,
    press `q`; the normal terminal must be restored.
 
-On a normal exit, Agentlog reports a terminal-restoration failure; on an
-unexpected terminal error or panic it still makes a best-effort restoration.
+On a normal exit, Agentlog restores the terminal. It reports an error only if
+that restoration fails; on an unexpected terminal error or panic it still makes
+a best-effort restoration.
 
 By default, Agentlog owns these paths under
 `~/Library/Application Support/Agentlog`:

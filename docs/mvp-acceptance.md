@@ -1,7 +1,10 @@
 # Agentlog MVP acceptance
 
-Status: release candidate evidence is complete; final human acceptance is
-pending.
+Status: M5 human acceptance was recorded for baseline commit
+`b5c64807fd543c5edd947ab3d26ba37613fa3761`. A post-review finding showed that
+raw-mode `Ctrl-C` was not yet handled as a TUI exit; CHO-826 tracks its
+remediation and repeatable terminal-restoration verification. MVP closure
+remains pending that remediation and final review.
 
 This record separates repeatable automated evidence from the actual-terminal
 review that must be performed by a person. Final acceptance must not be inferred
@@ -76,32 +79,36 @@ agentlog --home "$review_home" sync
 agentlog --home "$review_home" browse
 ```
 
-Confirm each item and record any failure before approving the MVP:
+The M5 reviewer approved the completed items below for the baseline commit.
+CHO-826 must complete the remaining `Ctrl-C` check before final MVP closure:
 
-- [ ] The six providers appear in sync completion or source diagnostics. For
+- [x] The six providers appear in sync completion or source diagnostics. For
   each provider with a visible session, filter to it, select a session, and
   inspect Preview. Accept the representative fixture evidence for a provider
   only when the actual source contains no supported visible session.
-- [ ] At 100x24 or wider, Browse shows Started, Title, Repository, Provider, and
+- [x] At 100x24 or wider, Browse shows Started, Title, Repository, Provider, and
   a passive preview. Selection and preview remain stable during refresh.
-- [ ] At 80x24, Browse uses the compact Started, Title, and Provider list;
+- [x] At 80x24, Browse uses the compact Started, Title, and Provider list;
   `Enter` opens Preview and `Esc` restores the same list context.
-- [ ] Below 40x10, `Terminal too small` is shown without a panic; resizing back
+- [x] Below 40x10, `Terminal too small` is shown without a panic; resizing back
   restores the normal view.
-- [ ] Refine supports OR within one field and AND across fields, preserves
+- [x] Refine supports OR within one field and AND across fields, preserves
   choices on `Esc`, groups by Provider or Repository, and reports an empty
   result distinctly.
-- [ ] `r` starts one refresh, repeated requests do not start another, existing
+- [x] `r` starts one refresh, repeated requests do not start another, existing
   sessions remain usable, and completion counts are bounded and visible.
-- [ ] `!` shows retained source diagnostics; list and preview navigation work,
+- [x] `!` shows retained source diagnostics; list and preview navigation work,
   and `Esc` returns without changing the selected session.
-- [ ] `agentlog --home "$review_home" purge` previews only the isolated
+- [x] `agentlog --home "$review_home" purge` previews only the isolated
   Agentlog-owned catalog and makes no change without confirmation.
-- [ ] `agentlog --home "$review_home" purge --yes` empties catalog rows while
+- [x] `agentlog --home "$review_home" purge --yes` empties catalog rows while
   preserving the database and schema; a subsequent `sync` rebuilds available
   provider data.
-- [ ] `q` and `Ctrl-C` restore the normal terminal, including alternate screen
-  and cursor state, from wide, narrow, Preview, Refine, and Diagnostics views.
+- [x] `q` restores the normal terminal, including alternate screen and cursor
+  state, from wide, narrow, Preview, Refine, and Diagnostics views.
+- [ ] `Ctrl-C` restores the same terminal state from every view. This is the
+  CHO-826 remediation check; the baseline approval did not provide valid
+  evidence for it.
 
-Final acceptance requires an explicit human approval after this checklist. The
-release candidate must remain pending if any item is unverified or rejected.
+Final closure requires the CHO-826 check and a final human review. The MVP must
+remain pending if either is unverified or rejected.
