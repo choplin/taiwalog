@@ -5,25 +5,54 @@ This first durable shell owns a small SQLite catalog and imports Codex, Claude
 Code, OpenCode, Gemini CLI, Cursor, and Kimi Code session history. It never
 creates, changes, or deletes provider-owned logs.
 
+See [MVP scope and limitations](docs/mvp-scope.md) for the shipped boundary and
+[MVP acceptance](docs/mvp-acceptance.md) for the release checks and human review
+procedure.
+
 ## Requirements
 
 - macOS
-- Rust 1.85 or newer
+- Rust 1.85 or newer when building from source
+
+## Install on macOS
+
+Build a native release bundle without Developer ID signing from a source checkout:
+
+```sh
+release_archive=$(./scripts/build-macos-release.sh)
+release_dir=$(mktemp -d)
+trap 'rm -rf "$release_dir"' EXIT HUP INT TERM
+tar -xzf "$release_archive" -C "$release_dir"
+"$release_dir"/agentlog-*/install.sh "$HOME/.local"
+```
+
+Add `$HOME/.local/bin` to `PATH` if it is not already present. Omit the prefix
+to install into `/usr/local`; that location may require elevated permissions.
+The bundle is built for the active macOS Rust host architecture. It is not
+Developer ID signed, notarized, checksummed, or a deterministic bundle.
+
+To build the bundle and verify an isolated installation in one command:
+
+```sh
+./scripts/smoke-macos-release.sh
+```
 
 ## Quickstart
 
-Build and run the shell:
+After installation:
 
 ```sh
-cargo run -- paths
-cargo run -- sync
-cargo run -- sync --json
-cargo run -- list
-cargo run -- show 1
-cargo run -- purge
-cargo run -- purge --yes
-cargo run -- browse
+agentlog paths
+agentlog sync
+agentlog sync --json
+agentlog list
+agentlog show 1
+agentlog purge
+agentlog purge --yes
+agentlog browse
 ```
+
+From a source checkout, replace `agentlog` with `cargo run --`.
 
 `browse` first shows the existing Agentlog catalog, then starts a read-only
 sync in the background. Its status line names the current provider and reports
@@ -148,6 +177,25 @@ gemini_root = "/absolute/path/to/gemini/config"
 cursor_root = "/absolute/path/to/cursor/config"
 kimi_root = "/absolute/path/to/kimi-code/config"
 ```
+
+## Supported providers
+
+All provider inputs are read-only. An explicit `providers.*_root` value in
+`config.toml` has the highest precedence.
+
+| Provider | Imported source | Default root precedence after config |
+| --- | --- | --- |
+| Codex | Current `sessions/**/*.jsonl` and legacy `history.jsonl` | `CODEX_HOME`, then `~/.codex` |
+| Claude Code | Parent and subagent JSONL below `projects/` | `CLAUDE_CONFIG_DIR`, then `~/.claude` |
+| OpenCode | `opencode.db` through a bounded private SQLite/WAL snapshot | `XDG_DATA_HOME/opencode`, `~/.local/share/opencode`, then the macOS Application Support fallback |
+| Gemini CLI | Session JSONL below `tmp/` | `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini` |
+| Cursor | Transcript JSONL below `projects/` | `~/.cursor` |
+| Kimi Code | `sessions/*/*/agents/*/wire.jsonl`, validated against the session index and state | `KIMI_CODE_HOME`, then `~/.kimi-code` |
+
+A discovered source can legitimately produce no session when it contains no
+supported visible conversation text. Provider and source failures are isolated:
+other providers continue, and a failed or missing source retains its last-good
+catalog snapshot with a diagnostic.
 
 `sync` creates fresh schema v1 and reads current Codex session JSONL, legacy
 `history.jsonl`, Claude Code project/subagent JSONL, the supported OpenCode
