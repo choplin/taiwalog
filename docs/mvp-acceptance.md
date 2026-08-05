@@ -1,10 +1,10 @@
 # Agentlog MVP acceptance
 
 Status: M5 human acceptance was recorded for baseline commit
-`b5c64807fd543c5edd947ab3d26ba37613fa3761`. A post-review finding showed that
-raw-mode `Ctrl-C` was not yet handled as a TUI exit; CHO-826 tracks its
-remediation and repeatable terminal-restoration verification. MVP closure
-remains pending that remediation and final review.
+`b5c64807fd543c5edd947ab3d26ba37613fa3761`. The post-review `Ctrl-C`
+remediation and automated real-PTY verification were completed in CHO-826 at
+commit `46468a9fe794578ca6b762f88ac0630c3bd92174`. Final MVP closure remains
+pending global re-review and an explicit human closure approval.
 
 This record separates repeatable automated evidence from the actual-terminal
 review that must be performed by a person. Final acceptance must not be inferred
@@ -26,7 +26,7 @@ git diff --check
 Verification on 2026-08-05:
 
 - format: passed;
-- tests: 124 library tests, 2 process integration tests, and doc tests passed;
+- tests: 125 library tests, 3 process integration tests, and doc tests passed;
 - Clippy with warnings denied: passed;
 - native release build: passed;
 - isolated native bundle install, `--version`, `--help`, and `paths --json`:
@@ -43,6 +43,11 @@ The process test `one_sync_accepts_one_representative_source_from_each_provider`
 is the reproducible fallback acceptance path: it exercises one representative
 source fixture for every supported provider in one catalog synchronization and
 verifies that the fixture inputs remain unchanged.
+
+CHO-826 adds a real-PTY regression that exits with `Ctrl-C` from Browse at
+100x24 and 80x24, Preview, Refine, Help, and Diagnostics. It verifies alternate
+screen and cursor restoration, then checks canonical mode and echo after the
+shell regains control.
 
 ## Six-provider source evidence
 
@@ -80,7 +85,9 @@ agentlog --home "$review_home" browse
 ```
 
 The M5 reviewer approved the completed items below for the baseline commit.
-CHO-826 must complete the remaining `Ctrl-C` check before final MVP closure:
+CHO-826 completed the `Ctrl-C` implementation and automated PTY check at
+`46468a9fe794578ca6b762f88ac0630c3bd92174`; global re-review and explicit
+human closure approval remain pending:
 
 - [x] The six providers appear in sync completion or source diagnostics. For
   each provider with a visible session, filter to it, select a session, and
@@ -106,9 +113,10 @@ CHO-826 must complete the remaining `Ctrl-C` check before final MVP closure:
   provider data.
 - [x] `q` restores the normal terminal, including alternate screen and cursor
   state, from wide, narrow, Preview, Refine, and Diagnostics views.
-- [ ] `Ctrl-C` restores the same terminal state from every view. This is the
-  CHO-826 remediation check; the baseline approval did not provide valid
-  evidence for it.
+- [x] `Ctrl-C` restores the same terminal state from every view. CHO-826
+  verifies the implementation in a real PTY from wide and narrow Browse,
+  Preview, Refine, Help, and Diagnostics, including canonical mode and echo
+  restoration after the shell regains control.
 
-Final closure requires the CHO-826 check and a final human review. The MVP must
-remain pending if either is unverified or rejected.
+Final closure requires global re-review and an explicit human closure approval.
+The MVP must remain pending if either is unverified or rejected.
