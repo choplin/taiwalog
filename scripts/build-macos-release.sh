@@ -60,12 +60,10 @@ bundle_dir="$staging_root/$bundle_name"
 staged_archive="$staging_root/$bundle_name.tar.gz"
 archive="$dist_dir/$bundle_name.tar.gz"
 
-mkdir -p "$bundle_dir/docs"
+mkdir -p "$bundle_dir"
 install -m 0755 "$binary" "$bundle_dir/agentlog"
 install -m 0755 "$repo_root/scripts/install-macos-release.sh" "$bundle_dir/install.sh"
-install -m 0644 "$repo_root/docs/macos-release-readme.md" "$bundle_dir/README.md"
-install -m 0644 "$repo_root/docs/mvp-scope.md" "$bundle_dir/docs/mvp-scope.md"
-install -m 0644 "$repo_root/docs/mvp-acceptance.md" "$bundle_dir/docs/mvp-acceptance.md"
+install -m 0644 "$repo_root/README.md" "$bundle_dir/README.md"
 COPYFILE_DISABLE=1 tar -czf "$staged_archive" -C "$staging_root" "$bundle_name"
 
 if [ -L "$archive" ]; then

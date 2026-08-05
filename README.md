@@ -5,10 +5,6 @@ This first durable shell owns a small SQLite catalog and imports Codex, Claude
 Code, OpenCode, Gemini CLI, Cursor, and Kimi Code session history. It never
 creates, changes, or deletes provider-owned logs.
 
-See [MVP scope and limitations](docs/mvp-scope.md) for the shipped boundary and
-[MVP acceptance](docs/mvp-acceptance.md) for the release checks and human review
-procedure.
-
 ## Requirements
 
 - macOS
