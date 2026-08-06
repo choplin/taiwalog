@@ -7,6 +7,16 @@ publish = false
 description = "A local browser for AI coding-agent session history"
 license = "MIT"
 repository = "https://github.com/choplin/agentlog"
+homepage = "https://github.com/choplin/agentlog"
+
+[package.metadata.release]
+publish = false
+tag = true
+tag-name = "v{{version}}"
+push = true
+
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 anyhow = "1.0"
