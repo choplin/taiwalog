@@ -61,7 +61,10 @@
 
           devShells.default = pkgs.devshell.mkShell {
             imports = [ (pkgs.devshell.importTOML ./devshell.toml) ];
-            packages = [ rustToolchain ];
+            packages = [
+              pkgs.cargo-release
+              rustToolchain
+            ];
           };
         };
     };
