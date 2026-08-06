@@ -7,7 +7,7 @@ creates, changes, or deletes provider-owned logs.
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - Rust 1.85 or newer when building from source
 
 ## Install on macOS
@@ -99,8 +99,9 @@ On a normal exit, Agentlog restores the terminal. It reports an error only if
 that restoration fails; on an unexpected terminal error or panic it still makes
 a best-effort restoration.
 
-By default, Agentlog owns these paths under
-`~/Library/Application Support/Agentlog`:
+By default, Agentlog owns these paths under the platform XDG data directory,
+falling back to `~/.local/share/agentlog` when `XDG_DATA_HOME` is unset or
+invalid:
 
 - `config.toml` — optional, minimal local configuration;
 - `agentlog.sqlite3` — the Agentlog-owned SQLite catalog.
@@ -114,6 +115,18 @@ cargo run -- --home /tmp/agentlog-demo paths
 cargo run -- --home /tmp/agentlog-demo sync
 ```
 
+### Data handling documentation
+
+Agentlog keeps provider-owned inputs separate from its local derived catalog.
+
+| Question | Reference |
+| --- | --- |
+| What is read, stored, or excluded? | [Data flow](docs/data-architecture.md#data-ownership-and-flow), [stored data](docs/data-architecture.md#stored-catalog-data), [excluded data](docs/data-architecture.md#excluded-data) |
+| Does data leave the machine? | [Local-only operation](docs/data-architecture.md#local-only-operation) |
+| What does purge remove? | [Purging Agentlog data](docs/data-architecture.md#purging-agentlog-data) |
+| Where are provider sources found? | [Source discovery and root precedence](docs/providers.md#source-discovery-and-root-precedence) |
+| What happens on failure? | [Failure isolation and last-good data](docs/providers.md#failure-isolation-and-last-good-data) |
+
 `sync` reports provider discovery, candidate counts, and completion to stderr.
 In an interactive terminal, its current provider and processed/candidate source
 counts update in place; redirected runs keep a bounded per-provider record.
@@ -121,59 +134,12 @@ counts update in place; redirected runs keep a bounded per-provider record.
 
 ### Purging the local catalog
 
-`agentlog purge` previews the exact Agentlog-owned database path, catalog
-source count, session count, transcript-item count, and approximate SQLite
-file-set size in human-readable IEC units (with the exact byte count), without
-changing files.
-When all three standard streams are terminals and the process is in the
-controlling terminal's foreground process group, it then asks for a default-No
-confirmation and a `y` answer purges in the same invocation. Captured,
-redirected, or background use remains preview-only; use `agentlog purge --yes`
-to skip the prompt and purge catalog rows while preserving the Agentlog-owned
-SQLite schema and files. Previewing privately copies only the bounded SQLite
-main/WAL contents, validates the
-complete main/WAL/SHM file-set fingerprint, and lets SQLite create a fresh
-private SHM, so it never opens the live catalog. Interactive confirmation also
-retains constant-size SHA-256 digests of the previewed main/WAL content and
-compares them after acquiring the SQLite writer lock; if they changed, it
-deletes nothing and asks for a new preview. Confirmation reports counts and
-current file-set size measured after
-acquiring the same writer serialization used to purge the rows; it fails
-instead of racing another active writer. The command never deletes
-configuration, provider sources, an external database, or raw provider logs.
-Catalog data may not be reconstructible: only provider logs that still exist
-and remain readable can be synchronized.
-
-Codex source discovery uses `providers.codex_root`, then `CODEX_HOME`, then
-`~/.codex`. Claude Code source discovery uses `providers.claude_root`, then
-`CLAUDE_CONFIG_DIR`, then `~/.claude`; project transcripts are read below its
-`projects` directory, including direct subagent JSONL files. OpenCode source
-discovery uses `providers.opencode_root`, then `XDG_DATA_HOME/opencode`, then
-`~/.local/share/opencode` and the macOS Application Support fallback. OpenCode
-is read through a bounded private snapshot of its SQLite database and WAL, so
-SQLite never opens the provider-owned files. Gemini CLI discovery uses
-`providers.gemini_root`, then `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini`; it
-reads JSONL files below `tmp` and uses the native `sessionId` as the session
-identity.
-Cursor discovery uses `providers.cursor_root`, then `~/.cursor`; it reads JSONL
-files below `projects`, including UUID- or otherwise arbitrarily named files,
-and uses the containing directory as the native session identity. Kimi Code
-discovery uses `providers.kimi_root`, then `KIMI_CODE_HOME`, then
-`~/.kimi-code`. It verifies each `sessions/*/*/agents/*/wire.jsonl` source
-against the provider session index and session state before importing its
-provider-native session ID. The optional config can override these read-only
-roots. It cannot configure enrichment, ctx, UI settings, retention, or an
-external database:
-
-```toml
-[providers]
-codex_root = "/absolute/path/to/codex/history"
-claude_root = "/absolute/path/to/claude/config"
-opencode_root = "/absolute/path/to/opencode/data"
-gemini_root = "/absolute/path/to/gemini/config"
-cursor_root = "/absolute/path/to/cursor/config"
-kimi_root = "/absolute/path/to/kimi-code/config"
-```
+`agentlog purge` previews the Agentlog-owned database path, row counts, and
+SQLite file-set size. In an eligible terminal it asks for default-No
+confirmation; redirected or background use stays preview-only. `--yes` skips
+the prompt and removes catalog rows while preserving the schema and files.
+See [Purging Agentlog data](docs/data-architecture.md#purging-agentlog-data) for
+the exact safety checks, retained data, and rebuild limitation.
 
 ## Supported providers
 
@@ -184,7 +150,7 @@ All provider inputs are read-only. An explicit `providers.*_root` value in
 | --- | --- | --- |
 | Codex | Current `sessions/**/*.jsonl` and legacy `history.jsonl` | `CODEX_HOME`, then `~/.codex` |
 | Claude Code | Parent and subagent JSONL below `projects/` | `CLAUDE_CONFIG_DIR`, then `~/.claude` |
-| OpenCode | `opencode.db` through a bounded private SQLite/WAL snapshot | `XDG_DATA_HOME/opencode`, `~/.local/share/opencode`, then the macOS Application Support fallback |
+| OpenCode | `opencode.db` through a bounded private SQLite/WAL snapshot | `XDG_DATA_HOME/opencode`, then the OS-native default (macOS Application Support or Linux `~/.local/share/opencode`) |
 | Gemini CLI | Session JSONL below `tmp/` | `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini` |
 | Cursor | Transcript JSONL below `projects/` | `~/.cursor` |
 | Kimi Code | `sessions/*/*/agents/*/wire.jsonl`, validated against the session index and state | `KIMI_CODE_HOME`, then `~/.kimi-code` |
@@ -194,56 +160,9 @@ supported visible conversation text. Provider and source failures are isolated:
 other providers continue, and a failed or missing source retains its last-good
 catalog snapshot with a diagnostic.
 
-`sync` creates fresh schema v1 and reads current Codex session JSONL, legacy
-`history.jsonl`, Claude Code project/subagent JSONL, the supported OpenCode
-SQLite catalog, Gemini CLI session JSONL, Cursor transcript JSONL, and Kimi
-Code session-indexed agent wire JSONL. Each source is replaced atomically after
-a successful read. A
-source-level failure records a diagnostic while retaining that source's
-last-good session snapshot; it does not block other sources or providers. A
-source absent from a successfully completed provider discovery is retained and
-reported as `missing`; provider-wide discovery failures never mark retained
-sources missing. Malformed,
-unsupported, or oversized sources are failures and preserve the last-good
-snapshot. Valid records that exceed catalog bounds are safely truncated and
-stored with a `partial` diagnostic. The collectors store only visible
-user/assistant text and tool names/statuses; hidden reasoning, tool
-inputs/outputs, raw diffs, images, binary attachments, and recognized injected
-user/control records are excluded.
-
-Every JSONL collector has a 64 MiB source bound. Gemini, Claude, Cursor, and
-Kimi have a 4 MiB record bound; Codex has a 1 MiB record bound. Gemini, Claude,
-Cursor, and Kimi bound visible text to 128 KiB per item, 2 MiB per source, and
-2,000 catalog items per source. Valid sources exceeding a selection bound are
-marked `partial`; the limits are safety boundaries and do not express a
-sync-speed target. Claude's 4 MiB record ceiling is the smallest whole-MiB bound
-above the observed 3.14 MiB local maximum, while its 64 MiB source limit remains
-above the observed 16.9 MiB maximum.
-
-OpenCode snapshots are bounded to 128 MiB for the provider database, WAL, and
-SHM file set, 64 MiB of joined transcript JSON, and 100,000 joined rows. Its
-session metadata and visible items use the same 512-byte identity, 128 KiB
-item, 2 MiB session-text, and 2,000-item limits as the normalized catalog.
-
-`list` and `show SESSION_ID` read only the already-cataloged SQLite data; they
-never synchronize provider files. List and preview responses show each source's
-diagnostic status, so an `error` status makes a retained last-good session
-explicitly stale and `missing` identifies a source absent from completed
-discovery. `show` emits at most 80 items and 4 KiB per text snippet.
-
-The rebuildable catalog uses SQLite WAL with `synchronous=NORMAL`. A sudden
-power loss can lose recent catalog updates, but does not corrupt the catalog or
-affect provider-owned logs; a later `sync` rebuilds it.
-
-## Schema v1
-
-The fresh catalog contains only `sources`, `sessions`, and `transcript_items`.
-A source is unique by provider, source format, and canonical locator; its
-latest diagnostic and last-success time live on the same source row. A session
-is unique within its source. The schema stores only fields needed for the MVP
-catalog filters and bounded visible transcript later. It contains no legacy
-compatibility, migration framework, raw archive, tags, AI enrichment, or ctx
-search.
-
-An existing database with a version other than v1, or with tables but no
-Agentlog version, is refused without modification.
+See [provider projections](docs/providers.md#provider-projections),
+[failure isolation](docs/providers.md#failure-isolation-and-last-good-data),
+and [safety bounds](docs/providers.md#safety-bounds) for collector details.
+Catalog fields and exclusions are documented under
+[Stored catalog data](docs/data-architecture.md#stored-catalog-data) and
+[Excluded data](docs/data-architecture.md#excluded-data).
