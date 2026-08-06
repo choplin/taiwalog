@@ -1,5 +1,5 @@
 {
-  description = "Agentlog Rust development shell";
+  description = "Agentlog — local browser for AI coding-agent session history";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
@@ -22,17 +22,20 @@
       fenix,
       ...
     }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
-      imports = [ ];
-
-      flake = { };
-
-      systems = [
+    let
+      supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
         "x86_64-darwin"
       ];
+    in
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ ];
+
+      flake = { };
+
+      systems = supportedSystems;
 
       perSystem =
         {
@@ -52,6 +55,23 @@
             "rustc"
             "rustfmt"
           ];
+          packagePkgs = if pkgs.stdenv.hostPlatform.isLinux then pkgs.pkgsStatic else pkgs;
+          agentlog = packagePkgs.rustPlatform.buildRustPackage {
+            pname = "agentlog";
+            version = "0.1.0";
+            src = ./.;
+
+            cargoLock.lockFile = ./Cargo.lock;
+            doCheck = false;
+
+            meta = {
+              description = "A local browser for AI coding-agent session history";
+              homepage = "https://github.com/choplin/agentlog";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "agentlog";
+              platforms = supportedSystems;
+            };
+          };
         in
         {
           _module.args.pkgs = import nixpkgs {
@@ -66,6 +86,19 @@
               rustToolchain
             ];
           };
+
+          packages = {
+            inherit agentlog;
+            default = agentlog;
+          };
+
+          apps.default = {
+            type = "app";
+            program = "${agentlog}/bin/agentlog";
+            meta.description = "Browse local AI coding-agent session history";
+          };
+
+          checks.agentlog = agentlog;
         };
     };
 }
