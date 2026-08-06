@@ -519,7 +519,7 @@ mod tests {
     use tempfile::TempDir;
     #[tokio::test]
     async fn collects_cursor_visible_parts_without_tool_payloads_and_isolates_bad_source() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("cursor");
         let good = root.join("projects/a/session-a/arbitrary-capture-name.jsonl");
         let bad = root.join("projects/b/session-b/transcript.jsonl");
@@ -579,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_over_the_cursor_item_bound_is_partial() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("cursor");
         let path = root.join("projects/project/session/capture.jsonl");
         fs::create_dir_all(path.parent().expect("parent")).expect("dirs");

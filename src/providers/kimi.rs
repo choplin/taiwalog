@@ -772,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn collects_visible_kimi_wire_text_and_preserves_last_good_source() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("kimi");
         let wire = write_source(
             &root,
@@ -838,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_and_text_bound_are_cataloged_without_parent_graph() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("kimi");
         write_source(
             &root,

@@ -904,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn collects_parent_and_subagent_without_storing_private_content() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         write_source(
             &root,
@@ -980,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_failure_preserves_last_good_snapshot_and_never_changes_source_bytes() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         let source = write_source(
             &root,
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_session_identity_preserves_last_good_snapshot() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         let source = write_source(
             &root,
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_source_does_not_block_a_different_good_source() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         write_source(
             &root,
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_are_partial_while_malformed_records_fail() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         let long = "x".repeat(128 * 1024 + 1);
         write_source(&root, "project/bounded.jsonl", &[&user("bounded", &long)]);
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_session_ids_in_one_physical_source_fail_without_combining_them() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         write_source(
             &root,
@@ -1141,7 +1141,7 @@ mod tests {
 
     #[tokio::test]
     async fn timestamp_tracks_only_items_retained_within_the_source_text_limit() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("claude");
         let text = "x".repeat(128 * 1024);
         let mut records = Vec::new();

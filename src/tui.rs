@@ -2240,7 +2240,7 @@ mod tests {
             update(&mut state, BrowseEvent::Reload),
             BrowseEffect::Sync
         ));
-        let temporary = tempfile::TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
         let paths = AppPaths::resolve(Some(temporary.path().join("agentlog"))).expect("paths");
         assert!(
             !loader.request(&paths, &mut state),

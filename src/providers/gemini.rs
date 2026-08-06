@@ -547,7 +547,7 @@ mod tests {
     use tempfile::TempDir;
     #[tokio::test]
     async fn stores_only_visible_gemini_text_and_preserves_last_good_on_malformed_source() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("gemini");
         let path = root.join("tmp/a/session.jsonl");
         fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
@@ -609,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_over_the_gemini_item_bound_is_partial() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("gemini");
         let path = root.join("tmp/session.jsonl");
         fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
@@ -640,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_gemini_jsonl_files_remain_separate_source_scoped_sessions() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary");
+        let temporary = TempDir::new().expect("temporary");
         let root = temporary.path().join("gemini");
         for (relative, key, text) in [
             ("tmp/parent.jsonl", "parent", "parent visible"),

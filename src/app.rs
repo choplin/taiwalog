@@ -614,7 +614,7 @@ fn inspect_purge_target_with_hook(
         catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
     let snapshot_directory = tempfile::Builder::new()
         .prefix("agentlog-purge-")
-        .tempdir_in("/private/tmp")
+        .tempdir()
         .context("create private catalog inspection snapshot")?;
     let snapshot_database = snapshot_directory.path().join("agentlog.sqlite3");
     for file in &files {
@@ -837,6 +837,13 @@ mod tests {
         },
     };
 
+    fn temporary_directory() -> TempDir {
+        let platform_temp = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve platform temporary directory");
+        TempDir::new_in(platform_temp).expect("temporary directory")
+    }
+
     use super::{
         PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, SyncProgress, build_sync_summary,
         catalog_file_set_size, diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
@@ -972,7 +979,7 @@ mod tests {
     }
 
     async fn scanned_purge_fixture() -> (TempDir, AppPaths, std::path::PathBuf) {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
@@ -1003,7 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_shell_opens_the_catalog_without_scanning_sources() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
@@ -1018,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_failure_is_reported_without_becoming_a_source_failure() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
             .await
             .expect("open catalog");
@@ -1047,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_failure_is_propagated_instead_of_reported_as_provider_completion() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
             .await
             .expect("open catalog");
@@ -1066,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_progress_reports_staged_sources_before_committed_provider_completion() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let catalog = Catalog::open(&temporary.path().join("catalog.sqlite3"))
             .await
             .expect("open catalog");
@@ -1251,7 +1258,7 @@ mod tests {
 
     #[test]
     fn purge_snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = temporary.path().join("agentlog.sqlite3");
         let file = fs::File::create(&database).expect("create sparse database");
         file.set_len(PURGE_SNAPSHOT_MAX_BYTES + 1)
@@ -1413,7 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_rejects_a_lookalike_v1_database_without_changing_it() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
         let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
@@ -1472,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_sync_creates_catalog_and_reports_empty_codex_collection() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
         fs::write(
@@ -1511,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gemini_failure_does_not_block_a_cursor_source() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         fs::create_dir(&agentlog_home).expect("create Agentlog home");
         let gemini_root = temporary.path().join("gemini");
@@ -1551,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_sync_keeps_a_source_last_good_session_in_the_catalog() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
@@ -1595,7 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_disappeared_source_is_retained_and_diagnosed_missing() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
@@ -1653,7 +1660,7 @@ mod tests {
 
     #[tokio::test]
     async fn kimi_and_cursor_keep_identical_native_session_keys_in_distinct_sources() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let agentlog_home = temporary.path().join("agentlog");
         let cursor_root = temporary.path().join("cursor");
         let kimi_root = temporary.path().join("kimi");
@@ -1720,7 +1727,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_sync_accepts_one_representative_source_from_each_provider() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let home = temporary.path().join("agentlog");
         let codex = temporary.path().join("codex");
         let claude = temporary.path().join("claude");

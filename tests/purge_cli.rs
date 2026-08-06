@@ -7,6 +7,13 @@ use std::{
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 
+fn temporary_directory() -> TempDir {
+    let platform_temp = std::env::temp_dir()
+        .canonicalize()
+        .expect("resolve platform temporary directory");
+    TempDir::new_in(platform_temp).expect("temporary directory")
+}
+
 fn agentlog(home: &Path, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agentlog"))
         .arg("--home")
@@ -74,7 +81,7 @@ fn json_session_count(output: &std::process::Output) -> usize {
 
 #[tokio::test]
 async fn purge_process_previews_and_removes_a_nonempty_catalog() {
-    let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+    let temporary = temporary_directory();
     let home = temporary.path().join("agentlog");
     fs::create_dir(&home).expect("create Agentlog home");
     write_provider_fixture(&temporary, &home);
@@ -160,7 +167,7 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
 
 #[test]
 fn sync_process_keeps_json_stdout_clean_and_bounds_noninteractive_progress() {
-    let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+    let temporary = temporary_directory();
     let home = temporary.path().join("agentlog");
     fs::create_dir(&home).expect("create Agentlog home");
     write_provider_fixture(&temporary, &home);

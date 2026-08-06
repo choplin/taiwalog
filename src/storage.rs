@@ -1734,6 +1734,13 @@ mod tests {
         verify_catalog_content,
     };
 
+    fn temporary_directory() -> TempDir {
+        let platform_temp = std::env::temp_dir()
+            .canonicalize()
+            .expect("resolve platform temporary directory");
+        TempDir::new_in(platform_temp).expect("temporary directory")
+    }
+
     struct MismatchedScanner;
 
     impl ProviderScanner for MismatchedScanner {
@@ -1835,7 +1842,7 @@ mod tests {
 
     #[test]
     fn catalog_content_token_matches_unchanged_main_and_rejects_mismatch() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = temporary.path().join("agentlog.sqlite3");
         fs::write(&database, b"previewed-main").expect("write previewed main");
         let token = CatalogContentToken::new(b"previewed-main", None);
@@ -1850,7 +1857,7 @@ mod tests {
 
     #[test]
     fn catalog_content_token_normalizes_empty_wal_and_rejects_wal_changes() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = temporary.path().join("agentlog.sqlite3");
         let wal = sqlite_sidecar_path(&database, "-wal");
         fs::write(&database, b"main").expect("write main");
@@ -1882,7 +1889,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_database_creates_only_v1_catalog_tables() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "agentlog.sqlite3").await;
 
         let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
@@ -1904,7 +1911,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_rejects_a_database_identity_replaced_after_sqlite_open() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database_path = temporary.path().join("agentlog.sqlite3");
         let original = open_database(&database_path)
             .await
@@ -1967,7 +1974,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_enforces_the_file_set_bound_while_holding_the_writer_lock() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database_path = temporary.path().join("agentlog.sqlite3");
         let database = open_database(&database_path).await.expect("open catalog");
         sqlx::query(
@@ -2015,7 +2022,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_rejects_scanner_identity_mismatch_without_persisting_it() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let pool = open_temporary_database(&temporary, "identity.sqlite3").await;
         let catalog = Catalog { pool };
 
@@ -2042,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_version_is_not_changed() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let path = temporary.path().join("future.sqlite3");
         create_foreign_database(&path, 99, false).await;
         let before = database_files(&path);
@@ -2060,7 +2067,7 @@ mod tests {
 
     #[tokio::test]
     async fn unversioned_nonempty_database_is_not_adopted() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let path = temporary.path().join("foreign.sqlite3");
         create_foreign_database(&path, 0, true).await;
         let before = database_files(&path);
@@ -2075,7 +2082,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_enforces_source_identity_and_cascades_source_snapshots() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
 
         sqlx::query(
@@ -2125,7 +2132,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_rejects_invalid_visible_transcript_shapes() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "transcript.sqlite3").await;
         sqlx::query(
             "INSERT INTO sources (provider, source_format, canonical_locator)\n             VALUES ('claude', 'project_jsonl', '/private/tmp/project.jsonl')",
@@ -2156,7 +2163,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_catalog_list_and_preview_expose_provider_and_stale_source_status() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
         for (provider, locator, session_key, text) in [
             (
@@ -2248,7 +2255,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_preview_survives_a_replaced_session_row_during_refresh() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
         let refreshed = SourceIdentity {
             provider: "codex",
@@ -2345,7 +2352,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_list_uses_stable_source_and_session_tie_breakers() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "ordered.sqlite3").await;
         for (provider, locator, session_keys) in [
             ("cursor", "/private/tmp/z.jsonl", &["b"][..]),
@@ -2409,7 +2416,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_list_orders_by_visible_activity_then_stable_identity() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "activity.sqlite3").await;
         replace_source_snapshot(
             &database,
@@ -2465,7 +2472,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_diagnostics_include_zero_session_failures_and_hide_locators_from_json() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "diagnostics.sqlite3").await;
         let failed = SourceIdentity {
             provider: "alpha",
@@ -2514,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn transcript_batch_insert_preserves_all_item_shapes_across_chunk_boundary() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = temporary_directory();
         let database = open_temporary_database(&temporary, "catalog.sqlite3").await;
         let items = (0..501)
             .map(|index| match index % 3 {

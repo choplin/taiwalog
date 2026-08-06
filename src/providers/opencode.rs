@@ -55,6 +55,22 @@ pub struct OpenCodeProvider {
     roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Platform {
+    MacOs,
+    Linux,
+}
+
+impl Platform {
+    const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Linux
+        }
+    }
+}
+
 impl OpenCodeProvider {
     /// Resolves `OpenCode` roots using provider-native precedence.
     ///
@@ -74,23 +90,31 @@ impl OpenCodeProvider {
         xdg_data_home: Option<OsString>,
         os_home: Option<OsString>,
     ) -> Result<Self, ProviderRootError> {
+        Self::resolve_from_for(configured, xdg_data_home, os_home, Platform::current())
+    }
+
+    fn resolve_from_for(
+        configured: Option<&Path>,
+        xdg_data_home: Option<OsString>,
+        os_home: Option<OsString>,
+        platform: Platform,
+    ) -> Result<Self, ProviderRootError> {
         let roots = if let Some(root) = configured {
             vec![root.to_path_buf()]
-        } else if let Some(root) = xdg_data_home {
-            let root = PathBuf::from(root);
-            if root.as_os_str().is_empty() || !root.is_absolute() {
-                return Err(ProviderRootError::InvalidOpenCodeRoot { path: root });
-            }
+        } else if let Some(root) = xdg_data_home
+            .map(PathBuf::from)
+            .filter(|root| !root.as_os_str().is_empty() && root.is_absolute())
+        {
             vec![root.join("opencode")]
         } else {
             let home = os_home
                 .map(PathBuf::from)
                 .filter(|home| !home.as_os_str().is_empty())
                 .ok_or(ProviderRootError::OpenCodeHomeUnavailable)?;
-            vec![
-                home.join(".local/share/opencode"),
-                home.join("Library/Application Support/opencode"),
-            ]
+            vec![match platform {
+                Platform::MacOs => home.join("Library/Application Support/opencode"),
+                Platform::Linux => home.join(".local/share/opencode"),
+            }]
         };
         if let Some(path) = roots
             .iter()
@@ -313,9 +337,7 @@ fn copy_read_snapshot(path: &Path) -> Result<ReadSnapshot, &'static str> {
 }
 
 fn private_snapshot_directory() -> Result<tempfile::TempDir, &'static str> {
-    tempfile::TempDir::new_in(std::env::temp_dir())
-        .or_else(|_| tempfile::TempDir::new_in("/private/tmp"))
-        .map_err(|_| "could not create an OpenCode read snapshot")
+    tempfile::TempDir::new().map_err(|_| "could not create an OpenCode read snapshot")
 }
 
 fn read_provider_files(path: &Path) -> Result<ProviderFiles, &'static str> {
@@ -894,6 +916,7 @@ pub(crate) async fn create_test_database(path: &Path) -> SqlitePool {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
     };
@@ -910,8 +933,84 @@ mod tests {
     };
 
     use super::{
-        MAX_ITEMS_PER_SESSION, MAX_TEXT_BYTES, OpenCodeProvider, OpenCodeScanner, collect_opencode,
+        MAX_ITEMS_PER_SESSION, MAX_TEXT_BYTES, OpenCodeProvider, OpenCodeScanner, Platform,
+        collect_opencode,
     };
+
+    #[test]
+    fn roots_are_target_specific_after_explicit_and_xdg_precedence() {
+        struct Case {
+            name: &'static str,
+            configured: Option<&'static str>,
+            xdg: Option<&'static str>,
+            home: Option<&'static str>,
+            platform: Platform,
+            expected: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "explicit config is authoritative",
+                configured: Some("/configured/opencode"),
+                xdg: Some("/xdg/data"),
+                home: Some("/Users/example"),
+                platform: Platform::Linux,
+                expected: &["/configured/opencode"],
+            },
+            Case {
+                name: "XDG is authoritative on macOS too",
+                configured: None,
+                xdg: Some("/xdg/data"),
+                home: Some("/Users/example"),
+                platform: Platform::MacOs,
+                expected: &["/xdg/data/opencode"],
+            },
+            Case {
+                name: "macOS fallback is Application Support",
+                configured: None,
+                xdg: None,
+                home: Some("/Users/example"),
+                platform: Platform::MacOs,
+                expected: &["/Users/example/Library/Application Support/opencode"],
+            },
+            Case {
+                name: "Linux fallback is local share",
+                configured: None,
+                xdg: None,
+                home: Some("/home/example"),
+                platform: Platform::Linux,
+                expected: &["/home/example/.local/share/opencode"],
+            },
+            Case {
+                name: "empty XDG falls back to the macOS default",
+                configured: None,
+                xdg: Some(""),
+                home: Some("/Users/example"),
+                platform: Platform::MacOs,
+                expected: &["/Users/example/Library/Application Support/opencode"],
+            },
+            Case {
+                name: "relative XDG falls back to the Linux default",
+                configured: None,
+                xdg: Some("relative/data"),
+                home: Some("/home/example"),
+                platform: Platform::Linux,
+                expected: &["/home/example/.local/share/opencode"],
+            },
+        ];
+
+        for case in cases {
+            let provider = OpenCodeProvider::resolve_from_for(
+                case.configured.map(Path::new),
+                case.xdg.map(OsString::from),
+                case.home.map(OsString::from),
+                case.platform,
+            )
+            .expect(case.name);
+            let expected = case.expected.iter().map(PathBuf::from).collect::<Vec<_>>();
+            assert_eq!(provider.roots(), expected, "{}", case.name);
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     struct SourceFileSnapshot {
@@ -939,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_multi_root_discovery_preserves_last_good_without_marking_missing() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let database_path = temporary.path().join("catalog.sqlite3");
         let pool = open_database(&database_path).await.expect("open catalog");
         replace_source_snapshot(
@@ -962,7 +1061,7 @@ mod tests {
         let oversized_component = "x".repeat(5_000);
         let scanner = OpenCodeScanner::new(OpenCodeProvider::at_roots(vec![
             temporary.path().join("absent"),
-            PathBuf::from("/private/tmp").join(oversized_component),
+            temporary.path().join(oversized_component),
         ]));
         let catalog = Catalog::open(&database_path).await.expect("reopen catalog");
         let error = catalog
@@ -1173,7 +1272,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_active_wal_without_changing_provider_files_or_storing_private_tool_data() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("opencode");
         let (source_path, writer) = active_wal_source(&root).await;
         populate_private_fixture(&writer).await;
@@ -1234,7 +1333,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_schema_and_inconsistent_rows_preserve_last_good_snapshot() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("opencode");
         let (_source_path, writer) = active_wal_source(&root).await;
         insert_session(&writer, "session-one").await;
@@ -1316,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_are_partial_without_exposing_hidden_data() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let root = temporary.path().join("opencode");
         let (_source_path, writer) = active_wal_source(&root).await;
         insert_session(&writer, "session-one").await;

@@ -15,7 +15,7 @@ use crate::providers::{
     gemini::GeminiProvider, kimi::KimiProvider, opencode::OpenCodeProvider,
 };
 
-const APPLICATION_SUPPORT: &str = "Library/Application Support/Agentlog";
+const DEFAULT_DATA_HOME: &str = ".local/share/agentlog";
 const CONFIG_FILE: &str = "config.toml";
 const DATABASE_FILE: &str = "agentlog.sqlite3";
 
@@ -30,18 +30,20 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
-    /// Resolves the macOS Application Support location, or the explicit test
-    /// override. `AGENTLOG_HOME` has the same meaning as `--home`.
+    /// Resolves the platform-owned data location, or an explicit override.
+    /// `AGENTLOG_HOME` has the same meaning as `--home`.
     ///
     /// # Errors
     ///
     /// Returns an error when no home directory is available, config is invalid,
     /// or a configured provider root is relative.
     pub fn resolve(home_override: Option<PathBuf>) -> Result<Self, PathError> {
-        let home = match home_override.or_else(|| env::var_os("AGENTLOG_HOME").map(PathBuf::from)) {
-            Some(home) => home,
-            None => default_home()?,
-        };
+        let home = resolve_agentlog_home(
+            home_override,
+            env::var_os("AGENTLOG_HOME"),
+            env::var_os("XDG_DATA_HOME"),
+            env::var_os("HOME"),
+        )?;
 
         if home.as_os_str().is_empty() {
             return Err(PathError::EmptyHome);
@@ -127,9 +129,10 @@ impl AppPaths {
     /// default. Agentlog's `--home` setting never changes this
     /// provider-owned location.
     ///
-    /// An explicit config root or `XDG_DATA_HOME/opencode` is authoritative.
-    /// Without either, Agentlog checks `OpenCode`'s documented XDG location and
-    /// the macOS-native Application Support fallback.
+    /// An explicit config root or a valid absolute
+    /// `XDG_DATA_HOME/opencode` is authoritative. Without either, Agentlog uses
+    /// the native default for the current OS: Application Support on macOS or
+    /// the XDG HOME fallback on Linux.
     ///
     /// # Errors
     ///
@@ -250,12 +253,35 @@ fn resolve_kimi_root(
         .map_err(Into::into)
 }
 
-fn default_home() -> Result<PathBuf, PathError> {
-    env::var_os("HOME")
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("Agentlog supports only macOS and Linux");
+
+fn resolve_agentlog_home(
+    home_override: Option<PathBuf>,
+    agentlog_home: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    os_home: Option<OsString>,
+) -> Result<PathBuf, PathError> {
+    if let Some(home) = home_override.or_else(|| agentlog_home.map(PathBuf::from)) {
+        return if home.as_os_str().is_empty() {
+            Err(PathError::EmptyHome)
+        } else {
+            Ok(home)
+        };
+    }
+
+    if let Some(data_home) = xdg_data_home.map(PathBuf::from)
+        && !data_home.as_os_str().is_empty()
+        && data_home.is_absolute()
+    {
+        return Ok(data_home.join("agentlog"));
+    }
+
+    let os_home = os_home
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
-        .map(|home| home.join(APPLICATION_SUPPORT))
-        .ok_or(PathError::HomeUnavailable)
+        .ok_or(PathError::HomeUnavailable)?;
+    Ok(os_home.join(DEFAULT_DATA_HOME))
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,13 +474,106 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AppPaths, resolve_claude_root, resolve_codex_root, resolve_cursor_root,
-        resolve_gemini_root, resolve_kimi_root, resolve_opencode_roots,
+        AppPaths, resolve_agentlog_home, resolve_claude_root, resolve_codex_root,
+        resolve_cursor_root, resolve_gemini_root, resolve_kimi_root, resolve_opencode_roots,
     };
 
     #[test]
+    fn agentlog_home_precedence_and_xdg_defaults_are_table_driven() {
+        struct Case {
+            name: &'static str,
+            explicit: Option<&'static str>,
+            environment: Option<&'static str>,
+            xdg: Option<&'static str>,
+            home: Option<&'static str>,
+            expected: Result<&'static str, &'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "explicit CLI home wins",
+                explicit: Some("/cli/home"),
+                environment: Some("/environment/home"),
+                xdg: Some("/xdg/data"),
+                home: Some("/Users/example"),
+                expected: Ok("/cli/home"),
+            },
+            Case {
+                name: "environment home wins over defaults",
+                explicit: None,
+                environment: Some("/environment/home"),
+                xdg: Some("/xdg/data"),
+                home: Some("/Users/example"),
+                expected: Ok("/environment/home"),
+            },
+            Case {
+                name: "macOS uses absolute XDG data home",
+                explicit: None,
+                environment: None,
+                xdg: Some("/Users/example/.xdg/data"),
+                home: Some("/Users/example"),
+                expected: Ok("/Users/example/.xdg/data/agentlog"),
+            },
+            Case {
+                name: "Linux uses absolute XDG data home",
+                explicit: None,
+                environment: None,
+                xdg: Some("/xdg/data"),
+                home: Some("/home/example"),
+                expected: Ok("/xdg/data/agentlog"),
+            },
+            Case {
+                name: "empty XDG data home uses the XDG HOME fallback",
+                explicit: None,
+                environment: None,
+                xdg: Some(""),
+                home: Some("/home/example"),
+                expected: Ok("/home/example/.local/share/agentlog"),
+            },
+            Case {
+                name: "relative XDG data home uses the XDG HOME fallback",
+                explicit: None,
+                environment: None,
+                xdg: Some("relative/data"),
+                home: Some("/home/example"),
+                expected: Ok("/home/example/.local/share/agentlog"),
+            },
+            Case {
+                name: "missing operating-system home fails",
+                explicit: None,
+                environment: None,
+                xdg: None,
+                home: None,
+                expected: Err("HOME is unavailable"),
+            },
+        ];
+
+        for case in cases {
+            let result = resolve_agentlog_home(
+                case.explicit.map(PathBuf::from),
+                case.environment.map(OsString::from),
+                case.xdg.map(OsString::from),
+                case.home.map(OsString::from),
+            );
+            match case.expected {
+                Ok(expected) => assert_eq!(
+                    result.expect(case.name),
+                    Path::new(expected),
+                    "{}",
+                    case.name
+                ),
+                Err(expected) => assert!(
+                    result.expect_err(case.name).to_string().contains(expected),
+                    "{}",
+                    case.name
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let paths =
             AppPaths::resolve(Some(temporary.path().join("agentlog"))).expect("paths resolve");
 
@@ -465,7 +584,7 @@ mod tests {
 
     #[test]
     fn config_accepts_explicit_provider_roots_without_changing_owned_database_path() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let home = temporary.path().join("agentlog");
         fs::create_dir(&home).expect("create home");
         fs::write(
@@ -485,7 +604,7 @@ mod tests {
 
     #[test]
     fn config_rejects_unrelated_configuration() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let home = temporary.path().join("agentlog");
         fs::create_dir(&home).expect("create home");
         fs::write(home.join("config.toml"), "[enrichment]\nenabled = true\n")
@@ -498,7 +617,7 @@ mod tests {
 
     #[test]
     fn config_rejects_relative_provider_roots() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let home = temporary.path().join("agentlog");
         fs::create_dir(&home).expect("create home");
         fs::write(
@@ -514,7 +633,7 @@ mod tests {
 
     #[test]
     fn configured_codex_root_is_independent_from_agentlog_home() {
-        let temporary = TempDir::new_in("/private/tmp").expect("temporary directory");
+        let temporary = TempDir::new().expect("temporary directory");
         let home = temporary.path().join("agentlog");
         fs::create_dir(&home).expect("create home");
         fs::write(
@@ -612,10 +731,11 @@ mod tests {
         assert_eq!(
             resolve_opencode_roots(None, None, Some(OsString::from("/Users/example")))
                 .expect("default root"),
-            vec![
-                PathBuf::from("/Users/example/.local/share/opencode"),
-                PathBuf::from("/Users/example/Library/Application Support/opencode"),
-            ]
+            vec![if cfg!(target_os = "macos") {
+                PathBuf::from("/Users/example/Library/Application Support/opencode")
+            } else {
+                PathBuf::from("/Users/example/.local/share/opencode")
+            }]
         );
         assert!(resolve_opencode_roots(None, Some(OsString::new()), None).is_err());
         assert!(

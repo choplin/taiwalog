@@ -1015,7 +1015,7 @@ mod tests {
     };
 
     fn temporary() -> TempDir {
-        TempDir::new_in("/private/tmp").expect("temporary directory")
+        TempDir::new().expect("temporary directory")
     }
 
     fn write(path: &Path, content: &str) {
