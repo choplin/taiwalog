@@ -1,168 +1,175 @@
 # Agentlog
 
-Agentlog is a local browser for session history produced by AI coding agents.
-This first durable shell owns a small SQLite catalog and imports Codex, Claude
-Code, OpenCode, Gemini CLI, Cursor, and Kimi Code session history. It never
-creates, changes, or deletes provider-owned logs.
+> All your AI coding-agent sessions in one local timeline.
 
-## Requirements
+Agentlog gives developers who use multiple AI coding agents one place to find
+and revisit their sessions. It reads supported agents' local history without
+changing the original files, then builds a local SQLite catalog for fast
+browsing.
 
-- macOS or Linux
-- Rust 1.85 or newer when building from source
+![Agentlog brings local histories from supported coding agents into one local timeline through a read-only sync.](docs/assets/agentlog-overview.png)
 
-## Install on macOS
+## Why Agentlog?
 
-Build a native release bundle without Developer ID signing from a source checkout:
+- **One timeline for every supported agent.** Browse sessions from supported
+  coding agents in a shared chronological view.
+- **Find the session you remember.** Filter by provider, repository, working
+  directory, model, execution kind, or start date, then preview the cataloged
+  transcript without leaving the terminal.
+- **Keep source history local and unchanged.** Agentlog reads provider data,
+  writes only to its own local catalog, and does not send catalog data over the
+  network. The last successful catalog snapshot remains available with a
+  diagnostic.
 
-```sh
-release_archive=$(./scripts/build-macos-release.sh)
-release_dir=$(mktemp -d)
-trap 'rm -rf "$release_dir"' EXIT HUP INT TERM
-tar -xzf "$release_archive" -C "$release_dir"
-"$release_dir"/agentlog-*/install.sh "$HOME/.local"
-```
+## Get started
 
-Add `$HOME/.local/bin` to `PATH` if it is not already present. Omit the prefix
-to install into `/usr/local`; that location may require elevated permissions.
-The bundle is built for the active macOS Rust host architecture. It is not
-Developer ID signed, notarized, checksummed, or a deterministic bundle.
+The shortest setup requires macOS and [Homebrew](https://brew.sh/). Nix and
+prebuilt release archives also support macOS and Linux; see
+[Other installation options](#other-installation-options).
 
-To build the bundle and verify an isolated installation in one command:
+1. Install Agentlog:
 
-```sh
-./scripts/smoke-macos-release.sh
-```
+   ```sh
+   brew install choplin/tap/agentlog
+   ```
 
-## Quickstart
+2. Build the local catalog from supported histories already on your machine:
 
-After installation:
+   ```sh
+   agentlog sync
+   ```
 
-```sh
-agentlog paths
-agentlog sync
-agentlog sync --json
-agentlog list
-agentlog show 1
-agentlog purge
-agentlog purge --yes
-agentlog browse
-```
+   The command reports source outcomes and the number of sessions available in
+   the catalog. A provider or source failure does not stop the other sources.
 
-From a source checkout, replace `agentlog` with `cargo run --`.
+3. Open the catalog:
 
-`browse` first shows the existing Agentlog catalog, then starts a read-only
-sync in the background. Its status line names the current provider and reports
-processed/candidate source counts without exposing source paths or log content.
-Press `r` to request another sync; repeated requests
-while a sync is active do not start another one. The list remains available
-during sync, keeps its selection by provider/source/session key when rows are
-replaced, and reports bounded provider-failure and
-refreshed/partial/failed/missing/session counts when sync completes.
-Use `j`/`k` or the arrow keys to choose a recent session, `Enter` for its full
-preview, `Esc` to return, and `q` to quit. Press `f` to refine by provider,
-repository, CWD, model, execution kind, and start date. Within each metadata
-field, `Space` toggles exact values with OR semantics; fields combine with AND.
-Blank or missing metadata is not offered as a filter value. Start-date choices
-also toggle with OR semantics. `Tab`/`Enter` moves forward, `BackTab` moves
-back, `x` clears the current step, and `C` clears every choice and returns to
-Recent grouping. Press `?` for the key reference and `!` for retained source
-diagnostics. The diagnostics list deliberately shows each retained source's
-local locator for source attribution; locators are never emitted by the JSON
-catalog interfaces.
+   ```sh
+   agentlog browse
+   ```
 
-### Manual browse review
+   The browser shows a chronological list when the catalog contains sessions,
+   or an empty state when it does not. Wide terminals also show a preview pane;
+   on narrower terminals, press `Enter` to open the selected session. Use the
+   arrow keys or `j`/`k` to move, `f` to filter, `?` for the key reference, and
+   `q` to quit.
 
-Run this only with an actual local catalog: at least two provider values, a
-repository or CWD value, and several sessions with different `started_at`
-values make every interaction observable. Run `cargo run -- sync` first, then
-`cargo run -- browse`; if the catalog lacks one of those values, verify the
-available layout, help, diagnostics, selection, and terminal restoration steps
-below rather than inventing a fixture.
+## Other installation options
 
-1. At **at least 100x24**, expect a chronological list with Started, Title,
-   Repository, and Provider plus a passive preview. At **80x24**, expect the
-   narrow list with Started, Title, and Provider. Below **40x10**, expect
-   `Terminal too small` and no panic.
-2. Press `f`. Toggle two provider values with `Space` (OR), advance with
-   `Tab`, select a repository and/or CWD (AND), then select multiple date
-   buckets (OR). Advance to Group and choose Provider or Repository. Expect
-   fixed recent order inside each first-seen group; missing repositories are
-   displayed as `(no repository)`.
-3. Press `Esc`: the choices remain active. Press `?` to confirm the key
-   reference. Press `!`, use `j`/`k`, `PgUp`/`PgDn`, and `g`/`G` to scroll the
-   diagnostics, then `Esc` to close it.
-4. In Browse, move selection with `j`/`k`, press `Enter`, scroll the preview,
-   and press `Esc`. Expect the same list selection and list context. Finally,
-   press `q`; the normal terminal must be restored.
+Agentlog supports Apple Silicon and Intel macOS, plus ARM64 and x86-64 Linux.
+Review the current [limitations](#limitations) before choosing an installation.
 
-On a normal exit, Agentlog restores the terminal. It reports an error only if
-that restoration fails; on an unexpected terminal error or panic it still makes
-a best-effort restoration.
+### Nix
 
-By default, Agentlog owns these paths under the platform XDG data directory,
-falling back to `~/.local/share/agentlog` when `XDG_DATA_HOME` is unset or
-invalid:
-
-- `config.toml` — optional, minimal local configuration;
-- `agentlog.sqlite3` — the Agentlog-owned SQLite catalog.
-
-`agentlog paths` prints these paths and the separate provider-source boundaries.
-Use `--home DIR` or `AGENTLOG_HOME` for an isolated Agentlog catalog; these do
-not redirect Codex history discovery:
+Run Agentlog without installing it:
 
 ```sh
-cargo run -- --home /tmp/agentlog-demo paths
-cargo run -- --home /tmp/agentlog-demo sync
+nix run github:choplin/agentlog -- sync
+nix run github:choplin/agentlog -- browse
 ```
 
-### Data handling documentation
+Or install the default flake package into your profile:
 
-Agentlog keeps provider-owned inputs separate from its local derived catalog.
+```sh
+nix profile install github:choplin/agentlog
+agentlog --version
+```
 
-| Question | Reference |
+The flake exposes a default package and app for `aarch64-darwin`,
+`x86_64-darwin`, `aarch64-linux`, and `x86_64-linux`. Linux packages use a
+static musl build.
+
+### GitHub Releases
+
+Download the archive and matching `.sha256` file for your system from the
+[latest release](https://github.com/choplin/agentlog/releases/latest):
+
+| System | Archive |
 | --- | --- |
-| What is read, stored, or excluded? | [Data flow](docs/data-architecture.md#data-ownership-and-flow), [stored data](docs/data-architecture.md#stored-catalog-data), [excluded data](docs/data-architecture.md#excluded-data) |
-| Does data leave the machine? | [Local-only operation](docs/data-architecture.md#local-only-operation) |
-| What does purge remove? | [Purging Agentlog data](docs/data-architecture.md#purging-agentlog-data) |
-| Where are provider sources found? | [Source discovery and root precedence](docs/providers.md#source-discovery-and-root-precedence) |
-| What happens on failure? | [Failure isolation and last-good data](docs/providers.md#failure-isolation-and-last-good-data) |
+| Apple Silicon macOS | `agentlog-aarch64-apple-darwin.tar.xz` |
+| Intel macOS | `agentlog-x86_64-apple-darwin.tar.xz` |
+| ARM64 Linux | `agentlog-aarch64-unknown-linux-musl.tar.xz` |
+| x86-64 Linux | `agentlog-x86_64-unknown-linux-musl.tar.xz` |
 
-`sync` reports provider discovery, candidate counts, and completion to stderr.
-In an interactive terminal, its current provider and processed/candidate source
-counts update in place; redirected runs keep a bounded per-provider record.
-`sync --json` keeps its machine-readable result on stdout.
+Verify the archive with `shasum -a 256 -c <archive>.sha256` on macOS or
+`sha256sum -c <archive>.sha256` on Linux. Then extract it and install the
+binary somewhere on `PATH`; for example:
 
-### Purging the local catalog
+```sh
+archive=agentlog-aarch64-apple-darwin.tar.xz
+tar -xJf "$archive"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "${archive%.tar.xz}/agentlog" "$HOME/.local/bin/agentlog"
+agentlog --version
+```
 
-`agentlog purge` previews the Agentlog-owned database path, row counts, and
-SQLite file-set size. In an eligible terminal it asks for default-No
-confirmation; redirected or background use stays preview-only. `--yes` skips
-the prompt and removes catalog rows while preserving the schema and files.
-See [Purging Agentlog data](docs/data-architecture.md#purging-agentlog-data) for
-the exact safety checks, retained data, and rebuild limitation.
+Replace `archive` with the filename for your system. Add `$HOME/.local/bin` to
+`PATH` if necessary.
 
-## Supported providers
+## Explore your catalog
 
-All provider inputs are read-only. An explicit `providers.*_root` value in
-`config.toml` has the highest precedence.
+The browser keeps the current catalog available while a read-only sync runs in
+the background. It preserves your selection when refreshed sessions are
+replaced and reports whether sources were refreshed, partial, failed, or
+missing.
 
-| Provider | Imported source | Default root precedence after config |
-| --- | --- | --- |
-| Codex | Current `sessions/**/*.jsonl` and legacy `history.jsonl` | `CODEX_HOME`, then `~/.codex` |
-| Claude Code | Parent and subagent JSONL below `projects/` | `CLAUDE_CONFIG_DIR`, then `~/.claude` |
-| OpenCode | `opencode.db` through a bounded private SQLite/WAL snapshot | `XDG_DATA_HOME/opencode`, then the OS-native default (macOS Application Support or Linux `~/.local/share/opencode`) |
-| Gemini CLI | Session JSONL below `tmp/` | `$GEMINI_CLI_HOME/.gemini`, then `~/.gemini` |
-| Cursor | Transcript JSONL below `projects/` | `~/.cursor` |
-| Kimi Code | `sessions/*/*/agents/*/wire.jsonl`, validated against the session index and state | `KIMI_CODE_HOME`, then `~/.kimi-code` |
+- Press `f` to filter by provider, repository, working directory, model,
+  execution kind, or start date.
+- Group matching sessions by provider or repository.
+- Press `!` to inspect retained source diagnostics.
+- Press `r` to request another background sync.
 
-A discovered source can legitimately produce no session when it contains no
-supported visible conversation text. Provider and source failures are isolated:
-other providers continue, and a failed or missing source retains its last-good
-catalog snapshot with a diagnostic.
+The same catalog is available through non-interactive commands:
 
-See [provider projections](docs/providers.md#provider-projections),
-[failure isolation](docs/providers.md#failure-isolation-and-last-good-data),
-and [safety bounds](docs/providers.md#safety-bounds) for collector details.
-Catalog fields and exclusions are documented under
-[Stored catalog data](docs/data-architecture.md#stored-catalog-data) and
-[Excluded data](docs/data-architecture.md#excluded-data).
+| Command | Purpose |
+| --- | --- |
+| `agentlog sync` | Refresh the catalog from supported local histories. |
+| `agentlog browse` | Browse and filter sessions interactively. |
+| `agentlog list` | List cataloged sessions without synchronizing. |
+| `agentlog show <session-id>` | Print one cataloged session. |
+| `agentlog paths` | Show Agentlog-owned paths and provider-source boundaries. |
+| `agentlog purge` | Preview and confirm removal of catalog rows. |
+
+Commands with structured output support `--json` where shown by
+`agentlog <command> --help`.
+
+## Supported provider history
+
+Agentlog imports local history from the providers shown in the opening flow.
+The [provider reference](docs/providers.md) documents source formats, discovery
+precedence, configuration overrides, projection rules, failure handling, and
+safety bounds.
+
+## Data stays local
+
+Agentlog separates provider-owned source data from its derived catalog.
+Provider sources are read only. The catalog stores normalized session metadata
+and visible transcript content for browsing while excluding provider
+thinking/reasoning and tool payloads. The current runtime reads and writes only
+local data.
+
+Agentlog stores its optional `config.toml` and `agentlog.sqlite3` catalog under
+the platform data directory. Run `agentlog paths` to see the resolved paths and
+provider-source boundaries.
+
+`agentlog purge` removes rows from the Agentlog-owned catalog after preview and
+confirmation. It leaves provider logs, configuration, database files, and the
+database schema unchanged. See [Data architecture](docs/data-architecture.md)
+for the complete data flow, stored and excluded fields, retention behavior,
+local-only boundary, and purge safety checks.
+
+## Limitations
+
+- Agentlog is a local, single-user browser; it does not synchronize data to a
+  hosted service.
+- Windows is not supported.
+- Release binaries are not code-signed or notarized.
+- Sources may be partial, malformed, unsupported, oversized, unreadable, or
+  changed during collection. Agentlog reports their state and preserves the
+  last successful data when available.
+- Imported content includes the visible fields supported by each provider, not
+  every field in the native format.
+
+## License
+
+Agentlog is available under the [MIT License](LICENSE).
