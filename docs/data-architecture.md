@@ -121,8 +121,11 @@ installation distribution are outside this runtime boundary.
 ## Purging Agentlog data
 
 `agentlog purge` previews the target path, row counts, and approximate SQLite
-main/WAL/SHM size. Interactive confirmation is bound to the previewed database
-identity and content. `--yes` skips the prompt, not the path, schema, identity,
+main/WAL/SHM size using a short read-only transaction and file metadata. After
+confirmation, purge acquires SQLite's writer lock without waiting, validates the
+schema, recounts the rows, and deletes them in one transaction. The completion
+report therefore describes the rows actually deleted, including changes made
+after the preview. `--yes` skips the prompt, not the path, schema, identity,
 size, or writer-lock checks.
 
 | Purge removes | Purge keeps |

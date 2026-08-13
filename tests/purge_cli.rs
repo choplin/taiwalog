@@ -124,7 +124,10 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
             .any(|unit| size_line.contains(unit)),
         "size report uses a human-readable IEC unit"
     );
-    assert!(size_line.ends_with(&format!("({expected_bytes} bytes)")));
+    assert!(
+        !size_line.ends_with("0 B (0 bytes)"),
+        "purge reports a nonzero metadata-based file-set size"
+    );
     assert!(preview_report.contains("No changes were made."));
     assert!(preview_report.contains("agentlog purge --yes"));
     assert!(preview_report.contains(

@@ -6,8 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Read,
+    fs,
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +15,6 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -64,22 +62,6 @@ pub struct CatalogCounts {
     pub sources: u64,
     pub sessions: u64,
     pub transcript_items: u64,
-}
-
-/// Constant-size cryptographic digests of content approved by a purge preview.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CatalogContentToken {
-    database: [u8; 32],
-    wal: Option<[u8; 32]>,
-}
-
-impl CatalogContentToken {
-    pub(crate) fn new(database: &[u8], wal: Option<&[u8]>) -> Self {
-        Self {
-            database: sha256(database),
-            wal: wal.filter(|bytes| !bytes.is_empty()).map(sha256),
-        }
-    }
 }
 
 /// Counts and file-set size observed while the purge writer lock is held.
@@ -512,37 +494,47 @@ pub async fn open_database(path: &Path) -> Result<SqlitePool, StorageError> {
     Ok(pool)
 }
 
-/// Inspects an existing catalog snapshot without creating or modifying it.
-///
-/// Callers must pass a private writable snapshot rather than the live Agentlog
-/// catalog. The snapshot may include a `SQLite` WAL; `SQLite` creates a private
-/// SHM file as needed without changing the catalog being described.
+/// Reads purge counts from an existing live catalog without modifying rows.
 ///
 /// # Errors
 ///
-/// Returns an error when the private database cannot be opened, does not contain
-/// the current Agentlog schema, or its counts cannot be represented.
-pub async fn inspect_catalog_snapshot(path: &Path) -> Result<CatalogCounts, StorageError> {
+/// Returns an error when the database cannot be opened, does not contain the
+/// current Agentlog schema, or its counts cannot be represented.
+pub(crate) async fn inspect_existing_catalog(
+    path: &Path,
+    expected_identity: CatalogFileIdentity,
+) -> Result<CatalogPurgeResult, StorageError> {
+    verify_catalog_file_identity(path, expected_identity)?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .foreign_keys(true);
+        .read_only(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::ZERO);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
         .await
         .map_err(StorageError::Connect)?;
 
-    validate_existing_schema(&pool).await?;
-    let sources = count_rows(&pool, "sources").await?;
-    let sessions = count_rows(&pool, "sessions").await?;
-    let transcript_items = count_rows(&pool, "transcript_items").await?;
+    if let Err(error) = verify_catalog_file_identity(path, expected_identity) {
+        pool.close().await;
+        return Err(error);
+    }
+    let mut transaction = pool.begin().await.map_err(StorageError::Query)?;
+    validate_existing_schema_in_transaction(&mut transaction).await?;
+    let counts = CatalogCounts {
+        sources: count_rows_in_transaction(&mut transaction, "sources").await?,
+        sessions: count_rows_in_transaction(&mut transaction, "sessions").await?,
+        transcript_items: count_rows_in_transaction(&mut transaction, "transcript_items").await?,
+    };
+    let approximate_bytes = inspect_catalog_file_set_size(path)?;
+    transaction.commit().await.map_err(StorageError::Query)?;
     pool.close().await;
 
-    Ok(CatalogCounts {
-        sources,
-        sessions,
-        transcript_items,
+    Ok(CatalogPurgeResult {
+        counts,
+        approximate_bytes,
     })
 }
 
@@ -659,26 +651,14 @@ fn verify_catalog_file_identity(
 pub(crate) async fn purge_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
-    expected_content: Option<&CatalogContentToken>,
-    max_file_set_bytes: u64,
     after_measurement: impl FnOnce(CatalogPurgeResult),
 ) -> Result<CatalogPurgeResult, StorageError> {
-    purge_existing_catalog_with_hooks(
-        path,
-        expected_identity,
-        expected_content,
-        max_file_set_bytes,
-        || {},
-        after_measurement,
-    )
-    .await
+    purge_existing_catalog_with_hooks(path, expected_identity, || {}, after_measurement).await
 }
 
 async fn purge_existing_catalog_with_hooks(
     path: &Path,
     expected_identity: CatalogFileIdentity,
-    expected_content: Option<&CatalogContentToken>,
-    max_file_set_bytes: u64,
     after_open: impl FnOnce(),
     after_measurement: impl FnOnce(CatalogPurgeResult),
 ) -> Result<CatalogPurgeResult, StorageError> {
@@ -705,20 +685,13 @@ async fn purge_existing_catalog_with_hooks(
         .await
         .map_err(StorageError::Query)?;
     verify_catalog_file_identity(path, expected_identity)?;
-    if let Some(expected_content) = expected_content
-        && let Err(error) = verify_catalog_content(path, expected_content, max_file_set_bytes)
-    {
-        transaction.rollback().await.map_err(StorageError::Query)?;
-        pool.close().await;
-        return Err(error);
-    }
     validate_existing_schema_in_transaction(&mut transaction).await?;
     let counts = CatalogCounts {
         sources: count_rows_in_transaction(&mut transaction, "sources").await?,
         sessions: count_rows_in_transaction(&mut transaction, "sessions").await?,
         transcript_items: count_rows_in_transaction(&mut transaction, "transcript_items").await?,
     };
-    let approximate_bytes = match inspect_catalog_file_set_size(path, max_file_set_bytes) {
+    let approximate_bytes = match inspect_catalog_file_set_size(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             transaction.rollback().await.map_err(StorageError::Query)?;
@@ -745,125 +718,7 @@ async fn purge_existing_catalog_with_hooks(
     Ok(result)
 }
 
-fn verify_catalog_content(
-    path: &Path,
-    expected: &CatalogContentToken,
-    max_bytes: u64,
-) -> Result<(), StorageError> {
-    let database = hash_bounded_catalog_component(path, max_bytes)?.ok_or_else(|| {
-        StorageError::CatalogPreviewChanged {
-            path: path.to_path_buf(),
-        }
-    })?;
-    let remaining = max_bytes.saturating_sub(database.length);
-    let wal = normalize_wal_digest(hash_bounded_catalog_component(
-        &sqlite_sidecar_path(path, "-wal"),
-        remaining,
-    )?);
-    if database.digest == expected.database && wal == expected.wal {
-        Ok(())
-    } else {
-        Err(StorageError::CatalogPreviewChanged {
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HashedCatalogComponent {
-    digest: [u8; 32],
-    length: u64,
-}
-
-fn normalize_wal_digest(wal: Option<HashedCatalogComponent>) -> Option<[u8; 32]> {
-    wal.filter(|component| component.length != 0)
-        .map(|component| component.digest)
-}
-
-fn hash_bounded_catalog_component(
-    path: &Path,
-    max_bytes: u64,
-) -> Result<Option<HashedCatalogComponent>, StorageError> {
-    let Some(expected_state) = inspect_catalog_file_state(path)? else {
-        return Ok(None);
-    };
-    if expected_state.length > max_bytes {
-        return Err(StorageError::CatalogFileSetTooLarge {
-            path: path.to_path_buf(),
-            bytes: expected_state.length,
-            max_bytes,
-        });
-    }
-    let file = File::open(path).map_err(|source| StorageError::CatalogPathIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let opened_state = CatalogFileState::from_metadata(
-        path,
-        &file
-            .metadata()
-            .map_err(|source| StorageError::CatalogPathIo {
-                path: path.to_path_buf(),
-                source,
-            })?,
-    )?;
-    if opened_state != expected_state {
-        return Err(StorageError::CatalogPreviewChanged {
-            path: path.to_path_buf(),
-        });
-    }
-    let mut file = file;
-    let mut hasher = Sha256::new();
-    let mut remaining = expected_state.length;
-    let mut buffer = [0_u8; 16 * 1024];
-    while remaining != 0 {
-        let limit = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
-            StorageError::CatalogFileSetSizeOverflow {
-                path: path.to_path_buf(),
-            }
-        })?;
-        let read =
-            file.read(&mut buffer[..limit])
-                .map_err(|source| StorageError::CatalogPathIo {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        if read == 0 {
-            return Err(StorageError::CatalogPreviewChanged {
-                path: path.to_path_buf(),
-            });
-        }
-        hasher.update(&buffer[..read]);
-        let read = u64::try_from(read).map_err(|_| StorageError::CatalogFileSetSizeOverflow {
-            path: path.to_path_buf(),
-        })?;
-        remaining -= read;
-    }
-    let mut trailing = [0_u8; 1];
-    if file
-        .read(&mut trailing)
-        .map_err(|source| StorageError::CatalogPathIo {
-            path: path.to_path_buf(),
-            source,
-        })?
-        != 0
-        || inspect_catalog_file_state(path)? != Some(expected_state)
-    {
-        return Err(StorageError::CatalogPreviewChanged {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(Some(HashedCatalogComponent {
-        digest: hasher.finalize().into(),
-        length: expected_state.length,
-    }))
-}
-
-fn inspect_catalog_file_set_size(path: &Path, max_bytes: u64) -> Result<u64, StorageError> {
+fn inspect_catalog_file_set_size(path: &Path) -> Result<u64, StorageError> {
     let main = inspect_catalog_file_state(path)?.ok_or_else(|| {
         StorageError::CatalogFileIdentityChanged {
             path: path.to_path_buf(),
@@ -879,13 +734,6 @@ fn inspect_catalog_file_set_size(path: &Path, max_bytes: u64) -> Result<u64, Sto
                 }
             })?;
         }
-    }
-    if total > max_bytes {
-        return Err(StorageError::CatalogFileSetTooLarge {
-            path: path.to_path_buf(),
-            bytes: total,
-            max_bytes,
-        });
     }
     Ok(total)
 }
@@ -928,16 +776,6 @@ async fn validate_existing_schema_in_transaction(
         .map_err(StorageError::Query)?;
     let objects = schema_objects_in_transaction(transaction).await?;
     validate_schema_fingerprint(version, &objects)
-}
-
-async fn count_rows(pool: &SqlitePool, table: &'static str) -> Result<u64, StorageError> {
-    count_rows_from_pool(pool, table).await
-}
-
-async fn count_rows_from_pool(pool: &SqlitePool, table: &'static str) -> Result<u64, StorageError> {
-    let query = count_query(table);
-    let count = scalar_i64(pool, query).await?;
-    u64::try_from(count).map_err(|_| StorageError::CountOutOfRange)
 }
 
 async fn count_rows_in_transaction(
@@ -1672,20 +1510,8 @@ pub enum StorageError {
     UnsafeCatalogPath { path: PathBuf, reason: &'static str },
     #[error("Agentlog catalog file identity changed while opening {path}; refusing to purge")]
     CatalogFileIdentityChanged { path: PathBuf },
-    #[error(
-        "Agentlog catalog changed after the purge preview at {path}; no data was deleted; rerun `agentlog purge` to review the updated catalog"
-    )]
-    CatalogPreviewChanged { path: PathBuf },
     #[error("Agentlog catalog file-set size exceeds the supported range at {path}")]
     CatalogFileSetSizeOverflow { path: PathBuf },
-    #[error(
-        "refusing to purge; Agentlog SQLite file set at {path} is {bytes} bytes, exceeding the {max_bytes} byte limit"
-    )]
-    CatalogFileSetTooLarge {
-        path: PathBuf,
-        bytes: u64,
-        max_bytes: u64,
-    },
     #[error("catalog transcript ordinal exceeds SQLite integer range")]
     OrdinalOverflow,
     #[error("system clock is before the Unix epoch")]
@@ -1726,12 +1552,11 @@ mod tests {
     };
 
     use super::{
-        Catalog, CatalogContentToken, CatalogItem, CatalogScanError, CatalogSession,
-        SCHEMA_VERSION, SourceIdentity, SourceSnapshot, StorageError, inspect_catalog_file_state,
-        list_catalog_sessions, list_catalog_source_diagnostics, open_database,
-        purge_existing_catalog_with_hooks, read_catalog_preview, read_catalog_preview_by_identity,
-        record_source_failure, replace_source_snapshot, sqlite_sidecar_path,
-        verify_catalog_content,
+        Catalog, CatalogItem, CatalogScanError, CatalogSession, SCHEMA_VERSION, SourceIdentity,
+        SourceSnapshot, StorageError, inspect_catalog_file_state, list_catalog_sessions,
+        list_catalog_source_diagnostics, open_database, purge_existing_catalog_with_hooks,
+        read_catalog_preview, read_catalog_preview_by_identity, record_source_failure,
+        replace_source_snapshot,
     };
 
     fn temporary_directory() -> TempDir {
@@ -1840,53 +1665,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn catalog_content_token_matches_unchanged_main_and_rejects_mismatch() {
-        let temporary = temporary_directory();
-        let database = temporary.path().join("agentlog.sqlite3");
-        fs::write(&database, b"previewed-main").expect("write previewed main");
-        let token = CatalogContentToken::new(b"previewed-main", None);
-
-        verify_catalog_content(&database, &token, 1024).expect("match unchanged main");
-        fs::write(&database, b"different-main").expect("replace main contents");
-        assert!(matches!(
-            verify_catalog_content(&database, &token, 1024),
-            Err(StorageError::CatalogPreviewChanged { .. })
-        ));
-    }
-
-    #[test]
-    fn catalog_content_token_normalizes_empty_wal_and_rejects_wal_changes() {
-        let temporary = temporary_directory();
-        let database = temporary.path().join("agentlog.sqlite3");
-        let wal = sqlite_sidecar_path(&database, "-wal");
-        fs::write(&database, b"main").expect("write main");
-
-        let no_wal = CatalogContentToken::new(b"main", None);
-        fs::write(&wal, b"").expect("create empty WAL");
-        verify_catalog_content(&database, &no_wal, 1024)
-            .expect("absent and empty WAL are equivalent");
-        fs::write(&wal, b"appeared").expect("write appearing WAL");
-        assert!(matches!(
-            verify_catalog_content(&database, &no_wal, 1024),
-            Err(StorageError::CatalogPreviewChanged { .. })
-        ));
-
-        let with_wal = CatalogContentToken::new(b"main", Some(b"previewed-wal"));
-        fs::write(&wal, b"previewed-wal").expect("write previewed WAL");
-        verify_catalog_content(&database, &with_wal, 1024).expect("match unchanged WAL");
-        fs::write(&wal, b"different-wal").expect("change WAL contents");
-        assert!(matches!(
-            verify_catalog_content(&database, &with_wal, 1024),
-            Err(StorageError::CatalogPreviewChanged { .. })
-        ));
-        fs::remove_file(&wal).expect("remove WAL");
-        assert!(matches!(
-            verify_catalog_content(&database, &with_wal, 1024),
-            Err(StorageError::CatalogPreviewChanged { .. })
-        ));
-    }
-
     #[tokio::test]
     async fn fresh_database_creates_only_v1_catalog_tables() {
         let temporary = temporary_directory();
@@ -1946,8 +1724,6 @@ mod tests {
         let error = purge_existing_catalog_with_hooks(
             &database_path,
             expected_identity,
-            None,
-            u64::MAX,
             || {
                 fs::rename(&database_path, &displaced_path).expect("displace opened database");
                 fs::rename(&replacement_path, &database_path).expect("replace database path");
@@ -1970,54 +1746,6 @@ mod tests {
             .expect("count retained replacement rows");
         assert_eq!(retained, 1);
         replacement.close().await;
-    }
-
-    #[tokio::test]
-    async fn purge_enforces_the_file_set_bound_while_holding_the_writer_lock() {
-        let temporary = temporary_directory();
-        let database_path = temporary.path().join("agentlog.sqlite3");
-        let database = open_database(&database_path).await.expect("open catalog");
-        sqlx::query(
-            "INSERT INTO sources (provider, source_format, canonical_locator)
-             VALUES ('test', 'test', 'test://retained')",
-        )
-        .execute(&database)
-        .await
-        .expect("insert retained source");
-        database.close().await;
-        let expected_identity = inspect_catalog_file_state(&database_path)
-            .expect("inspect catalog")
-            .expect("catalog exists")
-            .identity;
-
-        let error = purge_existing_catalog_with_hooks(
-            &database_path,
-            expected_identity,
-            None,
-            0,
-            || {},
-            |_| panic!("oversized file set must fail before the measurement hook"),
-        )
-        .await
-        .expect_err("reject the locked file set above its limit");
-        assert!(matches!(
-            error,
-            StorageError::CatalogFileSetTooLarge {
-                bytes,
-                max_bytes: 0,
-                ..
-            } if bytes > 0
-        ));
-
-        let database = open_database(&database_path)
-            .await
-            .expect("reopen retained catalog");
-        let retained = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sources")
-            .fetch_one(&database)
-            .await
-            .expect("count retained rows");
-        assert_eq!(retained, 1);
-        database.close().await;
     }
 
     #[tokio::test]

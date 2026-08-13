@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Made `purge` preview the catalog promptly, confirm once, and report progress
+  while deleting the latest catalog rows under SQLite's writer lock.
+
 ## [0.1.0] - 2026-08-09
 
 This is the first release of the Rust implementation of Agentlog.

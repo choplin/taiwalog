@@ -17,7 +17,7 @@ use urushi_prompt::{Confirm, ConfirmAnswer, FieldKey, Form, FormOutcome, Group};
 use crate::{
     app::{
         SyncProgress, list_shell, paths_report, preview_purge_catalog, purge_catalog_shell,
-        purge_previewed_catalog, show_shell, sync_shell_with_progress,
+        show_shell, sync_shell_with_progress,
     },
     display::visible_text,
     paths::AppPaths,
@@ -227,17 +227,17 @@ async fn print_purge(
         .context("start purge report")?;
 
     if yes {
-        let summary = purge_catalog_shell(paths, true).await?;
+        let summary = execute_purge(&report, paths).await?;
         print_purge_report(&report, &summary, "Purged catalog")?;
         print_purge_completion(&report, &summary)?;
         return Ok(());
     }
 
     let preview = preview_purge_catalog(paths).await?;
-    print_purge_report(&report, &preview.summary, "Catalog preview")?;
-    match confirm_purge_from_terminal(&preview.summary, prompt_eligible, theme, profile)? {
+    print_purge_report(&report, &preview, "Catalog preview")?;
+    match confirm_purge_from_terminal(&preview, prompt_eligible, theme, profile)? {
         Some(true) => {
-            let summary = purge_previewed_catalog(paths, preview).await?;
+            let summary = execute_purge(&report, paths).await?;
             print_purge_completion(&report, &summary)?;
         }
         Some(false) => report
@@ -252,6 +252,31 @@ async fn print_purge(
         }
     }
     Ok(())
+}
+
+async fn execute_purge(
+    report: &RunUi,
+    paths: &AppPaths,
+) -> anyhow::Result<crate::app::PurgeSummary> {
+    let progress = report
+        .spinner("Purging catalog rows")
+        .context("start purge progress")?;
+    match purge_catalog_shell(paths, true).await {
+        Ok(summary) => {
+            progress
+                .success("Catalog rows purged")
+                .context("finish purge progress")?;
+            Ok(summary)
+        }
+        Err(error) => {
+            if let Err(report_error) = progress.error("Catalog purge failed") {
+                return Err(error.context(format!(
+                    "additionally failed to finish purge progress: {report_error}"
+                )));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn print_purge_report(

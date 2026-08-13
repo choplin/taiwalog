@@ -1,12 +1,6 @@
 //! Application workflows for Agentlog's local catalog and six read-only collectors.
 
-use std::{
-    collections::BTreeMap,
-    fs::{self, File},
-    future::Future,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, future::Future, path::PathBuf};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -15,14 +9,11 @@ use crate::{
     paths::AppPaths,
     providers::{ProviderScanReport, ProviderScanner, installed, source_descriptions},
     storage::{
-        Catalog, CatalogContentToken, CatalogFileIdentity, CatalogFileState, CatalogScanError,
-        CatalogScanProgress, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
-        SCHEMA_VERSION, StorageError, inspect_catalog_file_state, inspect_catalog_snapshot,
-        purge_existing_catalog,
+        Catalog, CatalogScanError, CatalogScanProgress, CatalogSessionPreview,
+        CatalogSessionSummary, CatalogSourceDiagnostic, SCHEMA_VERSION, StorageError,
+        inspect_catalog_file_state, inspect_existing_catalog, purge_existing_catalog,
     },
 };
-
-const PURGE_SNAPSHOT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Observable result of one read-only provider synchronization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -362,7 +353,7 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
     }
 }
 
-/// The exact Agentlog-owned catalog target described before a purge operation.
+/// The Agentlog-owned catalog contents described by a purge operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PurgeSummary {
     pub database: PathBuf,
@@ -373,96 +364,31 @@ pub struct PurgeSummary {
     pub cleared: bool,
 }
 
-/// A purge preview whose private token binds confirmation to exact content.
-pub struct PurgePreview {
-    pub summary: PurgeSummary,
-    token: PurgePreviewToken,
-}
-
-enum PurgePreviewToken {
-    Absent,
-    Present {
-        database_identity: CatalogFileIdentity,
-        content: CatalogContentToken,
-    },
-}
-
-/// Builds a read-only purge preview and retains its exact-content token.
+/// Reads the current purge counts in a short, read-only transaction.
 ///
 /// # Errors
 ///
-/// Returns an error when the catalog cannot be copied and validated safely.
-pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgePreview> {
-    let Some(target) = inspect_purge_target(&paths.database_path)? else {
-        return Ok(PurgePreview {
-            summary: empty_purge_summary(paths),
-            token: PurgePreviewToken::Absent,
-        });
+/// Returns an error when the catalog cannot be opened or validated safely.
+pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgeSummary> {
+    let Some(state) = inspect_catalog_file_state(&paths.database_path)? else {
+        return Ok(empty_purge_summary(paths));
     };
-    let counts = inspect_catalog_snapshot(&target.snapshot_database)
+    let result = inspect_existing_catalog(&paths.database_path, state.identity)
         .await
         .with_context(|| {
             format!(
-                "validate private snapshot of Agentlog-owned database {}",
+                "inspect Agentlog-owned database {} for purge",
                 paths.database_path.display()
             )
         })?;
-    Ok(PurgePreview {
-        summary: PurgeSummary {
-            database: paths.database_path.clone(),
-            sources: counts.sources,
-            sessions: counts.sessions,
-            transcript_items: counts.transcript_items,
-            approximate_bytes: target.approximate_bytes,
-            cleared: false,
-        },
-        token: PurgePreviewToken::Present {
-            database_identity: target.database_identity,
-            content: target.content_token,
-        },
+    Ok(PurgeSummary {
+        database: paths.database_path.clone(),
+        sources: result.counts.sources,
+        sessions: result.counts.sessions,
+        transcript_items: result.counts.transcript_items,
+        approximate_bytes: result.approximate_bytes,
+        cleared: false,
     })
-}
-
-/// Purges only when the locked catalog still matches an interactive preview.
-///
-/// # Errors
-///
-/// Returns an error without deleting data when the catalog changed after the
-/// preview or when the purge cannot acquire writer serialization.
-pub async fn purge_previewed_catalog(
-    paths: &AppPaths,
-    preview: PurgePreview,
-) -> anyhow::Result<PurgeSummary> {
-    match preview.token {
-        PurgePreviewToken::Absent => {
-            if inspect_catalog_file_state(&paths.database_path)?.is_some() {
-                anyhow::bail!(
-                    "Agentlog catalog changed after the purge preview; no data was deleted; rerun `agentlog purge` to review the updated catalog"
-                );
-            }
-            Ok(empty_purge_summary(paths))
-        }
-        PurgePreviewToken::Present {
-            database_identity,
-            content,
-        } => {
-            let result = purge_existing_catalog(
-                &paths.database_path,
-                database_identity,
-                Some(&content),
-                PURGE_SNAPSHOT_MAX_BYTES,
-                |_| {},
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "purge previewed Agentlog-owned database {}",
-                    paths.database_path.display()
-                )
-            })?;
-            Ok(purge_result_summary(paths, result))
-        }
-    }
 }
 
 /// Reports, and when explicitly confirmed purges, only the Agentlog-owned
@@ -473,20 +399,17 @@ pub async fn purge_previewed_catalog(
 ///
 /// # Errors
 ///
-/// Previewing reads a bounded private copy of the `SQLite` main/WAL contents,
-/// while fingerprinting the complete main/WAL/SHM file set, so it never opens
-/// or writes the live catalog. Confirmation obtains `SQLite` writer
-/// serialization, then measures the complete main/WAL/SHM file set, counts
-/// rows, and purges them while preserving the schema and database files.
+/// Previewing uses a short read-only transaction. Confirmation obtains `SQLite`
+/// writer serialization without waiting, then measures the main/WAL/SHM file
+/// set, counts rows, and purges them while preserving the schema and files.
 ///
-/// Returns an error when the database is not a regular Agentlog v1 catalog, a
-/// file changes while the private preview snapshot is taken, or an explicitly
-/// requested purge cannot acquire `SQLite`'s writer lock.
+/// Returns an error when the database is not a regular Agentlog v1 catalog or
+/// an explicitly requested purge cannot acquire `SQLite`'s writer lock.
 pub async fn purge_catalog_shell(
     paths: &AppPaths,
     confirmed: bool,
 ) -> anyhow::Result<PurgeSummary> {
-    purge_catalog_shell_with_hooks(paths, confirmed, |_| async {}, |_| {}).await
+    purge_catalog_shell_with_hooks(paths, confirmed, || async {}, |_| {}).await
 }
 
 async fn purge_catalog_shell_with_hooks<BeforeLock, BeforeLockFuture, AfterMeasurement>(
@@ -496,51 +419,27 @@ async fn purge_catalog_shell_with_hooks<BeforeLock, BeforeLockFuture, AfterMeasu
     after_measurement: AfterMeasurement,
 ) -> anyhow::Result<PurgeSummary>
 where
-    BeforeLock: FnOnce(u64) -> BeforeLockFuture,
+    BeforeLock: FnOnce() -> BeforeLockFuture,
     BeforeLockFuture: Future<Output = ()>,
     AfterMeasurement: FnOnce(crate::storage::CatalogPurgeResult),
 {
     if confirmed {
-        let Some(target) = inspect_confirmed_purge_target(&paths.database_path)? else {
+        let Some(state) = inspect_catalog_file_state(&paths.database_path)? else {
             return Ok(empty_purge_summary(paths));
         };
-        before_lock(target.approximate_bytes).await;
-        let result = purge_existing_catalog(
-            &paths.database_path,
-            target.database_identity,
-            None,
-            PURGE_SNAPSHOT_MAX_BYTES,
-            after_measurement,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "purge Agentlog-owned database {}",
-                paths.database_path.display()
-            )
-        })?;
+        before_lock().await;
+        let result =
+            purge_existing_catalog(&paths.database_path, state.identity, after_measurement)
+                .await
+                .with_context(|| {
+                    format!(
+                        "purge Agentlog-owned database {}",
+                        paths.database_path.display()
+                    )
+                })?;
         return Ok(purge_result_summary(paths, result));
     }
-
-    let Some(target) = inspect_purge_target(&paths.database_path)? else {
-        return Ok(empty_purge_summary(paths));
-    };
-    let counts = inspect_catalog_snapshot(&target.snapshot_database)
-        .await
-        .with_context(|| {
-            format!(
-                "validate private snapshot of Agentlog-owned database {}",
-                paths.database_path.display()
-            )
-        })?;
-    Ok(PurgeSummary {
-        database: paths.database_path.clone(),
-        sources: counts.sources,
-        sessions: counts.sessions,
-        transcript_items: counts.transcript_items,
-        approximate_bytes: target.approximate_bytes,
-        cleared: false,
-    })
+    preview_purge_catalog(paths).await
 }
 
 fn empty_purge_summary(paths: &AppPaths) -> PurgeSummary {
@@ -566,247 +465,6 @@ fn purge_result_summary(
         approximate_bytes: result.approximate_bytes,
         cleared: true,
     }
-}
-
-#[derive(Debug)]
-struct PurgeTarget {
-    approximate_bytes: u64,
-    database_identity: CatalogFileIdentity,
-    content_token: CatalogContentToken,
-    _snapshot_directory: tempfile::TempDir,
-    snapshot_database: PathBuf,
-}
-
-struct ConfirmedPurgeTarget {
-    approximate_bytes: u64,
-    database_identity: CatalogFileIdentity,
-}
-
-fn inspect_confirmed_purge_target(database: &Path) -> anyhow::Result<Option<ConfirmedPurgeTarget>> {
-    let Some(files) = inspect_catalog_file_set(database)? else {
-        return Ok(None);
-    };
-    let approximate_bytes =
-        catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
-    let database_identity = files
-        .first()
-        .context("catalog file set is missing its main database")?
-        .state
-        .identity;
-    Ok(Some(ConfirmedPurgeTarget {
-        approximate_bytes,
-        database_identity,
-    }))
-}
-
-fn inspect_purge_target(database: &Path) -> anyhow::Result<Option<PurgeTarget>> {
-    inspect_purge_target_with_hook(database, || {})
-}
-
-fn inspect_purge_target_with_hook(
-    database: &Path,
-    after_copy: impl FnOnce(),
-) -> anyhow::Result<Option<PurgeTarget>> {
-    let Some(files) = read_catalog_file_set(database)? else {
-        return Ok(None);
-    };
-    let approximate_bytes =
-        catalog_file_set_size(database, files.iter().map(|file| file.state.length))?;
-    let snapshot_directory = tempfile::Builder::new()
-        .prefix("agentlog-purge-")
-        .tempdir()
-        .context("create private catalog inspection snapshot")?;
-    let snapshot_database = snapshot_directory.path().join("agentlog.sqlite3");
-    for file in &files {
-        if file.suffix == Some("-shm") {
-            continue;
-        }
-        let snapshot_path = if file.is_main {
-            snapshot_database.clone()
-        } else {
-            sqlite_sidecar_path(&snapshot_database, file.suffix.expect("sidecar suffix"))
-        };
-        fs::write(&snapshot_path, &file.bytes)
-            .with_context(|| format!("write private snapshot {}", snapshot_path.display()))?;
-    }
-    after_copy();
-    validate_catalog_file_set(database, &files)?;
-
-    let main = files
-        .iter()
-        .find(|file| file.is_main)
-        .context("catalog file set is missing its main database")?;
-    let wal = files
-        .iter()
-        .find(|file| file.suffix == Some("-wal"))
-        .map(|file| file.bytes.as_slice());
-
-    Ok(Some(PurgeTarget {
-        approximate_bytes,
-        database_identity: main.state.identity,
-        content_token: CatalogContentToken::new(&main.bytes, wal),
-        _snapshot_directory: snapshot_directory,
-        snapshot_database,
-    }))
-}
-
-fn catalog_file_set_size(
-    database: &Path,
-    lengths: impl IntoIterator<Item = u64>,
-) -> anyhow::Result<u64> {
-    let approximate_bytes = lengths.into_iter().try_fold(0_u64, |total, length| {
-        total
-            .checked_add(length)
-            .context("database size exceeds supported range")
-    })?;
-    if approximate_bytes > PURGE_SNAPSHOT_MAX_BYTES {
-        anyhow::bail!(
-            "refusing to inspect {}; the SQLite file set exceeds the {} byte snapshot limit",
-            database.display(),
-            PURGE_SNAPSHOT_MAX_BYTES
-        );
-    }
-    Ok(approximate_bytes)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CatalogFile {
-    path: PathBuf,
-    suffix: Option<&'static str>,
-    is_main: bool,
-    state: CatalogFileState,
-    bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CatalogFileDescriptor {
-    path: PathBuf,
-    suffix: Option<&'static str>,
-    is_main: bool,
-    state: CatalogFileState,
-}
-
-fn inspect_catalog_file_set(database: &Path) -> anyhow::Result<Option<Vec<CatalogFileDescriptor>>> {
-    let Some(main) = inspect_catalog_file_state(database)? else {
-        return Ok(None);
-    };
-    let mut files = vec![CatalogFileDescriptor {
-        path: database.to_path_buf(),
-        suffix: None,
-        is_main: true,
-        state: main,
-    }];
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sqlite_sidecar_path(database, suffix);
-        if let Some(state) = inspect_catalog_file_state(&sidecar)? {
-            files.push(CatalogFileDescriptor {
-                path: sidecar,
-                state,
-                is_main: false,
-                suffix: Some(suffix),
-            });
-        }
-    }
-    Ok(Some(files))
-}
-
-fn read_catalog_file_set(database: &Path) -> anyhow::Result<Option<Vec<CatalogFile>>> {
-    let Some(descriptors) = inspect_catalog_file_set(database)? else {
-        return Ok(None);
-    };
-    catalog_file_set_size(
-        database,
-        descriptors.iter().map(|descriptor| descriptor.state.length),
-    )?;
-    descriptors
-        .iter()
-        .map(read_catalog_file)
-        .collect::<anyhow::Result<Vec<_>>>()
-        .map(Some)
-}
-
-fn read_catalog_file(descriptor: &CatalogFileDescriptor) -> anyhow::Result<CatalogFile> {
-    let file = File::open(&descriptor.path)
-        .with_context(|| format!("read Agentlog database file {}", descriptor.path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("inspect opened database file {}", descriptor.path.display()))?;
-    let opened_state = CatalogFileState::from_metadata(&descriptor.path, &opened_metadata)?;
-    if opened_state != descriptor.state {
-        return catalog_changed();
-    }
-
-    let read_limit = descriptor
-        .state
-        .length
-        .checked_add(1)
-        .context("database size exceeds supported range")?;
-    let mut bytes = Vec::new();
-    file.take(read_limit)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read Agentlog database file {}", descriptor.path.display()))?;
-    if u64::try_from(bytes.len()).ok() != Some(descriptor.state.length) {
-        return catalog_changed();
-    }
-
-    Ok(CatalogFile {
-        path: descriptor.path.clone(),
-        suffix: descriptor.suffix,
-        is_main: descriptor.is_main,
-        state: descriptor.state,
-        bytes,
-    })
-}
-
-fn validate_catalog_file_set(database: &Path, expected: &[CatalogFile]) -> anyhow::Result<()> {
-    let Some(current) = inspect_catalog_file_set(database)? else {
-        return catalog_changed();
-    };
-    catalog_file_set_size(
-        database,
-        current.iter().map(|descriptor| descriptor.state.length),
-    )?;
-    if !catalog_file_descriptors_match(&current, expected) {
-        return catalog_changed();
-    }
-
-    for (descriptor, expected) in current.iter().zip(expected) {
-        if read_catalog_file(descriptor)?.bytes != expected.bytes {
-            return catalog_changed();
-        }
-    }
-    let Some(final_state) = inspect_catalog_file_set(database)? else {
-        return catalog_changed();
-    };
-    if !catalog_file_descriptors_match(&final_state, expected) {
-        return catalog_changed();
-    }
-    Ok(())
-}
-
-fn catalog_file_descriptors_match(
-    current: &[CatalogFileDescriptor],
-    expected: &[CatalogFile],
-) -> bool {
-    current.len() == expected.len()
-        && current.iter().zip(expected).all(|(current, expected)| {
-            current.path == expected.path
-                && current.suffix == expected.suffix
-                && current.is_main == expected.is_main
-                && current.state == expected.state
-        })
-}
-
-fn catalog_changed<T>() -> anyhow::Result<T> {
-    Err(anyhow::anyhow!(
-        "Agentlog database file set changed while preparing a read-only purge preview; retry the command"
-    ))
-}
-
-fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
-    let mut path = database.as_os_str().to_os_string();
-    path.push(suffix);
-    PathBuf::from(path)
 }
 
 #[cfg(test)]
@@ -845,10 +503,8 @@ mod tests {
     }
 
     use super::{
-        PURGE_SNAPSHOT_MAX_BYTES, ProviderSyncResult, SyncProgress, build_sync_summary,
-        catalog_file_set_size, diagnostics_shell, inspect_catalog_file_set, inspect_purge_target,
-        inspect_purge_target_with_hook, list_shell, preview_purge_catalog, purge_catalog_shell,
-        purge_catalog_shell_with_hooks, purge_previewed_catalog, sqlite_sidecar_path, sync_scanner,
+        ProviderSyncResult, SyncProgress, build_sync_summary, diagnostics_shell, list_shell,
+        preview_purge_catalog, purge_catalog_shell, purge_catalog_shell_with_hooks, sync_scanner,
         sync_scanner_with_progress, sync_shell,
     };
 
@@ -1130,17 +786,6 @@ mod tests {
         .execute(&writer)
         .await
         .expect("write catalog WAL frame");
-        let live_shm = sqlite_sidecar_path(&paths.database_path, "-shm");
-        assert!(live_shm.is_file(), "live WAL database has an SHM sidecar");
-        let private_target = inspect_purge_target(&paths.database_path)
-            .expect("copy private purge target")
-            .expect("catalog target exists");
-        assert!(
-            !sqlite_sidecar_path(&private_target.snapshot_database, "-shm").exists(),
-            "live SHM is not copied into the private snapshot"
-        );
-        drop(private_target);
-        let database_before = directory_fingerprint(&paths.data_dir);
         let config_before = fingerprint(&paths.config_path);
         let source_before = fingerprint(&source);
 
@@ -1151,21 +796,26 @@ mod tests {
         assert_eq!(preview.transcript_items, 1);
         assert!(preview.approximate_bytes > 0);
         assert!(!preview.cleared);
-        assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
 
         let without_yes = purge_catalog_shell(&paths, false)
             .await
             .expect("reject unconfirmed purge");
         assert!(!without_yes.cleared);
         assert!(paths.database_path.is_file());
-        assert_eq!(directory_fingerprint(&paths.data_dir), database_before);
+        assert_eq!(
+            list_shell(&paths, 10)
+                .await
+                .expect("list retained catalog")
+                .len(),
+            1
+        );
         assert_eq!(fingerprint(&paths.config_path), config_before);
         assert_eq!(fingerprint(&source), source_before);
         writer.close().await;
     }
 
     #[tokio::test]
-    async fn previewed_purge_rejects_an_intervening_sync_commit_without_deleting_it() {
+    async fn confirmed_purge_includes_an_intervening_sync_commit_in_actual_counts() {
         let (_temporary, paths, source) = scanned_purge_fixture().await;
         let preview = preview_purge_catalog(&paths)
             .await
@@ -1180,31 +830,26 @@ mod tests {
         )
         .expect("write provider source added after preview");
         sync_shell(&paths).await.expect("commit intervening sync");
-        let error = purge_previewed_catalog(&paths, preview)
+        let cleared = purge_catalog_shell(&paths, true)
             .await
-            .expect_err("reject catalog changed since preview");
+            .expect("purge current catalog after preview");
 
-        assert!(format!("{error:#}").contains("rerun `agentlog purge`"));
-        let sessions = list_shell(&paths, 10)
-            .await
-            .expect("read catalog after rejected purge");
-        assert_eq!(
-            sessions.len(),
-            2,
-            "intervening sync result remains cataloged"
+        assert_eq!(preview.sessions, 1);
+        assert_eq!(cleared.sessions, 2);
+        assert!(
+            list_shell(&paths, 10)
+                .await
+                .expect("list purged catalog")
+                .is_empty()
         );
     }
 
     #[tokio::test]
-    async fn previewed_purge_clears_the_unchanged_exact_catalog() {
+    async fn confirmed_purge_clears_the_current_catalog() {
         let (_temporary, paths, _source) = scanned_purge_fixture().await;
-        let preview = preview_purge_catalog(&paths)
+        let cleared = purge_catalog_shell(&paths, true)
             .await
-            .expect("preview unchanged catalog");
-
-        let cleared = purge_previewed_catalog(&paths, preview)
-            .await
-            .expect("purge exact previewed catalog");
+            .expect("purge catalog");
 
         assert_eq!(cleared.sources, 1);
         assert_eq!(cleared.sessions, 1);
@@ -1232,42 +877,9 @@ mod tests {
             .await
             .expect("preview diagnostic source");
 
-        assert_eq!(preview.summary.sources, 2);
-        assert_eq!(preview.summary.sessions, 1);
-        assert_eq!(preview.summary.transcript_items, 1);
-    }
-
-    #[tokio::test]
-    async fn purge_preview_rejects_a_file_set_presence_change_during_snapshot() {
-        let (temporary, paths, _source) = scanned_purge_fixture().await;
-        let shm = sqlite_sidecar_path(&paths.database_path, "-shm");
-        let moved_shm = temporary.path().join("moved-agentlog-shm");
-        let shm_was_present = shm.exists();
-
-        let error = inspect_purge_target_with_hook(&paths.database_path, || {
-            if shm_was_present {
-                fs::rename(&shm, &moved_shm).expect("move existing SHM during snapshot");
-            } else {
-                fs::write(&shm, b"appeared during snapshot").expect("create SHM during snapshot");
-            }
-        })
-        .expect_err("reject changed SQLite file-set presence");
-
-        assert!(format!("{error:#}").contains("file set changed"));
-    }
-
-    #[test]
-    fn purge_snapshot_rejects_an_oversized_sparse_file_before_reading_it() {
-        let temporary = temporary_directory();
-        let database = temporary.path().join("agentlog.sqlite3");
-        let file = fs::File::create(&database).expect("create sparse database");
-        file.set_len(PURGE_SNAPSHOT_MAX_BYTES + 1)
-            .expect("size sparse database");
-
-        let error =
-            inspect_purge_target(&database).expect_err("reject oversized metadata before reading");
-
-        assert!(format!("{error:#}").contains("exceeds the 536870912 byte snapshot limit"));
+        assert_eq!(preview.sources, 2);
+        assert_eq!(preview.sessions, 1);
+        assert_eq!(preview.transcript_items, 1);
     }
 
     #[tokio::test]
@@ -1276,18 +888,13 @@ mod tests {
         let writer = open_database(&paths.database_path)
             .await
             .expect("open catalog for intervening write");
-        let preflight_size = Arc::new(Mutex::new(None));
-        let observed_preflight_size = Arc::clone(&preflight_size);
-        let locked_size = Arc::new(Mutex::new(None));
-        let measured_size = Arc::clone(&locked_size);
-        let measured_path = paths.database_path.clone();
+        let locked_result = Arc::new(Mutex::new(None));
+        let measured_result = Arc::clone(&locked_result);
 
         let cleared = purge_catalog_shell_with_hooks(
             &paths,
             true,
-            move |approximate_bytes| async move {
-                *observed_preflight_size.lock().expect("lock preflight size") =
-                    Some(approximate_bytes);
+            move || async move {
                 let source_id = sqlx::query(
                     "INSERT INTO sources (provider, source_format, canonical_locator)
                      VALUES ('test', 'test', 'test://transaction-counts')",
@@ -1316,33 +923,19 @@ mod tests {
                 writer.close().await;
             },
             move |result| {
-                let files = inspect_catalog_file_set(&measured_path)
-                    .expect("inspect locked catalog file set")
-                    .expect("locked catalog exists");
-                let current_size = catalog_file_set_size(
-                    &measured_path,
-                    files.iter().map(|file| file.state.length),
-                )
-                .expect("measure locked catalog file set");
-                assert_eq!(result.approximate_bytes, current_size);
-                *measured_size.lock().expect("lock measured size") = Some(current_size);
+                *measured_result.lock().expect("lock purge result") = Some(result);
             },
         )
         .await
         .expect("purge current locked transaction contents");
         assert_eq!(cleared.sessions, 2);
         assert_eq!(cleared.transcript_items, 2);
-        assert_eq!(
-            Some(cleared.approximate_bytes),
-            *locked_size.lock().expect("read measured size")
-        );
-        assert!(
-            preflight_size
-                .lock()
-                .expect("read preflight size")
-                .is_some(),
-            "confirmed purge must preflight the file set before the hook"
-        );
+        let result = locked_result
+            .lock()
+            .expect("read purge result")
+            .expect("measured purge");
+        assert_eq!(cleared.approximate_bytes, result.approximate_bytes);
+        assert!(cleared.approximate_bytes > 0);
         assert!(cleared.cleared);
     }
 
