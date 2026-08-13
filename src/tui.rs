@@ -26,7 +26,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use tokio::task::JoinHandle;
-use urushi::{ComponentRole, RatatuiStyle, TerminalProfile, Theme};
+use urushi::{ComponentRole, TerminalProfile, Theme};
+use urushi_tui::RatatuiStyle;
 
 use crate::{
     app::{

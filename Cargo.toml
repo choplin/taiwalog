@@ -35,8 +35,9 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 toml = "0.8"
 tempfile = "3.24"
-urushi = { version = "0.1.0", features = ["ratatui", "terminal"] }
+urushi = { version = "0.1.0", features = ["terminal"] }
 urushi-prompt = "0.1.0"
+urushi-tui = "0.1.0"
 
 [dev-dependencies]
 portable-pty = "0.9"
