@@ -79,6 +79,13 @@ fn json_session_count(output: &std::process::Output) -> usize {
         .len()
 }
 
+fn report_field<'a>(report: &'a str, label: &str) -> &'a str {
+    report
+        .lines()
+        .find(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("missing report field {label}"))
+}
+
 #[tokio::test]
 async fn purge_process_previews_and_removes_a_nonempty_catalog() {
     let temporary = temporary_directory();
@@ -102,16 +109,14 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
         "purge does not have a product output"
     );
     let preview_report = String::from_utf8(preview.stderr).expect("UTF-8 preview report");
-    assert!(preview_report.contains(&format!(
-        "Agentlog-owned database target: {}",
-        database.display()
-    )));
-    assert!(preview_report.contains("Catalog sources: 1"));
-    assert!(preview_report.contains("Catalog sessions: 1"));
-    assert!(preview_report.contains("Transcript items: 1"));
+    assert!(preview_report.contains("Database target"));
+    assert!(preview_report.contains(&database.display().to_string()));
+    assert!(report_field(&preview_report, "Catalog sources").ends_with('1'));
+    assert!(report_field(&preview_report, "Catalog sessions").ends_with('1'));
+    assert!(report_field(&preview_report, "Transcript items").ends_with('1'));
     let size_line = preview_report
         .lines()
-        .find(|line| line.starts_with("Approximate database size: "))
+        .find(|line| line.contains("Approximate size"))
         .expect("purge size report");
     assert!(
         [" B (", " KiB (", " MiB (", " GiB ("]
@@ -179,11 +184,13 @@ fn sync_process_keeps_json_stdout_clean_and_bounds_noninteractive_progress() {
         .expect("sync JSON remains the complete stdout product");
     assert_eq!(summary["sources_refreshed"], 1);
     let report = String::from_utf8(output.stderr).expect("UTF-8 sync report");
-    assert!(report.contains("[~] Provider gemini: starting 1 candidate sources"));
-    assert!(report.contains("[~] Provider gemini: discovering sources"));
-    assert!(report.contains("[+] Provider gemini: candidates=1, refreshed=1"));
+    assert!(report.contains("Provider gemini: discovering sources"));
+    assert!(report.contains("Provider gemini: discovered 1 candidate sources"));
+    assert!(report.contains("Provider gemini: candidates=1, refreshed=1"));
+    assert!(report.contains("Sync summary"));
+    let report_lines = report.lines().count();
     assert!(
-        report.lines().count() <= 18,
-        "noninteractive progress reports bounded provider discovery, candidate, and completion events"
+        report_lines <= 44,
+        "noninteractive report has {report_lines} lines; expected provider-level events plus the final summary"
     );
 }

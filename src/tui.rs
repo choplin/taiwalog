@@ -21,11 +21,12 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use tokio::task::JoinHandle;
+use urushi::{ComponentRole, RatatuiStyle, TerminalProfile, Theme};
 
 use crate::{
     app::{
@@ -37,6 +38,7 @@ use crate::{
     storage::{
         CatalogItemView, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
     },
+    theme::AgentlogThemeExtension,
 };
 
 const BROWSE_SESSION_LIMIT: u32 = 500;
@@ -57,10 +59,14 @@ static TERMINAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Returns an error when terminal setup, input, drawing, or normal terminal
 /// restoration fails. Catalog read failures remain visible and retryable in UI.
-pub async fn run(paths: &AppPaths) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    paths: &AppPaths,
+    theme: &Theme<AgentlogThemeExtension>,
+    profile: &TerminalProfile,
+) -> anyhow::Result<()> {
     let anchor_now = unix_now().context("read browse activity-date anchor")?;
     let mut terminal = TerminalSession::enter()?;
-    let mut state = BrowseState::new(anchor_now);
+    let mut state = BrowseState::with_styles(anchor_now, TuiStyles::resolve(theme, *profile));
     let mut preview_loader = PreviewLoader::new();
     let mut sync_loader = SyncLoader::new();
     if let Some(id) = load_sessions(paths, &mut state).await {
@@ -623,8 +629,52 @@ enum BrowseEffect {
     LoadDiagnostics,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TuiStyles {
+    body: Style,
+    muted: Style,
+    accent: Style,
+    success: Style,
+    warning: Style,
+    error: Style,
+    option: Style,
+    option_selected: Style,
+    help: Style,
+    panel: Style,
+    panel_border: Style,
+    panel_focused: Style,
+    panel_focused_border: Style,
+}
+
+impl TuiStyles {
+    fn resolve(theme: &Theme<AgentlogThemeExtension>, profile: TerminalProfile) -> Self {
+        let component = |role| {
+            let resolved = profile.resolve_style(theme.style(role));
+            RatatuiStyle::from(&resolved)
+        };
+        let panel = component(ComponentRole::Panel);
+        let panel_focused = component(ComponentRole::PanelFocused);
+        Self {
+            body: component(ComponentRole::Body).into_inner(),
+            muted: component(ComponentRole::Muted).into_inner(),
+            accent: component(ComponentRole::Accent).into_inner(),
+            success: component(ComponentRole::Success).into_inner(),
+            warning: component(ComponentRole::Warning).into_inner(),
+            error: component(ComponentRole::Error).into_inner(),
+            option: component(ComponentRole::PromptOption).into_inner(),
+            option_selected: component(ComponentRole::PromptOptionSelected).into_inner(),
+            help: component(ComponentRole::PromptHelp).into_inner(),
+            panel: panel.into_inner(),
+            panel_border: panel.border_style(),
+            panel_focused: panel_focused.into_inner(),
+            panel_focused_border: panel_focused.border_style(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BrowseState {
+    styles: TuiStyles,
     anchor_now: i64,
     loaded: Vec<CatalogSessionSummary>,
     filtered: Vec<CatalogSessionSummary>,
@@ -679,8 +729,14 @@ struct SyncProgressLine {
 }
 
 impl BrowseState {
+    #[cfg(test)]
     fn new(anchor_now: i64) -> Self {
+        Self::with_styles(anchor_now, TuiStyles::default())
+    }
+
+    fn with_styles(anchor_now: i64, styles: TuiStyles) -> Self {
         Self {
+            styles,
             anchor_now,
             loaded: Vec::new(),
             filtered: Vec::new(),
@@ -1323,11 +1379,19 @@ fn render(frame: &mut Frame, state: &mut BrowseState) {
             "Terminal too small",
             "Resize to at least 40 columns by 10 rows.",
             "q quit",
+            state.styles,
         );
         return;
     }
     if let Some(error) = &state.catalog_error {
-        render_message(frame, area, "Catalog error", error, "r retry | q quit");
+        render_message(
+            frame,
+            area,
+            "Catalog error",
+            error,
+            "r retry | q quit",
+            state.styles,
+        );
         return;
     }
     match state.view {
@@ -1344,7 +1408,7 @@ fn render(frame: &mut Frame, state: &mut BrowseState) {
         Overlay::Help => {
             let area = overlay_area(area);
             frame.render_widget(Clear, area);
-            render_help(frame, area);
+            render_help(frame, area, state.styles);
         }
         Overlay::Diagnostics => {
             let area = overlay_area(area);
@@ -1365,6 +1429,7 @@ fn render_browse(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
                 "{} | f refine | ? help | ! diagnostics | r sync | q quit",
                 sync_status_line(state)
             ),
+            state.styles,
         );
         return;
     }
@@ -1565,15 +1630,12 @@ fn render_session_list(frame: &mut Frame, area: Rect, state: &mut BrowseState, w
         .map(|row| match row {
             VisibleRow::Header(header) => ListItem::new(Line::styled(
                 format!("-- {} --", visible_text(header.label())),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                state.styles.accent,
             )),
-            VisibleRow::Session(session) => ListItem::new(Line::from(session_row(
-                session,
-                wide,
-                usize::from(area.width.saturating_sub(4)),
-            ))),
+            VisibleRow::Session(session) => ListItem::new(Line::styled(
+                session_row(session, wide, usize::from(area.width.saturating_sub(4))),
+                state.styles.option,
+            )),
         })
         .collect::<Vec<_>>();
     let title = format!(
@@ -1584,13 +1646,14 @@ fn render_session_list(frame: &mut Frame, area: Rect, state: &mut BrowseState, w
         state.grouping.label()
     );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::styled(title, state.styles.accent))
+                .style(state.styles.panel_focused)
+                .border_style(state.styles.panel_focused_border),
         )
+        .highlight_style(state.styles.option_selected)
         .highlight_symbol("> ");
     let mut list_state = ListState::default().with_offset(state.list_offset);
     list_state.select(state.selected_row());
@@ -1600,7 +1663,8 @@ fn render_session_list(frame: &mut Frame, area: Rect, state: &mut BrowseState, w
     frame.render_widget(
         Paragraph::new(
             "f refine | ? help | ! diagnostics | j/k select | d/u half page | Enter preview | r sync | q quit",
-        ),
+        )
+        .style(state.styles.help),
         regions[1],
     );
 }
@@ -1614,7 +1678,8 @@ fn render_full_preview(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
     frame.render_widget(
         Paragraph::new(
             "f refine | ? help | ! diagnostics | j/k scroll | d/u half page | PgUp/PgDn | g/G | r sync | Esc back | q quit",
-        ),
+        )
+        .style(state.styles.help),
         regions[1],
     );
 }
@@ -1623,37 +1688,57 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &mut BrowseState, title:
     state.preview_viewport_rows = usize::from(area.height.saturating_sub(2));
     state.preview_scroll = state.preview_scroll.min(preview_bottom_scroll(state));
     let content = if let Some(error) = &state.preview_error {
-        Paragraph::new(visible_text(error))
+        Paragraph::new(visible_text(error)).style(state.styles.error)
     } else if let Some(preview) = &state.preview {
-        Paragraph::new(preview_lines(preview)).scroll((state.preview_scroll, 0))
+        Paragraph::new(preview_lines(preview, state.styles)).scroll((state.preview_scroll, 0))
     } else {
-        Paragraph::new("Loading selected session preview...")
+        Paragraph::new("Loading selected session preview...").style(state.styles.muted)
     };
     frame.render_widget(
         content
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::styled(title, state.styles.accent))
+                    .style(state.styles.panel)
+                    .border_style(state.styles.panel_border),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 fn preview_visual_line_count(preview: &CatalogSessionPreview, width: u16) -> usize {
-    Paragraph::new(preview_lines(preview))
+    Paragraph::new(preview_lines(preview, TuiStyles::default()))
         .wrap(Wrap { trim: false })
         .line_count(width)
 }
-fn render_message(frame: &mut Frame, area: Rect, title: &str, message: &str, controls: &str) {
+fn render_message(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: &str,
+    controls: &str,
+    styles: TuiStyles,
+) {
     let regions = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(area);
     frame.render_widget(
         Paragraph::new(visible_text(message))
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .style(styles.body)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::styled(title, styles.accent))
+                    .style(styles.panel_focused)
+                    .border_style(styles.panel_focused_border),
+            )
             .wrap(Wrap { trim: false }),
         regions[0],
     );
-    frame.render_widget(Paragraph::new(controls), regions[1]);
+    frame.render_widget(Paragraph::new(controls).style(styles.help), regions[1]);
 }
 fn overlay_area(area: Rect) -> Rect {
     let mx = if area.width >= 80 { area.width / 8 } else { 1 };
@@ -1691,13 +1776,14 @@ fn render_refine(frame: &mut Frame, area: Rect, state: &mut BrowseState, step: R
         .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(area);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::styled(title, state.styles.accent))
+                .style(state.styles.panel_focused)
+                .border_style(state.styles.panel_focused_border),
         )
+        .highlight_style(state.styles.option_selected)
         .highlight_symbol("> ");
     let mut list_state = ListState::default().with_offset(state.refine_offset);
     list_state.select((!options.is_empty()).then_some(state.refine_cursor));
@@ -1706,7 +1792,8 @@ fn render_refine(frame: &mut Frame, area: Rect, state: &mut BrowseState, step: R
     frame.render_widget(
         Paragraph::new(
             "Space toggle | Tab/Enter next | BackTab prev | x clear | C reset | Esc close",
-        ),
+        )
+        .style(state.styles.help),
         regions[1],
     );
 }
@@ -1762,13 +1849,14 @@ fn refine_options(state: &BrowseState, step: RefineStep) -> Vec<(String, bool)> 
             .collect(),
     }
 }
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, area: Rect, styles: TuiStyles) {
     render_message(
         frame,
         area,
         "Help",
         "f Refine; j/k move; Space toggles facets/date; Tab/Enter next refine step; BackTab previous; x clear step; C clear all and Recent; ! diagnostics; ? help; Esc closes overlays; q quits.",
         "Esc close | q quit",
+        styles,
     );
 }
 fn render_diagnostics(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
@@ -1788,17 +1876,24 @@ fn render_diagnostics(frame: &mut Frame, area: Rect, state: &mut BrowseState) {
         .min(u16::try_from(bottom).unwrap_or(u16::MAX));
     frame.render_widget(
         Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .style(state.styles.body)
             .scroll((state.diagnostics_scroll, 0))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(selected_summary.unwrap_or_else(|| "Diagnostics".to_owned())),
+                    .title(Line::styled(
+                        selected_summary.unwrap_or_else(|| "Diagnostics".to_owned()),
+                        state.styles.accent,
+                    ))
+                    .style(state.styles.panel_focused)
+                    .border_style(state.styles.panel_focused_border),
             )
             .wrap(Wrap { trim: false }),
         regions[0],
     );
     frame.render_widget(
-        Paragraph::new("j/k scroll | PgUp/PgDn | g/G | Esc close | q quit"),
+        Paragraph::new("j/k scroll | PgUp/PgDn | g/G | Esc close | q quit")
+            .style(state.styles.help),
         regions[1],
     );
 }
@@ -1866,60 +1961,73 @@ fn diagnostics_visual_line_count(lines: &[String], width: u16) -> usize {
         .line_count(width)
 }
 
-fn preview_lines(preview: &CatalogSessionPreview) -> Vec<Line<'static>> {
+fn preview_lines(preview: &CatalogSessionPreview, styles: TuiStyles) -> Vec<Line<'static>> {
     let session = &preview.session;
     let mut lines = vec![
-        Line::from(Span::styled(
-            session_title(session),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "{} | {} | {} | source: {}",
-            visible_text(&session.provider),
-            visible_text(&session.source_format),
-            visible_text(&session.session_key),
-            visible_text(&session.source_diagnostic_status)
-        )),
+        Line::from(Span::styled(session_title(session), styles.accent)),
+        Line::styled(
+            format!(
+                "{} | {} | {} | source: {}",
+                visible_text(&session.provider),
+                visible_text(&session.source_format),
+                visible_text(&session.session_key),
+                visible_text(&session.source_diagnostic_status)
+            ),
+            styles.muted,
+        ),
     ];
-    append_metadata(&mut lines, "Repository", session.repository.as_deref());
-    append_metadata(&mut lines, "Directory", session.cwd.as_deref());
-    append_metadata(&mut lines, "Model", session.model.as_deref());
-    append_metadata(&mut lines, "Execution", session.execution_kind.as_deref());
+    append_metadata(
+        &mut lines,
+        "Repository",
+        session.repository.as_deref(),
+        styles.muted,
+    );
+    append_metadata(
+        &mut lines,
+        "Directory",
+        session.cwd.as_deref(),
+        styles.muted,
+    );
+    append_metadata(&mut lines, "Model", session.model.as_deref(), styles.muted);
+    append_metadata(
+        &mut lines,
+        "Execution",
+        session.execution_kind.as_deref(),
+        styles.muted,
+    );
     lines.push(Line::from(""));
     for item in &preview.items {
         match item {
-            CatalogItemView::UserText { content } => append_text(
-                &mut lines,
-                "user",
-                content,
-                Style::default().fg(Color::Cyan),
-            ),
-            CatalogItemView::AssistantText { content } => append_text(
-                &mut lines,
-                "assistant",
-                content,
-                Style::default().fg(Color::Green),
-            ),
+            CatalogItemView::UserText { content } => {
+                append_text(&mut lines, "user", content, styles.accent);
+            }
+            CatalogItemView::AssistantText { content } => {
+                append_text(&mut lines, "assistant", content, styles.success);
+            }
             CatalogItemView::ToolMarker { name, status } => lines.push(Line::styled(
                 format!(
                     "tool: {} ({})",
                     visible_text(name),
                     visible_text(status.as_deref().unwrap_or("unknown"))
                 ),
-                Style::default().fg(Color::Yellow),
+                styles.warning,
             )),
         }
     }
     if preview.items_truncated {
-        lines.push(Line::from(
+        lines.push(Line::styled(
             "Preview is limited to the first 80 catalog items.",
+            styles.muted,
         ));
     }
     lines
 }
-fn append_metadata(lines: &mut Vec<Line<'static>>, label: &str, value: Option<&str>) {
+fn append_metadata(lines: &mut Vec<Line<'static>>, label: &str, value: Option<&str>, style: Style) {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
-        lines.push(Line::from(format!("{label}: {}", visible_text(value))));
+        lines.push(Line::styled(
+            format!("{label}: {}", visible_text(value)),
+            style,
+        ));
     }
 }
 fn append_text(lines: &mut Vec<Line<'static>>, label: &str, text: &str, style: Style) {
@@ -2064,13 +2172,51 @@ mod tests {
         },
     };
 
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::{Color, Modifier},
+    };
+    use urushi::{AnsiPolicy, ColorProfile};
 
-    use crate::storage::CatalogItemView;
+    use crate::{
+        storage::CatalogItemView,
+        theme::{DEFAULT_COLOR_SCHEME, theme_set},
+    };
 
     use super::*;
 
     static LIFECYCLE_TEST_SERIALIZER: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn tui_styles_share_theme_colors_and_preserve_no_color_focus() {
+        let themes = theme_set();
+        let theme = themes.select(DEFAULT_COLOR_SCHEME);
+        let colored = TuiStyles::resolve(
+            theme,
+            TerminalProfile::new(ColorProfile::TrueColor, AnsiPolicy::Enabled),
+        );
+        assert_eq!(colored.option_selected.fg, Some(Color::Rgb(20, 24, 28)));
+        assert_eq!(colored.option_selected.bg, Some(Color::Rgb(100, 170, 255)));
+        assert_eq!(
+            colored.panel_focused_border.fg,
+            Some(Color::Rgb(100, 170, 255))
+        );
+
+        let no_color = TuiStyles::resolve(
+            theme,
+            TerminalProfile::new(ColorProfile::Monochrome, AnsiPolicy::Enabled),
+        );
+        assert_eq!(no_color.option_selected.fg, None);
+        assert_eq!(no_color.option_selected.bg, None);
+        assert!(
+            no_color
+                .option_selected
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(no_color.panel_focused_border.fg, None);
+    }
 
     fn serialize_lifecycle_test() -> MutexGuard<'static, ()> {
         LIFECYCLE_TEST_SERIALIZER

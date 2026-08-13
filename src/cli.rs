@@ -1,7 +1,6 @@
 //! Command-line transport for Agentlog application workflows.
 
 use std::{
-    env,
     fs::OpenOptions,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -9,6 +8,11 @@ use std::{
 
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
+use urushi::{
+    ComponentRole, ComponentStyles, Line, OutputMode, ProgressBar, Spinner, StderrTerminal,
+    Summary, TerminalProfile, Theme, View, Warning, wrap_text,
+};
+use urushi_prompt::{Confirm, ConfirmAnswer, FieldKey, Form, FormOutcome, Group};
 
 use crate::{
     app::{
@@ -18,6 +22,7 @@ use crate::{
     display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
+    theme::{AgentlogThemeExtension, DEFAULT_COLOR_SCHEME, theme_set},
     tui,
 };
 
@@ -87,86 +92,201 @@ pub async fn run() -> anyhow::Result<()> {
         return Ok(());
     };
     let paths = AppPaths::resolve(home).context("resolve Agentlog-owned paths")?;
+    let themes = theme_set();
+    let theme = themes.select(DEFAULT_COLOR_SCHEME);
 
     match command {
-        Command::Paths { json } => print_paths(&paths, json),
-        Command::Sync { json } => print_sync(&paths, json).await,
-        Command::List { limit, json } => print_list(&paths, limit, json).await,
-        Command::Show { session_id, json } => print_show(&paths, session_id, json).await,
-        Command::Purge { yes } => print_purge(&paths, yes).await,
-        Command::Browse => tui::run(&paths).await,
+        Command::Paths { json } => print_paths(&paths, json, theme),
+        Command::Sync { json } => print_sync(&paths, json, theme).await,
+        Command::List { limit, json } => print_list(&paths, limit, json, theme).await,
+        Command::Show { session_id, json } => print_show(&paths, session_id, json, theme).await,
+        Command::Purge { yes } => print_purge(&paths, yes, theme).await,
+        Command::Browse => {
+            let profile = TerminalProfile::detect_for(&io::stderr());
+            tui::run(&paths, theme, &profile).await
+        }
     }
 }
 
-async fn print_purge(paths: &AppPaths, yes: bool) -> anyhow::Result<()> {
-    let prompt_eligible = !yes && interactive_terminal();
-    let rich_report = prompt_eligible || cliclack_chrome_allowed();
+/// Agentlog's run-level composition over reusable urushi components.
+///
+/// The rails and start/end vocabulary belong to this CLI workflow, while
+/// styling, stable component views, ANSI rendering, and live-region lifecycle
+/// remain owned by urushi.
+struct RunUi {
+    terminal: StderrTerminal,
+    styles: ComponentStyles,
+}
 
-    if rich_report {
-        cliclack::intro("Purge Agentlog catalog").context("start purge report")?;
+impl RunUi {
+    fn new(theme: &Theme<AgentlogThemeExtension>) -> Self {
+        Self {
+            terminal: StderrTerminal::detect(),
+            styles: theme.components().clone(),
+        }
     }
+
+    const fn mode(&self) -> OutputMode {
+        self.terminal.mode()
+    }
+
+    fn start(&self, title: impl AsRef<str>) -> io::Result<()> {
+        let accent = self.styles.style(ComponentRole::Accent).clone();
+        let muted = self.styles.style(ComponentRole::Muted).clone();
+        self.terminal.write(&View::line(
+            Line::new()
+                .span("┌", accent.clone())
+                .span("  ", muted)
+                .span(title.as_ref(), accent),
+        ))
+    }
+
+    fn summary(&self, summary: &Summary) -> io::Result<()> {
+        self.terminal
+            .write(&summary.view(&self.styles, self.terminal.width()))
+    }
+
+    fn warning(&self, message: impl Into<String>) -> io::Result<()> {
+        self.terminal
+            .write(&Warning::new("Warning", message).view(&self.styles, self.terminal.width()))
+    }
+
+    fn finish_success(&self, message: impl AsRef<str>) -> io::Result<()> {
+        self.finish("✓", ComponentRole::Success, message.as_ref())
+    }
+
+    fn finish_cancelled(&self, message: impl AsRef<str>) -> io::Result<()> {
+        self.finish("–", ComponentRole::Warning, message.as_ref())
+    }
+
+    fn finish(&self, marker: &str, role: ComponentRole, message: &str) -> io::Result<()> {
+        self.terminal.write(&run_outcome_view(
+            &self.styles,
+            self.terminal.width(),
+            marker,
+            role,
+            message,
+        ))
+    }
+
+    fn spinner(&self, message: impl Into<String>) -> io::Result<Spinner> {
+        self.terminal.spinner(&self.styles, message)
+    }
+
+    fn progress(&self, total: u64, message: impl Into<String>) -> io::Result<ProgressBar> {
+        self.terminal.progress(&self.styles, total, message)
+    }
+}
+
+fn run_outcome_view(
+    styles: &ComponentStyles,
+    width: usize,
+    marker: &str,
+    role: ComponentRole,
+    message: &str,
+) -> View {
+    let muted = styles.style(ComponentRole::Muted).clone();
+    let outcome = styles.style(role).clone();
+    let body = styles.style(ComponentRole::Body).clone();
+    let mut view = View::line(Line::styled("│", muted.clone()));
+    for (index, line) in wrap_text(message, width.saturating_sub(5).max(1))
+        .iter()
+        .enumerate()
+    {
+        view = if index == 0 {
+            view.push(
+                Line::new()
+                    .span("└", outcome.clone())
+                    .span("  ", muted.clone())
+                    .span(marker, outcome.clone())
+                    .span(" ", body.clone())
+                    .span(line, body.clone()),
+            )
+        } else {
+            view.push(
+                Line::new()
+                    .span("     ", muted.clone())
+                    .span(line, body.clone()),
+            )
+        };
+    }
+    view
+}
+
+async fn print_purge(
+    paths: &AppPaths,
+    yes: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+) -> anyhow::Result<()> {
+    let prompt_eligible = !yes && interactive_terminal();
+    let profile = TerminalProfile::detect_for(&io::stderr());
+    let report = RunUi::new(theme);
+
+    report
+        .start("Purge Agentlog catalog")
+        .context("start purge report")?;
 
     if yes {
         let summary = purge_catalog_shell(paths, true).await?;
-        print_purge_report(&summary, "Purged catalog", rich_report)?;
-        print_purge_completion(&summary, rich_report)?;
+        print_purge_report(&report, &summary, "Purged catalog")?;
+        print_purge_completion(&report, &summary)?;
         return Ok(());
     }
 
     let preview = preview_purge_catalog(paths).await?;
-    print_purge_report(&preview.summary, "Catalog preview", rich_report)?;
-    match confirm_purge_from_terminal(&preview.summary, prompt_eligible)? {
+    print_purge_report(&report, &preview.summary, "Catalog preview")?;
+    match confirm_purge_from_terminal(&preview.summary, prompt_eligible, theme, profile)? {
         Some(true) => {
             let summary = purge_previewed_catalog(paths, preview).await?;
-            print_purge_completion(&summary, rich_report)?;
+            print_purge_completion(&report, &summary)?;
         }
-        Some(false) if rich_report => {
-            cliclack::outro_cancel("Purge canceled; no changes were made.")
-                .context("finish canceled purge report")?;
-        }
-        Some(false) => eprintln!("Purge canceled; no changes were made."),
-        None if rich_report => {
-            cliclack::outro_cancel(
-                "No changes were made. Re-run with `agentlog purge --yes` to confirm.",
-            )
-            .context("finish unconfirmed purge report")?;
-        }
+        Some(false) => report
+            .finish_cancelled("Purge canceled; no changes were made.")
+            .context("finish canceled purge report")?,
         None => {
-            eprintln!("No changes were made. Re-run with `agentlog purge --yes` to confirm.");
+            report
+                .finish_cancelled(
+                    "No changes were made. Re-run with `agentlog purge --yes` to confirm.",
+                )
+                .context("finish unconfirmed purge report")?;
         }
     }
     Ok(())
 }
 
 fn print_purge_report(
+    report: &RunUi,
     summary: &crate::app::PurgeSummary,
     heading: &str,
-    rich_report: bool,
 ) -> anyhow::Result<()> {
-    let body = format!(
-        "Agentlog-owned database target: {}\nCatalog sources: {}\nCatalog sessions: {}\nTranscript items: {}\nApproximate database size: {} ({} bytes)",
-        visible_text(&summary.database.display().to_string()),
-        summary.sources,
-        summary.sessions,
-        summary.transcript_items,
-        human_readable_bytes(summary.approximate_bytes),
-        summary.approximate_bytes
-    );
+    let fields = Summary::new(heading)
+        .field(
+            "Database target",
+            visible_text(&summary.database.display().to_string()),
+        )
+        .field("Catalog sources", summary.sources.to_string())
+        .field("Catalog sessions", summary.sessions.to_string())
+        .field("Transcript items", summary.transcript_items.to_string())
+        .field(
+            "Approximate size",
+            format!(
+                "{} ({} bytes)",
+                human_readable_bytes(summary.approximate_bytes),
+                summary.approximate_bytes
+            ),
+        );
     let warning = "Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized.";
 
-    if rich_report {
-        cliclack::note(heading, body).context("write purge catalog report")?;
-        cliclack::log::warning(cliclack::termwrap(warning, 3)).context("write purge warning")?;
-    } else {
-        eprintln!("{body}");
-        eprintln!("Warning: {warning}");
-    }
+    report
+        .summary(&fields)
+        .context("write purge catalog report")?;
+    report.warning(warning).context("write purge warning")?;
     Ok(())
 }
 
 fn print_purge_completion(
+    report: &RunUi,
     summary: &crate::app::PurgeSummary,
-    rich_report: bool,
 ) -> anyhow::Result<()> {
     let message = if summary.cleared {
         format!(
@@ -180,11 +300,9 @@ fn print_purge_completion(
     } else {
         "Purge complete: no Agentlog-owned database was present.".to_owned()
     };
-    if rich_report {
-        cliclack::outro(message).context("finish purge report")?;
-    } else {
-        eprintln!("{message}");
-    }
+    report
+        .finish_success(message)
+        .context("finish purge report")?;
     Ok(())
 }
 
@@ -194,21 +312,41 @@ fn print_purge_completion(
 fn confirm_purge_from_terminal(
     summary: &crate::app::PurgeSummary,
     prompt_eligible: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+    profile: TerminalProfile,
 ) -> anyhow::Result<Option<bool>> {
     if !prompt_eligible {
         return Ok(None);
     }
 
-    cliclack::confirm(purge_confirmation_message(summary))
-        .initial_value(false)
-        .interact()
-        .map(Some)
-        .context("confirm catalog purge")
-}
+    let answer_key = FieldKey::<ConfirmAnswer>::new("purge-confirmation");
+    let confirmation = Confirm::new(
+        answer_key.clone(),
+        purge_confirmation_message(summary),
+        Some(false),
+    )
+    .context("configure purge confirmation")?
+    .help("←/→ choose • y/n answer • enter submit • esc cancel");
+    let form = Form::builder()
+        .group(
+            Group::builder()
+                .field(confirmation)
+                .build()
+                .context("configure purge prompt group")?,
+        )
+        .build()
+        .context("configure purge prompt")?;
 
-fn cliclack_chrome_allowed() -> bool {
-    let term = env::var("TERM").ok();
-    terminal_chrome_allowed(io::stderr().is_terminal(), term.as_deref())
+    match form
+        .run(theme, &profile)
+        .context("run purge confirmation")?
+    {
+        FormOutcome::Submitted(values) => values
+            .get(&answer_key)
+            .map(|answer| Some(answer.value))
+            .context("read submitted purge confirmation"),
+        FormOutcome::Cancelled => Ok(Some(false)),
+    }
 }
 
 fn purge_confirmation_message(summary: &crate::app::PurgeSummary) -> String {
@@ -272,168 +410,167 @@ fn human_readable_bytes(bytes: u64) -> String {
     )
 }
 
-fn print_paths(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
+fn print_paths(
+    paths: &AppPaths,
+    json: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+) -> anyhow::Result<()> {
     let report = paths_report(paths);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let palette = OutputPalette::for_stdout(theme);
         println!(
-            "Agentlog-owned home: {}",
-            visible_text(&report.agentlog_home.display().to_string())
+            "{} {}",
+            palette.paint(ComponentRole::Muted, "Agentlog-owned home:"),
+            palette.paint(
+                ComponentRole::Body,
+                &visible_text(&report.agentlog_home.display().to_string())
+            )
         );
         println!(
-            "Agentlog-owned config: {}",
-            visible_text(&report.config_file.display().to_string())
+            "{} {}",
+            palette.paint(ComponentRole::Muted, "Agentlog-owned config:"),
+            palette.paint(
+                ComponentRole::Body,
+                &visible_text(&report.config_file.display().to_string())
+            )
         );
         println!(
-            "Agentlog-owned data: {}",
-            visible_text(&report.data_directory.display().to_string())
+            "{} {}",
+            palette.paint(ComponentRole::Muted, "Agentlog-owned data:"),
+            palette.paint(
+                ComponentRole::Body,
+                &visible_text(&report.data_directory.display().to_string())
+            )
         );
         println!(
-            "Agentlog-owned database: {}",
-            visible_text(&report.database.display().to_string())
+            "{} {}",
+            palette.paint(ComponentRole::Muted, "Agentlog-owned database:"),
+            palette.paint(
+                ComponentRole::Body,
+                &visible_text(&report.database.display().to_string())
+            )
         );
         println!(
-            "Provider-owned sources: {}",
-            visible_text(&report.provider_sources)
+            "{} {}",
+            palette.paint(ComponentRole::Muted, "Provider-owned sources:"),
+            palette.paint(ComponentRole::Body, &visible_text(&report.provider_sources))
         );
     }
     Ok(())
 }
 
-async fn print_sync(paths: &AppPaths, json: bool) -> anyhow::Result<()> {
-    let mut reporter = SyncProgressReporter::new();
-    if reporter.interactive {
-        cliclack::intro("Synchronize provider history").context("start sync report")?;
-    }
+async fn print_sync(
+    paths: &AppPaths,
+    json: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+) -> anyhow::Result<()> {
+    let report = RunUi::new(theme);
+    report
+        .start("Synchronize provider history")
+        .context("start sync report")?;
+    let mut reporter = SyncProgressReporter::new(&report);
     let summary = sync_shell_with_progress(paths, |progress| reporter.report(progress)).await?;
+    reporter.finish().context("finish sync progress")?;
+    print_sync_summary(&report, &summary)?;
+    report
+        .finish_success(visible_text(&summary.message))
+        .context("finish sync report")?;
     if json {
-        if reporter.interactive {
-            cliclack::outro(format!("Sync result: {}", visible_text(&summary.message)))
-                .context("finish sync report")?;
-        }
         println!("{}", serde_json::to_string(&summary)?);
-    } else if reporter.interactive {
-        print_rich_sync_summary(&summary)?;
-    } else {
-        eprintln!("Schema version: {}", summary.schema_version);
-        eprintln!("Collectors installed: {}", summary.collectors_installed);
-        eprintln!("Providers failed: {}", summary.providers_failed);
-        eprintln!("Sources refreshed: {}", summary.sources_refreshed);
-        eprintln!("Sources partial: {}", summary.sources_partial);
-        eprintln!("Sources failed: {}", summary.sources_failed);
-        eprintln!("Sources missing: {}", summary.sources_missing);
-        eprintln!("Sessions available: {}", summary.sessions_available);
-        for provider in &summary.provider_summaries {
-            eprintln!(
-                "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}, sessions={}",
-                visible_text(&provider.provider),
+    }
+    Ok(())
+}
+
+fn print_sync_summary(report: &RunUi, summary: &crate::app::SyncSummary) -> anyhow::Result<()> {
+    let mut fields = Summary::new("Sync summary")
+        .field("Schema version", summary.schema_version.to_string())
+        .field(
+            "Collectors installed",
+            summary.collectors_installed.to_string(),
+        )
+        .field("Providers failed", summary.providers_failed.to_string())
+        .field("Sources refreshed", summary.sources_refreshed.to_string())
+        .field("Sources partial", summary.sources_partial.to_string())
+        .field("Sources failed", summary.sources_failed.to_string())
+        .field("Sources missing", summary.sources_missing.to_string())
+        .field("Sessions available", summary.sessions_available.to_string());
+    for provider in &summary.provider_summaries {
+        fields = fields.field(
+            format!("Provider {}", visible_text(&provider.provider)),
+            format!(
+                "candidates={}, refreshed={}, partial={}, failed={}, missing={}, sessions={}",
                 provider.candidate_sources,
                 provider.refreshed_sources,
                 provider.partial_sources,
                 provider.failed_sources,
                 provider.missing_sources,
                 provider.sessions_available
-            );
-            if let Some(failure) = &provider.failure {
-                eprintln!("  warning: {}", visible_text(failure));
-            }
-        }
-        eprintln!("Sync result: {}", visible_text(&summary.message));
+            ),
+        );
     }
-    Ok(())
-}
-
-fn print_rich_sync_summary(summary: &crate::app::SyncSummary) -> anyhow::Result<()> {
-    let mut lines = vec![
-        format!("Schema version: {}", summary.schema_version),
-        format!("Collectors installed: {}", summary.collectors_installed),
-        format!("Providers failed: {}", summary.providers_failed),
-        format!("Sources refreshed: {}", summary.sources_refreshed),
-        format!("Sources partial: {}", summary.sources_partial),
-        format!("Sources failed: {}", summary.sources_failed),
-        format!("Sources missing: {}", summary.sources_missing),
-        format!("Sessions available: {}", summary.sessions_available),
-    ];
+    report.summary(&fields).context("write sync summary")?;
     for provider in &summary.provider_summaries {
-        lines.push(format!(
-            "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}, sessions={}",
-            visible_text(&provider.provider),
-            provider.candidate_sources,
-            provider.refreshed_sources,
-            provider.partial_sources,
-            provider.failed_sources,
-            provider.missing_sources,
-            provider.sessions_available
-        ));
         if let Some(failure) = &provider.failure {
-            lines.push(format!("  Warning: {}", visible_text(failure)));
+            report
+                .warning(format!(
+                    "Provider {}: {}",
+                    visible_text(&provider.provider),
+                    visible_text(failure)
+                ))
+                .context("write provider warning")?;
         }
     }
-    cliclack::note("Sync summary", lines.join("\n")).context("write sync summary")?;
-    cliclack::outro(format!("Sync result: {}", visible_text(&summary.message)))
-        .context("finish sync report")?;
     Ok(())
 }
 
 /// Writes compact synchronization progress to stderr without touching stdout.
-struct SyncProgressReporter {
-    interactive: bool,
-    active: Option<cliclack::ProgressBar>,
+struct SyncProgressReporter<'a> {
+    report: &'a RunUi,
+    active: Option<ActiveProgress>,
+    error: Option<io::Error>,
 }
 
-impl SyncProgressReporter {
-    fn new() -> Self {
-        let term = env::var("TERM").ok();
+impl<'a> SyncProgressReporter<'a> {
+    const fn new(report: &'a RunUi) -> Self {
         Self {
-            interactive: terminal_control_allowed(
-                std::io::stderr().is_terminal(),
-                term.as_deref(),
-                env::var_os("NO_COLOR").is_some(),
-            ),
+            report,
             active: None,
+            error: None,
         }
     }
 
     fn report(&mut self, progress: SyncProgress) {
+        if self.error.is_some() {
+            return;
+        }
         match progress {
             SyncProgress::ProviderDiscovering { provider } => {
-                if self.interactive {
-                    let progress = cliclack::spinner();
-                    progress.start(format!(
-                        "Provider {}: discovering sources",
-                        visible_text(&provider)
-                    ));
-                    self.active = Some(progress);
-                } else {
-                    eprintln!(
-                        "[~] Provider {}: discovering sources",
-                        visible_text(&provider)
-                    );
+                match self.report.spinner(format!(
+                    "Provider {}: discovering sources",
+                    visible_text(&provider)
+                )) {
+                    Ok(spinner) => self.active = Some(ActiveProgress::Spinner(spinner)),
+                    Err(error) => self.error = Some(error),
                 }
             }
             SyncProgress::ProviderCandidates {
                 provider,
                 candidate_sources,
             } => {
-                if self.interactive {
-                    self.stop_active(format!(
-                        "Provider {}: discovered {} candidate sources",
-                        visible_text(&provider),
-                        candidate_sources
-                    ));
-                    let progress = cliclack::progress_bar(candidate_sources);
-                    progress.start(format!(
-                        "Provider {}: synchronizing sources",
-                        visible_text(&provider)
-                    ));
-                    self.active = Some(progress);
-                } else {
-                    eprintln!(
-                        "[~] Provider {}: starting {} candidate sources",
-                        visible_text(&provider),
-                        candidate_sources
-                    );
+                let provider = visible_text(&provider);
+                self.stop_active(format!(
+                    "Provider {provider}: discovered {candidate_sources} candidate sources"
+                ));
+                if self.error.is_none() {
+                    match self.report.progress(
+                        candidate_sources,
+                        format!("Provider {provider}: synchronizing sources"),
+                    ) {
+                        Ok(progress) => self.active = Some(ActiveProgress::Bar(progress)),
+                        Err(error) => self.error = Some(error),
+                    }
                 }
             }
             SyncProgress::SourceStaged {
@@ -441,10 +578,11 @@ impl SyncProgressReporter {
                 processed_sources,
                 candidate_sources: _,
             } => {
-                if self.interactive {
-                    if let Some(progress) = &self.active {
-                        progress.set_position(processed_sources);
-                    }
+                if self.report.mode() == OutputMode::Live
+                    && let Some(ActiveProgress::Bar(progress)) = &mut self.active
+                    && let Err(error) = progress.set_position(processed_sources)
+                {
+                    self.error = Some(error);
                 }
             }
             SyncProgress::ProviderCompleted {
@@ -459,7 +597,7 @@ impl SyncProgressReporter {
                         visible_text(&failure)
                     ));
                 } else {
-                    let message = format!(
+                    self.complete_active(format!(
                         "Provider {}: candidates={}, refreshed={}, partial={}, failed={}, missing={}",
                         visible_text(&provider),
                         report.candidate_sources,
@@ -467,69 +605,84 @@ impl SyncProgressReporter {
                         report.partial_sources,
                         report.failed_sources,
                         report.missing_sources
-                    );
-                    if self.interactive {
-                        self.complete_active(message);
-                    } else {
-                        eprintln!("[+] {message}");
-                    }
+                    ));
                 }
             }
         }
     }
 
     fn stop_active(&mut self, message: String) {
-        if let Some(progress) = self.active.take() {
-            progress.stop(message);
-        } else {
-            eprintln!("[~] {message}");
-        }
+        self.finish_active(FinishProgress::Stop, message);
     }
 
     fn error_active(&mut self, message: String) {
-        if let Some(progress) = self.active.take() {
-            progress.error(message);
-        } else {
-            eprintln!("[!] {message}");
-        }
+        self.finish_active(FinishProgress::Error, message);
     }
 
     fn complete_active(&mut self, message: String) {
-        if let Some(progress) = self.active.take() {
-            progress.stop(message);
+        self.finish_active(FinishProgress::Success, message);
+    }
+
+    fn finish_active(&mut self, finish: FinishProgress, message: String) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        let result = match (active, finish) {
+            (ActiveProgress::Spinner(progress), FinishProgress::Stop) => progress.stop(message),
+            (ActiveProgress::Spinner(progress), FinishProgress::Success) => {
+                progress.success(message)
+            }
+            (ActiveProgress::Spinner(progress), FinishProgress::Error) => progress.error(message),
+            (ActiveProgress::Bar(progress), FinishProgress::Stop) => progress.stop(message),
+            (ActiveProgress::Bar(progress), FinishProgress::Success) => progress.success(message),
+            (ActiveProgress::Bar(progress), FinishProgress::Error) => progress.error(message),
+        };
+        if let Err(error) = result {
+            self.error = Some(error);
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if let Some(error) = self.error.take() {
+            Err(error)
         } else {
-            eprintln!("[+] {message}");
+            Ok(())
         }
     }
 }
 
-/// Returns whether stderr supports the live cursor control used by cliclack.
-///
-/// A plain report is safer for a terminal without a declared terminal type, a
-/// dumb terminal, or when the user has explicitly disabled terminal styling.
-fn terminal_control_allowed(stderr_is_terminal: bool, term: Option<&str>, no_color: bool) -> bool {
-    terminal_chrome_allowed(stderr_is_terminal, term) && !no_color
+enum ActiveProgress {
+    Spinner(Spinner),
+    Bar(ProgressBar),
 }
 
-fn terminal_chrome_allowed(stderr_is_terminal: bool, term: Option<&str>) -> bool {
-    stderr_is_terminal && term.is_some_and(|term| !term.trim_ascii().is_empty() && term != "dumb")
+#[derive(Clone, Copy)]
+enum FinishProgress {
+    Stop,
+    Success,
+    Error,
 }
 
-impl Drop for SyncProgressReporter {
-    fn drop(&mut self) {
-        if let Some(progress) = self.active.take() {
-            progress.clear();
-        }
-    }
-}
-
-async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<()> {
+async fn print_list(
+    paths: &AppPaths,
+    limit: u32,
+    json: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+) -> anyhow::Result<()> {
     let sessions = list_shell(paths, limit).await?;
     if json {
         println!("{}", serde_json::to_string(&sessions)?);
     } else if sessions.is_empty() {
-        println!("No cataloged sessions. Run `agentlog sync` to synchronize sources.");
+        let palette = OutputPalette::for_stdout(theme);
+        println!(
+            "{}",
+            palette.paint(
+                ComponentRole::Muted,
+                "No cataloged sessions. Run `agentlog sync` to synchronize sources."
+            )
+        );
     } else {
+        let palette = OutputPalette::for_stdout(theme);
         for session in sessions {
             let title = session
                 .title
@@ -542,30 +695,51 @@ async fn print_list(paths: &AppPaths, limit: u32, json: bool) -> anyhow::Result<
                 session.source_diagnostic_status.as_str()
             };
             println!(
-                "{}  [{}:{}; {}] {}",
-                session.id,
-                visible_text(&session.provider),
-                visible_text(&session.source_format),
-                visible_text(freshness),
-                visible_text(title)
+                "{}  {} {}",
+                palette.paint(ComponentRole::Accent, &session.id.to_string()),
+                palette.paint(
+                    ComponentRole::Muted,
+                    &format!(
+                        "[{}:{}; {}]",
+                        visible_text(&session.provider),
+                        visible_text(&session.source_format),
+                        visible_text(freshness)
+                    )
+                ),
+                palette.paint(ComponentRole::Body, &visible_text(title))
             );
         }
     }
     Ok(())
 }
 
-async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Result<()> {
+async fn print_show(
+    paths: &AppPaths,
+    session_id: i64,
+    json: bool,
+    theme: &Theme<AgentlogThemeExtension>,
+) -> anyhow::Result<()> {
     let preview = show_shell(paths, session_id).await?;
     if json {
         println!("{}", serde_json::to_string(&preview)?);
     } else {
+        let palette = OutputPalette::for_stdout(theme);
         let freshness = &preview.session.source_diagnostic_status;
         println!(
-            "Session {} [{}:{}; source status: {}]",
-            preview.session.id,
-            visible_text(&preview.session.provider),
-            visible_text(&preview.session.source_format),
-            visible_text(freshness)
+            "{} {}",
+            palette.paint(
+                ComponentRole::Accent,
+                &format!("Session {}", preview.session.id)
+            ),
+            palette.paint(
+                ComponentRole::Muted,
+                &format!(
+                    "[{}:{}; source status: {}]",
+                    visible_text(&preview.session.provider),
+                    visible_text(&preview.session.source_format),
+                    visible_text(freshness)
+                )
+            )
         );
         let title = preview
             .session
@@ -573,20 +747,32 @@ async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Re
             .as_deref()
             .filter(|title| !title.trim().is_empty())
             .unwrap_or(&preview.session.session_key);
-        println!("{}", visible_text(title));
+        println!(
+            "{}",
+            palette.paint(ComponentRole::Body, &visible_text(title))
+        );
         for item in preview.items {
             match item {
                 CatalogItemView::UserText { content } => {
-                    print_visible_transcript("user", &content);
+                    print_visible_transcript("user", &content, ComponentRole::Accent, &palette);
                 }
                 CatalogItemView::AssistantText { content } => {
-                    print_visible_transcript("assistant", &content);
+                    print_visible_transcript(
+                        "assistant",
+                        &content,
+                        ComponentRole::Success,
+                        &palette,
+                    );
                 }
                 CatalogItemView::ToolMarker { name, status } => {
                     println!(
-                        "tool: {} ({})",
-                        visible_text(&name),
-                        visible_text(status.as_deref().unwrap_or("unknown"))
+                        "{} {} {}",
+                        palette.paint(ComponentRole::Warning, "tool:"),
+                        palette.paint(ComponentRole::Body, &visible_text(&name)),
+                        palette.paint(
+                            ComponentRole::Muted,
+                            &format!("({})", visible_text(status.as_deref().unwrap_or("unknown")))
+                        )
                     );
                 }
             }
@@ -598,19 +784,48 @@ async fn print_show(paths: &AppPaths, session_id: i64, json: bool) -> anyhow::Re
     Ok(())
 }
 
-fn print_visible_transcript(label: &str, content: &str) {
+fn print_visible_transcript(
+    label: &str,
+    content: &str,
+    label_role: ComponentRole,
+    palette: &OutputPalette,
+) {
     if content.is_empty() {
-        println!("{label}:");
+        println!("{}", palette.paint(label_role, &format!("{label}:")));
         return;
     }
 
     for (index, line) in content.lines().enumerate() {
         let prefix = if index == 0 {
-            format!("{label}: ")
+            format!("{} ", palette.paint(label_role, &format!("{label}:")))
         } else {
             "  ".to_owned()
         };
-        println!("{prefix}{}", visible_text(line));
+        println!(
+            "{prefix}{}",
+            palette.paint(ComponentRole::Body, &visible_text(line))
+        );
+    }
+}
+
+struct OutputPalette<'a> {
+    theme: &'a Theme<AgentlogThemeExtension>,
+    profile: TerminalProfile,
+}
+
+impl<'a> OutputPalette<'a> {
+    fn for_stdout(theme: &'a Theme<AgentlogThemeExtension>) -> Self {
+        Self::resolve(theme, TerminalProfile::detect_for(&io::stdout()))
+    }
+
+    const fn resolve(theme: &'a Theme<AgentlogThemeExtension>, profile: TerminalProfile) -> Self {
+        Self { theme, profile }
+    }
+
+    fn paint(&self, role: ComponentRole, text: &str) -> String {
+        self.profile
+            .resolve_style(self.theme.style(role))
+            .render(text)
     }
 }
 
@@ -620,8 +835,9 @@ mod tests {
 
     use super::{
         Cli, Command, PromptEligibility, human_readable_bytes, purge_confirmation_message,
-        terminal_chrome_allowed, terminal_control_allowed,
+        run_outcome_view,
     };
+    use crate::theme::{DEFAULT_COLOR_SCHEME, theme_set};
 
     #[test]
     fn database_sizes_use_readable_binary_units() {
@@ -630,6 +846,23 @@ mod tests {
         assert_eq!(human_readable_bytes(1024), "1.0 KiB");
         assert_eq!(human_readable_bytes(128_339_968), "122.4 MiB");
         assert_eq!(human_readable_bytes(u64::MAX), "16.0 EiB");
+    }
+
+    #[test]
+    fn run_outcomes_wrap_without_moving_workflow_vocabulary_into_urushi() {
+        let themes = theme_set();
+        let styles = themes.select(DEFAULT_COLOR_SCHEME).components();
+        let view = run_outcome_view(
+            styles,
+            15,
+            "✓",
+            urushi::ComponentRole::Success,
+            "one two three four",
+        );
+
+        assert_eq!(view.lines().len(), 3);
+        assert_eq!(view.lines()[1].spans()[0].text(), "└");
+        assert_eq!(view.lines()[2].spans()[0].text(), "     ");
     }
 
     #[test]
@@ -696,42 +929,6 @@ mod tests {
             },
         ] {
             assert!(!ineligible.allows_prompt());
-        }
-    }
-
-    #[test]
-    fn sync_progress_uses_cliclack_only_with_terminal_control() {
-        assert!(terminal_control_allowed(
-            true,
-            Some("xterm-256color"),
-            false
-        ));
-        for (stderr_is_terminal, term, no_color) in [
-            (false, Some("xterm-256color"), false),
-            (true, None, false),
-            (true, Some(""), false),
-            (true, Some(" \t"), false),
-            (true, Some("dumb"), false),
-            (true, Some("xterm-256color"), true),
-        ] {
-            assert!(
-                !terminal_control_allowed(stderr_is_terminal, term, no_color),
-                "stderr_tty={stderr_is_terminal}, term={term:?}, no_color={no_color} must use plain progress"
-            );
-        }
-    }
-
-    #[test]
-    fn static_cliclack_chrome_requires_a_capable_stderr_terminal() {
-        assert!(terminal_chrome_allowed(true, Some("xterm-256color")));
-        for (stderr_is_terminal, term) in [
-            (false, Some("xterm-256color")),
-            (true, None),
-            (true, Some("")),
-            (true, Some(" \t")),
-            (true, Some("dumb")),
-        ] {
-            assert!(!terminal_chrome_allowed(stderr_is_terminal, term));
         }
     }
 

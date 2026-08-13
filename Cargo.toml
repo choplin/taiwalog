@@ -2,7 +2,7 @@
 name = "agentlog"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 description = "A local browser for AI coding-agent session history"
 license = "MIT"
@@ -25,7 +25,6 @@ lto = "thin"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive", "env"] }
-cliclack = "0.5.5"
 crossterm = "0.28"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
@@ -37,6 +36,8 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 toml = "0.8"
 tempfile = "3.24"
+urushi = { version = "0.1.0", features = ["ratatui", "terminal"] }
+urushi-prompt = "0.1.0"
 
 [dev-dependencies]
 portable-pty = "0.9"

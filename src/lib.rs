@@ -10,6 +10,7 @@ pub mod display;
 pub mod paths;
 pub mod providers;
 pub mod storage;
+pub(crate) mod theme;
 pub mod tui;
 
 // Keep provider modules public for callers that need provider-specific source
