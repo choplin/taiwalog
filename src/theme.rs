@@ -2,17 +2,9 @@
 
 use urushi::{Color, ColorScheme, SemanticTokens, Theme, ThemeSet};
 
-/// Agentlog-specific theme roles.
-///
-/// The MVP currently needs only urushi's shared component roles. Keeping the
-/// extension type explicit leaves application-only roles a typed home without
-/// duplicating common semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AgentlogThemeExtension;
-
 pub(crate) const DEFAULT_COLOR_SCHEME: ColorScheme = ColorScheme::Dark;
 
-pub(crate) fn theme_set() -> ThemeSet<AgentlogThemeExtension> {
+pub(crate) fn theme_set() -> ThemeSet {
     ThemeSet::new(
         theme(SemanticTokens {
             text: Color::Rgb(35, 39, 47),
@@ -41,8 +33,8 @@ pub(crate) fn theme_set() -> ThemeSet<AgentlogThemeExtension> {
     )
 }
 
-fn theme(tokens: SemanticTokens) -> Theme<AgentlogThemeExtension> {
-    Theme::from_tokens(tokens).extend(|_, _| AgentlogThemeExtension)
+fn theme(tokens: SemanticTokens) -> Theme {
+    Theme::from_tokens(tokens)
 }
 
 #[cfg(test)]
@@ -57,8 +49,8 @@ mod tests {
         let selected = themes.select(DEFAULT_COLOR_SCHEME);
 
         assert_eq!(
-            selected.style(ComponentRole::Body),
-            themes.dark().style(ComponentRole::Body)
+            selected.text_style(ComponentRole::Body),
+            themes.dark().text_style(ComponentRole::Body)
         );
         assert_ne!(
             themes.light().tokens().background,

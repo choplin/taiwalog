@@ -2,16 +2,18 @@
 
 use std::{
     fs::OpenOptions,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
 };
 
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
+use indicatif::{ProgressBar as IndicatifProgressBar, ProgressStyle};
 use urushi::{
-    ComponentRole, ComponentStyles, Line, OutputMode, ProgressBar, Spinner, StderrTerminal,
-    Summary, TerminalProfile, Theme, View, Warning, wrap_text,
+    Align, ComponentRole, GridStyle, Length, RenderSettings, StyledText, TextStyle, Theme,
+    VerticalAlign, View,
 };
+use urushi_cli::{CliTheme, Summary, Warning};
 use urushi_prompt::{Confirm, ConfirmAnswer, FieldKey, Form, FormOutcome, Group};
 
 use crate::{
@@ -22,7 +24,7 @@ use crate::{
     display::visible_text,
     paths::AppPaths,
     storage::CatalogItemView,
-    theme::{AgentlogThemeExtension, DEFAULT_COLOR_SCHEME, theme_set},
+    theme::{DEFAULT_COLOR_SCHEME, theme_set},
     tui,
 };
 
@@ -101,10 +103,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::List { limit, json } => print_list(&paths, limit, json, theme).await,
         Command::Show { session_id, json } => print_show(&paths, session_id, json, theme).await,
         Command::Purge { yes } => print_purge(&paths, yes, theme).await,
-        Command::Browse => {
-            let profile = TerminalProfile::detect_for(&io::stderr());
-            tui::run(&paths, theme, &profile).await
-        }
+        Command::Browse => tui::run(&paths, theme).await,
     }
 }
 
@@ -114,112 +113,164 @@ pub async fn run() -> anyhow::Result<()> {
 /// styling, stable component views, ANSI rendering, and live-region lifecycle
 /// remain owned by urushi.
 struct RunUi {
-    terminal: StderrTerminal,
-    styles: ComponentStyles,
+    theme: Theme,
+    cli_theme: CliTheme,
+    live: bool,
 }
 
 impl RunUi {
-    fn new(theme: &Theme<AgentlogThemeExtension>) -> Self {
+    fn new(theme: &Theme) -> Self {
         Self {
-            terminal: StderrTerminal::detect(),
-            styles: theme.components().clone(),
+            theme: theme.clone(),
+            cli_theme: CliTheme::from_theme(theme),
+            live: io::stderr().is_terminal(),
         }
     }
 
-    const fn mode(&self) -> OutputMode {
-        self.terminal.mode()
+    const fn is_live(&self) -> bool {
+        self.live
     }
 
     fn start(&self, title: impl AsRef<str>) -> io::Result<()> {
-        let accent = self.styles.style(ComponentRole::Accent).clone();
-        let muted = self.styles.style(ComponentRole::Muted).clone();
-        self.terminal.write(&View::line(
-            Line::new()
-                .span("┌", accent.clone())
-                .span("  ", muted)
-                .span(title.as_ref(), accent),
-        ))
+        let accent = self.theme.text_style(ComponentRole::Accent);
+        let muted = self.theme.text_style(ComponentRole::Muted);
+        let view = View::row(
+            VerticalAlign::Top,
+            [
+                View::text("┌", accent.clone()),
+                View::text("  ", muted),
+                View::text(title.as_ref(), accent),
+            ],
+        );
+        self.write_view(&view)
     }
 
     fn summary(&self, summary: &Summary) -> io::Result<()> {
-        self.terminal
-            .write(&summary.view(&self.styles, self.terminal.width()))
+        self.write_view(&self.cli_theme.summary(summary))
     }
 
     fn warning(&self, message: impl Into<String>) -> io::Result<()> {
-        self.terminal
-            .write(&Warning::new("Warning", message).view(&self.styles, self.terminal.width()))
+        self.write_view(&self.cli_theme.warning(&Warning::new("Warning", message)))
     }
 
     fn finish_success(&self, message: impl AsRef<str>) -> io::Result<()> {
-        self.finish("✓", ComponentRole::Success, message.as_ref())
+        self.finish(
+            "✓",
+            self.theme.text_style(ComponentRole::Success),
+            message.as_ref(),
+        )
     }
 
     fn finish_cancelled(&self, message: impl AsRef<str>) -> io::Result<()> {
-        self.finish("–", ComponentRole::Warning, message.as_ref())
+        self.finish(
+            "–",
+            TextStyle::new().foreground(self.theme.tokens().warning),
+            message.as_ref(),
+        )
     }
 
-    fn finish(&self, marker: &str, role: ComponentRole, message: &str) -> io::Result<()> {
-        self.terminal.write(&run_outcome_view(
-            &self.styles,
-            self.terminal.width(),
-            marker,
-            role,
-            message,
-        ))
+    fn finish(&self, marker: &str, outcome: TextStyle, message: &str) -> io::Result<()> {
+        self.write_view(&run_outcome_view(&self.theme, marker, outcome, message))
     }
 
-    fn spinner(&self, message: impl Into<String>) -> io::Result<Spinner> {
-        self.terminal.spinner(&self.styles, message)
+    fn spinner(&self, message: impl Into<String>) -> io::Result<Activity> {
+        Activity::new(self.live, None, message.into())
     }
 
-    fn progress(&self, total: u64, message: impl Into<String>) -> io::Result<ProgressBar> {
-        self.terminal.progress(&self.styles, total, message)
+    fn progress(&self, total: u64, message: impl Into<String>) -> io::Result<Activity> {
+        Activity::new(self.live, Some(total), message.into())
+    }
+
+    fn write_view(&self, view: &View) -> io::Result<()> {
+        if self.live {
+            return urushi::eprintln_view(view);
+        }
+        let resolved = urushi::resolve(view, urushi::Available::NONE).map_err(io::Error::other)?;
+        let rendered = urushi::render(&resolved, &RenderSettings::default());
+        let mut stderr = io::stderr().lock();
+        for line in rendered.lines() {
+            writeln!(stderr, "{}", line.trim_end())?;
+        }
+        Ok(())
     }
 }
 
-fn run_outcome_view(
-    styles: &ComponentStyles,
-    width: usize,
-    marker: &str,
-    role: ComponentRole,
-    message: &str,
-) -> View {
-    let muted = styles.style(ComponentRole::Muted).clone();
-    let outcome = styles.style(role).clone();
-    let body = styles.style(ComponentRole::Body).clone();
-    let mut view = View::line(Line::styled("│", muted.clone()));
-    for (index, line) in wrap_text(message, width.saturating_sub(5).max(1))
-        .iter()
-        .enumerate()
-    {
-        view = if index == 0 {
-            view.push(
-                Line::new()
-                    .span("└", outcome.clone())
-                    .span("  ", muted.clone())
-                    .span(marker, outcome.clone())
-                    .span(" ", body.clone())
-                    .span(line, body.clone()),
-            )
+fn run_outcome_view(theme: &Theme, marker: &str, outcome: TextStyle, message: &str) -> View {
+    let muted = theme.text_style(ComponentRole::Muted);
+    let body = theme.text_style(ComponentRole::Body);
+    View::column(
+        Align::Left,
+        [
+            View::text("│", muted.clone()),
+            View::grid(
+                GridStyle::new().columns([Some(Length::Cells(5)), None]),
+                [[
+                    View::text(format!("└  {marker} "), outcome),
+                    View::text(message, body),
+                ]],
+            ),
+        ],
+    )
+}
+
+struct Activity {
+    progress: Option<IndicatifProgressBar>,
+}
+
+impl Activity {
+    fn new(live: bool, total: Option<u64>, message: String) -> io::Result<Self> {
+        if !live {
+            eprintln!("{message}");
+            return Ok(Self { progress: None });
+        }
+        let progress =
+            total.map_or_else(IndicatifProgressBar::new_spinner, IndicatifProgressBar::new);
+        let template = if total.is_some() {
+            "{spinner} {msg} [{pos}/{len}]"
         } else {
-            view.push(
-                Line::new()
-                    .span("     ", muted.clone())
-                    .span(line, body.clone()),
-            )
+            "{spinner} {msg}"
         };
+        progress.set_style(
+            ProgressStyle::with_template(template)
+                .map_err(io::Error::other)?
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+        );
+        progress.set_message(message);
+        progress.enable_steady_tick(std::time::Duration::from_millis(80));
+        Ok(Self {
+            progress: Some(progress),
+        })
     }
-    view
+
+    fn set_position(&self, position: u64) {
+        if let Some(progress) = &self.progress {
+            progress.set_position(position);
+        }
+    }
+
+    fn stop(self, message: impl Into<String>) {
+        self.finish(message);
+    }
+
+    fn success(self, message: impl Into<String>) {
+        self.finish(message);
+    }
+
+    fn error(self, message: impl Into<String>) {
+        self.finish(message);
+    }
+
+    fn finish(self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(progress) = self.progress {
+            progress.finish_and_clear();
+        }
+        eprintln!("{message}");
+    }
 }
 
-async fn print_purge(
-    paths: &AppPaths,
-    yes: bool,
-    theme: &Theme<AgentlogThemeExtension>,
-) -> anyhow::Result<()> {
+async fn print_purge(paths: &AppPaths, yes: bool, theme: &Theme) -> anyhow::Result<()> {
     let prompt_eligible = !yes && interactive_terminal();
-    let profile = TerminalProfile::detect_for(&io::stderr());
     let report = RunUi::new(theme);
 
     report
@@ -235,7 +286,7 @@ async fn print_purge(
 
     let preview = preview_purge_catalog(paths).await?;
     print_purge_report(&report, &preview, "Catalog preview")?;
-    match confirm_purge_from_terminal(&preview, prompt_eligible, theme, profile)? {
+    match confirm_purge_from_terminal(&preview, prompt_eligible, theme)? {
         Some(true) => {
             let summary = execute_purge(&report, paths).await?;
             print_purge_completion(&report, &summary)?;
@@ -263,17 +314,11 @@ async fn execute_purge(
         .context("start purge progress")?;
     match purge_catalog_shell(paths, true).await {
         Ok(summary) => {
-            progress
-                .success("Catalog rows purged")
-                .context("finish purge progress")?;
+            progress.success("Catalog rows purged");
             Ok(summary)
         }
         Err(error) => {
-            if let Err(report_error) = progress.error("Catalog purge failed") {
-                return Err(error.context(format!(
-                    "additionally failed to finish purge progress: {report_error}"
-                )));
-            }
+            progress.error("Catalog purge failed");
             Err(error)
         }
     }
@@ -337,8 +382,7 @@ fn print_purge_completion(
 fn confirm_purge_from_terminal(
     summary: &crate::app::PurgeSummary,
     prompt_eligible: bool,
-    theme: &Theme<AgentlogThemeExtension>,
-    profile: TerminalProfile,
+    theme: &Theme,
 ) -> anyhow::Result<Option<bool>> {
     if !prompt_eligible {
         return Ok(None);
@@ -362,10 +406,7 @@ fn confirm_purge_from_terminal(
         .build()
         .context("configure purge prompt")?;
 
-    match form
-        .run(theme, &profile)
-        .context("run purge confirmation")?
-    {
+    match form.run(theme).context("run purge confirmation")? {
         FormOutcome::Submitted(values) => values
             .get(&answer_key)
             .map(|answer| Some(answer.value))
@@ -435,11 +476,7 @@ fn human_readable_bytes(bytes: u64) -> String {
     )
 }
 
-fn print_paths(
-    paths: &AppPaths,
-    json: bool,
-    theme: &Theme<AgentlogThemeExtension>,
-) -> anyhow::Result<()> {
+fn print_paths(paths: &AppPaths, json: bool, theme: &Theme) -> anyhow::Result<()> {
     let report = paths_report(paths);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -486,11 +523,7 @@ fn print_paths(
     Ok(())
 }
 
-async fn print_sync(
-    paths: &AppPaths,
-    json: bool,
-    theme: &Theme<AgentlogThemeExtension>,
-) -> anyhow::Result<()> {
+async fn print_sync(paths: &AppPaths, json: bool, theme: &Theme) -> anyhow::Result<()> {
     let report = RunUi::new(theme);
     report
         .start("Synchronize provider history")
@@ -603,11 +636,10 @@ impl<'a> SyncProgressReporter<'a> {
                 processed_sources,
                 candidate_sources: _,
             } => {
-                if self.report.mode() == OutputMode::Live
+                if self.report.is_live()
                     && let Some(ActiveProgress::Bar(progress)) = &mut self.active
-                    && let Err(error) = progress.set_position(processed_sources)
                 {
-                    self.error = Some(error);
+                    progress.set_position(processed_sources);
                 }
             }
             SyncProgress::ProviderCompleted {
@@ -652,18 +684,13 @@ impl<'a> SyncProgressReporter<'a> {
         let Some(active) = self.active.take() else {
             return;
         };
-        let result = match (active, finish) {
-            (ActiveProgress::Spinner(progress), FinishProgress::Stop) => progress.stop(message),
-            (ActiveProgress::Spinner(progress), FinishProgress::Success) => {
-                progress.success(message)
-            }
-            (ActiveProgress::Spinner(progress), FinishProgress::Error) => progress.error(message),
-            (ActiveProgress::Bar(progress), FinishProgress::Stop) => progress.stop(message),
-            (ActiveProgress::Bar(progress), FinishProgress::Success) => progress.success(message),
-            (ActiveProgress::Bar(progress), FinishProgress::Error) => progress.error(message),
+        let progress = match active {
+            ActiveProgress::Spinner(progress) | ActiveProgress::Bar(progress) => progress,
         };
-        if let Err(error) = result {
-            self.error = Some(error);
+        match finish {
+            FinishProgress::Stop => progress.stop(message),
+            FinishProgress::Success => progress.success(message),
+            FinishProgress::Error => progress.error(message),
         }
     }
 
@@ -677,8 +704,8 @@ impl<'a> SyncProgressReporter<'a> {
 }
 
 enum ActiveProgress {
-    Spinner(Spinner),
-    Bar(ProgressBar),
+    Spinner(Activity),
+    Bar(Activity),
 }
 
 #[derive(Clone, Copy)]
@@ -688,12 +715,7 @@ enum FinishProgress {
     Error,
 }
 
-async fn print_list(
-    paths: &AppPaths,
-    limit: u32,
-    json: bool,
-    theme: &Theme<AgentlogThemeExtension>,
-) -> anyhow::Result<()> {
+async fn print_list(paths: &AppPaths, limit: u32, json: bool, theme: &Theme) -> anyhow::Result<()> {
     let sessions = list_shell(paths, limit).await?;
     if json {
         println!("{}", serde_json::to_string(&sessions)?);
@@ -742,7 +764,7 @@ async fn print_show(
     paths: &AppPaths,
     session_id: i64,
     json: bool,
-    theme: &Theme<AgentlogThemeExtension>,
+    theme: &Theme,
 ) -> anyhow::Result<()> {
     let preview = show_shell(paths, session_id).await?;
     if json {
@@ -792,7 +814,7 @@ async fn print_show(
                 CatalogItemView::ToolMarker { name, status } => {
                     println!(
                         "{} {} {}",
-                        palette.paint(ComponentRole::Warning, "tool:"),
+                        palette.warning("tool:"),
                         palette.paint(ComponentRole::Body, &visible_text(&name)),
                         palette.paint(
                             ComponentRole::Muted,
@@ -834,23 +856,35 @@ fn print_visible_transcript(
 }
 
 struct OutputPalette<'a> {
-    theme: &'a Theme<AgentlogThemeExtension>,
-    profile: TerminalProfile,
+    theme: &'a Theme,
+    settings: RenderSettings,
 }
 
 impl<'a> OutputPalette<'a> {
-    fn for_stdout(theme: &'a Theme<AgentlogThemeExtension>) -> Self {
-        Self::resolve(theme, TerminalProfile::detect_for(&io::stdout()))
-    }
-
-    const fn resolve(theme: &'a Theme<AgentlogThemeExtension>, profile: TerminalProfile) -> Self {
-        Self { theme, profile }
+    fn for_stdout(theme: &'a Theme) -> Self {
+        let color = io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+        let settings = if color {
+            RenderSettings::all()
+        } else {
+            RenderSettings::default()
+        };
+        Self { theme, settings }
     }
 
     fn paint(&self, role: ComponentRole, text: &str) -> String {
-        self.profile
-            .resolve_style(self.theme.style(role))
-            .render(text)
+        self.paint_style(self.theme.text_style(role), text)
+    }
+
+    fn warning(&self, text: &str) -> String {
+        self.paint_style(
+            TextStyle::new().foreground(self.theme.tokens().warning),
+            text,
+        )
+    }
+
+    fn paint_style(&self, style: TextStyle, text: &str) -> String {
+        urushi::render_text(&StyledText::new(text, style), &self.settings)
     }
 }
 
@@ -876,18 +910,31 @@ mod tests {
     #[test]
     fn run_outcomes_wrap_without_moving_workflow_vocabulary_into_urushi() {
         let themes = theme_set();
-        let styles = themes.select(DEFAULT_COLOR_SCHEME).components();
+        let theme = themes.select(DEFAULT_COLOR_SCHEME);
         let view = run_outcome_view(
-            styles,
-            15,
+            theme,
             "✓",
-            urushi::ComponentRole::Success,
+            theme.text_style(urushi::ComponentRole::Success),
             "one two three four",
         );
+        let resolved =
+            urushi::resolve(&view, urushi::Available::columns(15)).expect("resolve run outcome");
+        let rendered = urushi::render(&resolved, &urushi::RenderSettings::default());
 
-        assert_eq!(view.lines().len(), 3);
-        assert_eq!(view.lines()[1].spans()[0].text(), "└");
-        assert_eq!(view.lines()[2].spans()[0].text(), "     ");
+        assert_eq!(rendered.lines().count(), 3);
+        assert!(
+            rendered
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("└  ✓ ")),
+            "unexpected outcome rendering: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .nth(2)
+                .is_some_and(|line| line.starts_with("     "))
+        );
     }
 
     #[test]

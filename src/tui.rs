@@ -26,8 +26,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use tokio::task::JoinHandle;
-use urushi::{ComponentRole, TerminalProfile, Theme};
-use urushi_tui::RatatuiStyle;
+use urushi::{ComponentRole, PanelRole, TextStyle, Theme};
+use urushi_adapter_ratatui::RatatuiStyle;
 
 use crate::{
     app::{
@@ -39,7 +39,6 @@ use crate::{
     storage::{
         CatalogItemView, CatalogSessionPreview, CatalogSessionSummary, CatalogSourceDiagnostic,
     },
-    theme::AgentlogThemeExtension,
 };
 
 const BROWSE_SESSION_LIMIT: u32 = 500;
@@ -60,14 +59,11 @@ static TERMINAL_SESSION_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Returns an error when terminal setup, input, drawing, or normal terminal
 /// restoration fails. Catalog read failures remain visible and retryable in UI.
-pub(crate) async fn run(
-    paths: &AppPaths,
-    theme: &Theme<AgentlogThemeExtension>,
-    profile: &TerminalProfile,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(paths: &AppPaths, theme: &Theme) -> anyhow::Result<()> {
     let anchor_now = unix_now().context("read browse activity-date anchor")?;
     let mut terminal = TerminalSession::enter()?;
-    let mut state = BrowseState::with_styles(anchor_now, TuiStyles::resolve(theme, *profile));
+    let color = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    let mut state = BrowseState::with_styles(anchor_now, TuiStyles::resolve(theme, color));
     let mut preview_loader = PreviewLoader::new();
     let mut sync_loader = SyncLoader::new();
     if let Some(id) = load_sessions(paths, &mut state).await {
@@ -648,29 +644,49 @@ struct TuiStyles {
 }
 
 impl TuiStyles {
-    fn resolve(theme: &Theme<AgentlogThemeExtension>, profile: TerminalProfile) -> Self {
-        let component = |role| {
-            let resolved = profile.resolve_style(theme.style(role));
-            RatatuiStyle::from(&resolved)
+    fn resolve(theme: &Theme, color: bool) -> Self {
+        let adapt = |style: TextStyle| {
+            let style = if color {
+                style
+            } else {
+                style.reset_foreground().reset_background()
+            };
+            RatatuiStyle::from(&style)
         };
-        let panel = component(ComponentRole::Panel);
-        let panel_focused = component(ComponentRole::PanelFocused);
+        let component = |role| adapt(theme.text_style(role));
+        let panel = theme.block_style(PanelRole::Panel);
+        let panel_focused = theme.block_style(PanelRole::PanelFocused);
+        let panel_style = adapt(panel.text_style().clone());
+        let panel_border = adapt(panel_border_style(&panel));
+        let panel_focused_style = adapt(panel_focused.text_style().clone());
+        let panel_focused_border = adapt(panel_border_style(&panel_focused));
         Self {
             body: component(ComponentRole::Body).into_inner(),
             muted: component(ComponentRole::Muted).into_inner(),
             accent: component(ComponentRole::Accent).into_inner(),
             success: component(ComponentRole::Success).into_inner(),
-            warning: component(ComponentRole::Warning).into_inner(),
+            warning: adapt(TextStyle::new().foreground(theme.tokens().warning)).into_inner(),
             error: component(ComponentRole::Error).into_inner(),
             option: component(ComponentRole::PromptOption).into_inner(),
             option_selected: component(ComponentRole::PromptOptionSelected).into_inner(),
             help: component(ComponentRole::PromptHelp).into_inner(),
-            panel: panel.into_inner(),
-            panel_border: panel.border_style(),
-            panel_focused: panel_focused.into_inner(),
-            panel_focused_border: panel_focused.border_style(),
+            panel: panel_style.into_inner(),
+            panel_border: panel_border.into_inner(),
+            panel_focused: panel_focused_style.into_inner(),
+            panel_focused_border: panel_focused_border.into_inner(),
         }
     }
+}
+
+fn panel_border_style(panel: &urushi::BlockStyle) -> TextStyle {
+    let mut style = panel.get_border_text_style().clone();
+    if let Some(color) = panel.get_border_foreground() {
+        style = style.foreground(color);
+    }
+    if let Some(color) = panel.get_border_background() {
+        style = style.background(color);
+    }
+    style
 }
 
 #[derive(Clone, Debug)]
@@ -2173,16 +2189,14 @@ mod tests {
         },
     };
 
+    use crate::{
+        storage::CatalogItemView,
+        theme::{DEFAULT_COLOR_SCHEME, theme_set},
+    };
     use ratatui::{
         Terminal,
         backend::TestBackend,
         style::{Color, Modifier},
-    };
-    use urushi::{AnsiPolicy, ColorProfile};
-
-    use crate::{
-        storage::CatalogItemView,
-        theme::{DEFAULT_COLOR_SCHEME, theme_set},
     };
 
     use super::*;
@@ -2193,10 +2207,7 @@ mod tests {
     fn tui_styles_share_theme_colors_and_preserve_no_color_focus() {
         let themes = theme_set();
         let theme = themes.select(DEFAULT_COLOR_SCHEME);
-        let colored = TuiStyles::resolve(
-            theme,
-            TerminalProfile::new(ColorProfile::TrueColor, AnsiPolicy::Enabled),
-        );
+        let colored = TuiStyles::resolve(theme, true);
         assert_eq!(colored.option_selected.fg, Some(Color::Rgb(20, 24, 28)));
         assert_eq!(colored.option_selected.bg, Some(Color::Rgb(100, 170, 255)));
         assert_eq!(
@@ -2204,10 +2215,7 @@ mod tests {
             Some(Color::Rgb(100, 170, 255))
         );
 
-        let no_color = TuiStyles::resolve(
-            theme,
-            TerminalProfile::new(ColorProfile::Monochrome, AnsiPolicy::Enabled),
-        );
+        let no_color = TuiStyles::resolve(theme, false);
         assert_eq!(no_color.option_selected.fg, None);
         assert_eq!(no_color.option_selected.bg, None);
         assert!(
