@@ -140,7 +140,7 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
 
     let confirmed = taiwalog(&home, &["purge", "--yes"]);
     assert!(confirmed.status.success());
-    assert!(confirmed.stdout.is_empty());
+    assert_eq!(confirmed.stdout, Vec::<u8>::new());
     let completion_report = String::from_utf8(confirmed.stderr).expect("UTF-8 completion report");
     assert!(completion_report.contains("Purge complete: cleared 1 catalog sources"));
     assert!(completion_report.contains(

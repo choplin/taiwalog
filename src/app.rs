@@ -675,7 +675,7 @@ mod tests {
             .await
             .expect("read empty diagnostics");
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, Vec::new());
         assert!(paths.database_path.is_file());
     }
 
@@ -836,11 +836,9 @@ mod tests {
 
         assert_eq!(preview.sessions, 1);
         assert_eq!(cleared.sessions, 2);
-        assert!(
-            list_shell(&paths, 10)
-                .await
-                .expect("list purged catalog")
-                .is_empty()
+        assert_eq!(
+            list_shell(&paths, 10).await.expect("list purged catalog"),
+            Vec::new()
         );
     }
 
@@ -989,17 +987,15 @@ mod tests {
         assert_eq!(fingerprint(&paths.config_path), config_before);
         assert_eq!(fingerprint(&source), source_before);
 
-        assert!(
-            list_shell(&paths, 10)
-                .await
-                .expect("list purged catalog")
-                .is_empty()
+        assert_eq!(
+            list_shell(&paths, 10).await.expect("list purged catalog"),
+            Vec::new()
         );
-        assert!(
+        assert_eq!(
             diagnostics_shell(&paths)
                 .await
-                .expect("list purged diagnostics")
-                .is_empty()
+                .expect("list purged diagnostics"),
+            Vec::new()
         );
 
         let rebuilt = sync_shell(&paths)
