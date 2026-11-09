@@ -1,4 +1,4 @@
-//! Application workflows for Agentlog's local catalog and six read-only collectors.
+//! Application workflows for Taiwalog's local catalog and six read-only collectors.
 
 use std::{collections::BTreeMap, future::Future, path::PathBuf};
 
@@ -81,7 +81,7 @@ pub enum SyncProgress {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog-owned storage cannot be created, opened, or
+/// Returns an error when Taiwalog-owned storage cannot be created, opened, or
 /// queried.
 pub async fn sync_shell(paths: &AppPaths) -> anyhow::Result<SyncSummary> {
     sync_shell_with_progress(paths, |_| {}).await
@@ -94,7 +94,7 @@ pub async fn sync_shell(paths: &AppPaths) -> anyhow::Result<SyncSummary> {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog-owned storage cannot be created, opened, or
+/// Returns an error when Taiwalog-owned storage cannot be created, opened, or
 /// queried.
 pub async fn sync_shell_with_progress<F>(
     paths: &AppPaths,
@@ -272,7 +272,7 @@ fn provider_sessions(counts: &BTreeMap<String, u64>, provider: &str) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog-owned storage cannot be opened or queried.
+/// Returns an error when Taiwalog-owned storage cannot be opened or queried.
 pub async fn list_shell(
     paths: &AppPaths,
     limit: u32,
@@ -288,7 +288,7 @@ pub async fn list_shell(
 ///
 /// # Errors
 ///
-/// Returns an error when the selected session is unavailable or the Agentlog
+/// Returns an error when the selected session is unavailable or the Taiwalog
 /// catalog cannot be opened.
 pub async fn show_shell(
     paths: &AppPaths,
@@ -305,7 +305,7 @@ pub async fn show_shell(
 ///
 /// # Errors
 ///
-/// Returns an error when the session is unavailable or the Agentlog catalog
+/// Returns an error when the session is unavailable or the Taiwalog catalog
 /// cannot be opened.
 pub async fn show_shell_by_identity(
     paths: &AppPaths,
@@ -322,7 +322,7 @@ pub async fn show_shell_by_identity(
 ///
 /// # Errors
 ///
-/// Returns an error when the Agentlog catalog cannot be opened or queried.
+/// Returns an error when the Taiwalog catalog cannot be opened or queried.
 pub async fn diagnostics_shell(paths: &AppPaths) -> anyhow::Result<Vec<CatalogSourceDiagnostic>> {
     paths.ensure_data_dir()?;
     let catalog = Catalog::open(&paths.database_path).await?;
@@ -332,10 +332,10 @@ pub async fn diagnostics_shell(paths: &AppPaths) -> anyhow::Result<Vec<CatalogSo
 }
 
 /// Paths shown by the diagnostic command. All paths except provider sources are
-/// owned by Agentlog. Collectors will report provider source paths later.
+/// owned by Taiwalog. Collectors will report provider source paths later.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PathsReport {
-    pub agentlog_home: PathBuf,
+    pub taiwalog_home: PathBuf,
     pub config_file: PathBuf,
     pub data_directory: PathBuf,
     pub database: PathBuf,
@@ -345,7 +345,7 @@ pub struct PathsReport {
 #[must_use]
 pub fn paths_report(paths: &AppPaths) -> PathsReport {
     PathsReport {
-        agentlog_home: paths.home().to_path_buf(),
+        taiwalog_home: paths.home().to_path_buf(),
         config_file: paths.config_path.clone(),
         data_directory: paths.data_dir.clone(),
         database: paths.database_path.clone(),
@@ -353,7 +353,7 @@ pub fn paths_report(paths: &AppPaths) -> PathsReport {
     }
 }
 
-/// The Agentlog-owned catalog contents described by a purge operation.
+/// The Taiwalog-owned catalog contents described by a purge operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PurgeSummary {
     pub database: PathBuf,
@@ -377,7 +377,7 @@ pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgeSumm
         .await
         .with_context(|| {
             format!(
-                "inspect Agentlog-owned database {} for purge",
+                "inspect Taiwalog-owned database {} for purge",
                 paths.database_path.display()
             )
         })?;
@@ -391,7 +391,7 @@ pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgeSumm
     })
 }
 
-/// Reports, and when explicitly confirmed purges, only the Agentlog-owned
+/// Reports, and when explicitly confirmed purges, only the Taiwalog-owned
 /// catalog contents.
 ///
 /// The database path is fixed by [`AppPaths`]; configuration and provider-owned
@@ -403,7 +403,7 @@ pub async fn preview_purge_catalog(paths: &AppPaths) -> anyhow::Result<PurgeSumm
 /// writer serialization without waiting, then measures the main/WAL/SHM file
 /// set, counts rows, and purges them while preserving the schema and files.
 ///
-/// Returns an error when the database is not a regular Agentlog v1 catalog or
+/// Returns an error when the database is not a regular Taiwalog v1 catalog or
 /// an explicitly requested purge cannot acquire `SQLite`'s writer lock.
 pub async fn purge_catalog_shell(
     paths: &AppPaths,
@@ -433,7 +433,7 @@ where
                 .await
                 .with_context(|| {
                     format!(
-                        "purge Agentlog-owned database {}",
+                        "purge Taiwalog-owned database {}",
                         paths.database_path.display()
                     )
                 })?;
@@ -618,7 +618,7 @@ mod tests {
 
     fn directory_fingerprint(directory: &std::path::Path) -> Vec<(String, FileFingerprint)> {
         let mut files = fs::read_dir(directory)
-            .expect("read Agentlog data directory")
+            .expect("read Taiwalog data directory")
             .map(|entry| {
                 let entry = entry.expect("directory entry");
                 (
@@ -636,10 +636,10 @@ mod tests {
 
     async fn scanned_purge_fixture() -> (TempDir, AppPaths, std::path::PathBuf) {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
+        let taiwalog_home = temporary.path().join("taiwalog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         fs::create_dir_all(source.parent().expect("Gemini source parent"))
             .expect("create Gemini directory");
         fs::write(
@@ -656,8 +656,8 @@ mod tests {
             temporary.path().join("empty-cursor").display(),
             temporary.path().join("empty-kimi").display(),
         );
-        fs::write(agentlog_home.join("config.toml"), config).expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        fs::write(taiwalog_home.join("config.toml"), config).expect("write config");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
         let scan = sync_shell(&paths).await.expect("sync fixture source");
         assert_eq!(scan.sessions_available, 1);
 
@@ -667,9 +667,9 @@ mod tests {
     #[tokio::test]
     async fn diagnostics_shell_opens_the_catalog_without_scanning_sources() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let taiwalog_home = temporary.path().join("taiwalog");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         let diagnostics = diagnostics_shell(&paths)
             .await
@@ -943,7 +943,7 @@ mod tests {
     #[tokio::test]
     async fn confirmed_purge_rejects_a_final_component_symlink() {
         let (temporary, paths, _source) = scanned_purge_fixture().await;
-        let real_database = temporary.path().join("real-agentlog.sqlite3");
+        let real_database = temporary.path().join("real-taiwalog.sqlite3");
         fs::rename(&paths.database_path, &real_database).expect("move real database");
         symlink(&real_database, &paths.database_path).expect("link database path");
         let real_before = fingerprint(&real_database);
@@ -960,14 +960,14 @@ mod tests {
     #[tokio::test]
     async fn confirmed_purge_rejects_an_ancestor_symlink() {
         let (temporary, paths, _source) = scanned_purge_fixture().await;
-        let alias = temporary.path().join("agentlog-alias");
-        symlink(&paths.data_dir, &alias).expect("link Agentlog home");
+        let alias = temporary.path().join("taiwalog-alias");
+        symlink(&paths.data_dir, &alias).expect("link Taiwalog home");
         let aliased_paths = AppPaths::resolve(Some(alias)).expect("resolve aliased paths");
         let before = directory_fingerprint(&paths.data_dir);
 
         let error = purge_catalog_shell(&aliased_paths, true)
             .await
-            .expect_err("reject Agentlog home symlink during purge");
+            .expect_err("reject Taiwalog home symlink during purge");
 
         assert!(format!("{error:#}").contains("symbolic-link component"));
         assert_eq!(directory_fingerprint(&paths.data_dir), before);
@@ -1014,9 +1014,9 @@ mod tests {
     #[tokio::test]
     async fn purge_rejects_a_lookalike_v1_database_without_changing_it() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let taiwalog_home = temporary.path().join("taiwalog");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -1073,10 +1073,10 @@ mod tests {
     #[tokio::test]
     async fn shell_sync_creates_catalog_and_reports_empty_codex_collection() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        let taiwalog_home = temporary.path().join("taiwalog");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         fs::write(
-            agentlog_home.join("config.toml"),
+            taiwalog_home.join("config.toml"),
             format!(
                 "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
@@ -1088,7 +1088,7 @@ mod tests {
             ),
         )
         .expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         let summary = sync_shell(&paths).await.expect("run shell sync");
 
@@ -1112,8 +1112,8 @@ mod tests {
     #[tokio::test]
     async fn a_gemini_failure_does_not_block_a_cursor_source() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        let taiwalog_home = temporary.path().join("taiwalog");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         let gemini_root = temporary.path().join("gemini");
         let cursor_root = temporary.path().join("cursor");
         fs::create_dir_all(gemini_root.join("tmp")).expect("Gemini directory");
@@ -1125,7 +1125,7 @@ mod tests {
         )
         .expect("Cursor source");
         fs::write(
-            agentlog_home.join("config.toml"),
+            taiwalog_home.join("config.toml"),
             format!(
                 "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
@@ -1137,7 +1137,7 @@ mod tests {
             ),
         )
         .expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         let summary = sync_shell(&paths).await.expect("run shell sync");
 
@@ -1152,10 +1152,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_sync_keeps_a_source_last_good_session_in_the_catalog() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
+        let taiwalog_home = temporary.path().join("taiwalog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         fs::create_dir_all(source.parent().expect("Gemini source parent"))
             .expect("create Gemini directory");
         fs::write(
@@ -1164,7 +1164,7 @@ mod tests {
         )
         .expect("write valid Gemini source");
         fs::write(
-            agentlog_home.join("config.toml"),
+            taiwalog_home.join("config.toml"),
             format!(
                 "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
@@ -1176,7 +1176,7 @@ mod tests {
             ),
         )
         .expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         let first = sync_shell(&paths).await.expect("initial sync");
         assert_eq!(first.sessions_available, 1);
@@ -1196,10 +1196,10 @@ mod tests {
     #[tokio::test]
     async fn a_disappeared_source_is_retained_and_diagnosed_missing() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
+        let taiwalog_home = temporary.path().join("taiwalog");
         let gemini_root = temporary.path().join("gemini");
         let source = gemini_root.join("tmp/session.jsonl");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         fs::create_dir_all(source.parent().expect("Gemini source parent"))
             .expect("create Gemini directory");
         fs::write(
@@ -1208,7 +1208,7 @@ mod tests {
         )
         .expect("write valid Gemini source");
         fs::write(
-            agentlog_home.join("config.toml"),
+            taiwalog_home.join("config.toml"),
             format!(
                 "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
@@ -1220,7 +1220,7 @@ mod tests {
             ),
         )
         .expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         assert_eq!(
             sync_shell(&paths)
@@ -1254,10 +1254,10 @@ mod tests {
     #[tokio::test]
     async fn kimi_and_cursor_keep_identical_native_session_keys_in_distinct_sources() {
         let temporary = temporary_directory();
-        let agentlog_home = temporary.path().join("agentlog");
+        let taiwalog_home = temporary.path().join("taiwalog");
         let cursor_root = temporary.path().join("cursor");
         let kimi_root = temporary.path().join("kimi");
-        fs::create_dir(&agentlog_home).expect("create Agentlog home");
+        fs::create_dir(&taiwalog_home).expect("create Taiwalog home");
         fs::create_dir_all(cursor_root.join("projects/project/collision"))
             .expect("Cursor directory");
         fs::write(
@@ -1283,7 +1283,7 @@ mod tests {
         )
         .expect("Kimi index");
         fs::write(
-            agentlog_home.join("config.toml"),
+            taiwalog_home.join("config.toml"),
             format!(
                 "[providers]\ncodex_root = \"{}\"\nclaude_root = \"{}\"\nopencode_root = \"{}\"\ngemini_root = \"{}\"\ncursor_root = \"{}\"\nkimi_root = \"{}\"\n",
                 temporary.path().join("empty-codex").display(),
@@ -1295,7 +1295,7 @@ mod tests {
             ),
         )
         .expect("write config");
-        let paths = AppPaths::resolve(Some(agentlog_home)).expect("resolve paths");
+        let paths = AppPaths::resolve(Some(taiwalog_home)).expect("resolve paths");
 
         let summary = sync_shell(&paths).await.expect("run sync");
 
@@ -1321,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn one_sync_accepts_one_representative_source_from_each_provider() {
         let temporary = temporary_directory();
-        let home = temporary.path().join("agentlog");
+        let home = temporary.path().join("taiwalog");
         let codex = temporary.path().join("codex");
         let claude = temporary.path().join("claude");
         let opencode = temporary.path().join("opencode");

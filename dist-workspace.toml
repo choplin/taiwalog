@@ -3,7 +3,7 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.31.0"
-packages = ["agentlog"]
+packages = ["taiwalog"]
 ci = "github"
 hosting = "github"
 installers = ["homebrew"]

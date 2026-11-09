@@ -14,13 +14,13 @@ fn temporary_directory() -> TempDir {
     TempDir::new_in(platform_temp).expect("temporary directory")
 }
 
-fn agentlog(home: &Path, arguments: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_agentlog"))
+fn taiwalog(home: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_taiwalog"))
         .arg("--home")
         .arg(home)
         .args(arguments)
         .output()
-        .expect("run agentlog process")
+        .expect("run taiwalog process")
 }
 
 fn write_provider_fixture(temporary: &TempDir, home: &Path) {
@@ -89,20 +89,20 @@ fn report_field<'a>(report: &'a str, label: &str) -> &'a str {
 #[tokio::test]
 async fn purge_process_previews_and_removes_a_nonempty_catalog() {
     let temporary = temporary_directory();
-    let home = temporary.path().join("agentlog");
-    fs::create_dir(&home).expect("create Agentlog home");
+    let home = temporary.path().join("taiwalog");
+    fs::create_dir(&home).expect("create Taiwalog home");
     write_provider_fixture(&temporary, &home);
 
-    let sync = agentlog(&home, &["sync"]);
+    let sync = taiwalog(&home, &["sync"]);
     assert!(sync.status.success());
-    let list_before = agentlog(&home, &["list", "--json"]);
+    let list_before = taiwalog(&home, &["list", "--json"]);
     assert_eq!(json_session_count(&list_before), 1);
 
-    let database = home.join("agentlog.sqlite3");
+    let database = home.join("taiwalog.sqlite3");
     let expected_bytes = sqlite_file_set_size(&database);
     assert!(expected_bytes > 0);
 
-    let preview = agentlog(&home, &["purge"]);
+    let preview = taiwalog(&home, &["purge"]);
     assert!(preview.status.success());
     assert!(
         preview.stdout.is_empty(),
@@ -129,16 +129,16 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
         "purge reports a nonzero metadata-based file-set size"
     );
     assert!(preview_report.contains("No changes were made."));
-    assert!(preview_report.contains("agentlog purge --yes"));
+    assert!(preview_report.contains("taiwalog purge --yes"));
     assert!(preview_report.contains(
         "Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
     ));
 
-    let list_after_preview = agentlog(&home, &["list", "--json"]);
+    let list_after_preview = taiwalog(&home, &["list", "--json"]);
     assert_eq!(json_session_count(&list_after_preview), 1);
     assert_eq!(list_after_preview.stdout, list_before.stdout);
 
-    let confirmed = agentlog(&home, &["purge", "--yes"]);
+    let confirmed = taiwalog(&home, &["purge", "--yes"]);
     assert!(confirmed.status.success());
     assert!(confirmed.stdout.is_empty());
     let completion_report = String::from_utf8(confirmed.stderr).expect("UTF-8 completion report");
@@ -147,7 +147,7 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
         "Catalog data may not be reconstructible: only provider logs that still exist and remain readable can be synchronized."
     ));
 
-    let list_after_purge = agentlog(&home, &["list", "--json"]);
+    let list_after_purge = taiwalog(&home, &["list", "--json"]);
     assert_eq!(json_session_count(&list_after_purge), 0);
     let options = SqliteConnectOptions::new()
         .filename(&database)
@@ -169,18 +169,18 @@ async fn purge_process_previews_and_removes_a_nonempty_catalog() {
     assert_eq!(counts, (0, 0, 0));
     pool.close().await;
 
-    assert!(!agentlog(&home, &["data", "clear"]).status.success());
-    assert!(!agentlog(&home, &["purge", "--dry-run"]).status.success());
+    assert!(!taiwalog(&home, &["data", "clear"]).status.success());
+    assert!(!taiwalog(&home, &["purge", "--dry-run"]).status.success());
 }
 
 #[test]
 fn sync_process_keeps_json_stdout_clean_and_bounds_noninteractive_progress() {
     let temporary = temporary_directory();
-    let home = temporary.path().join("agentlog");
-    fs::create_dir(&home).expect("create Agentlog home");
+    let home = temporary.path().join("taiwalog");
+    fs::create_dir(&home).expect("create Taiwalog home");
     write_provider_fixture(&temporary, &home);
 
-    let output = agentlog(&home, &["sync", "--json"]);
+    let output = taiwalog(&home, &["sync", "--json"]);
 
     assert!(output.status.success());
     let summary = serde_json::from_slice::<serde_json::Value>(&output.stdout)

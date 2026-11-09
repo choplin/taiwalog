@@ -1,13 +1,13 @@
 [package]
-name = "agentlog"
+name = "taiwalog"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 publish = false
 description = "A local browser for AI coding-agent session history"
 license = "MIT"
-repository = "https://github.com/choplin/agentlog"
-homepage = "https://github.com/choplin/agentlog"
+repository = "https://github.com/choplin/taiwalog"
+homepage = "https://github.com/choplin/taiwalog"
 
 [package.metadata.release]
 publish = false

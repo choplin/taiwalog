@@ -1,4 +1,4 @@
-//! Command-line transport for Agentlog application workflows.
+//! Command-line transport for Taiwalog application workflows.
 
 use std::{
     fs::OpenOptions,
@@ -32,8 +32,8 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Agentlog-owned home directory. Intended for tests and isolated installs.
-    #[arg(long, global = true, env = "AGENTLOG_HOME", value_name = "DIR")]
+    /// Taiwalog-owned home directory. Intended for tests and isolated installs.
+    #[arg(long, global = true, env = "TAIWALOG_HOME", value_name = "DIR")]
     home: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -41,7 +41,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show Agentlog-owned paths and the separate provider-source boundary.
+    /// Show Taiwalog-owned paths and the separate provider-source boundary.
     Paths {
         /// Emit a machine-readable report.
         #[arg(long)]
@@ -64,15 +64,15 @@ enum Command {
     },
     /// Preview one already-cataloged session without synchronizing provider-owned files.
     Show {
-        /// Catalog session ID from `agentlog list`.
+        /// Catalog session ID from `taiwalog list`.
         session_id: i64,
         /// Emit a machine-readable report.
         #[arg(long)]
         json: bool,
     },
-    /// Preview and interactively confirm, or with --yes purge, the Agentlog-owned catalog.
+    /// Preview and interactively confirm, or with --yes purge, the Taiwalog-owned catalog.
     Purge {
-        /// Purge the reported Agentlog-owned catalog contents.
+        /// Purge the reported Taiwalog-owned catalog contents.
         #[arg(long)]
         yes: bool,
     },
@@ -93,7 +93,7 @@ pub async fn run() -> anyhow::Result<()> {
         println!();
         return Ok(());
     };
-    let paths = AppPaths::resolve(home).context("resolve Agentlog-owned paths")?;
+    let paths = AppPaths::resolve(home).context("resolve Taiwalog-owned paths")?;
     let themes = theme_set();
     let theme = themes.select(DEFAULT_COLOR_SCHEME);
 
@@ -107,7 +107,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Agentlog's run-level composition over reusable urushi components.
+/// Taiwalog's run-level composition over reusable urushi components.
 ///
 /// The rails and start/end vocabulary belong to this CLI workflow, while
 /// styling, stable component views, ANSI rendering, and live-region lifecycle
@@ -274,7 +274,7 @@ async fn print_purge(paths: &AppPaths, yes: bool, theme: &Theme) -> anyhow::Resu
     let report = RunUi::new(theme);
 
     report
-        .start("Purge Agentlog catalog")
+        .start("Purge Taiwalog catalog")
         .context("start purge report")?;
 
     if yes {
@@ -297,7 +297,7 @@ async fn print_purge(paths: &AppPaths, yes: bool, theme: &Theme) -> anyhow::Resu
         None => {
             report
                 .finish_cancelled(
-                    "No changes were made. Re-run with `agentlog purge --yes` to confirm.",
+                    "No changes were made. Re-run with `taiwalog purge --yes` to confirm.",
                 )
                 .context("finish unconfirmed purge report")?;
         }
@@ -368,7 +368,7 @@ fn print_purge_completion(
             summary.approximate_bytes
         )
     } else {
-        "Purge complete: no Agentlog-owned database was present.".to_owned()
+        "Purge complete: no Taiwalog-owned database was present.".to_owned()
     };
     report
         .finish_success(message)
@@ -484,15 +484,15 @@ fn print_paths(paths: &AppPaths, json: bool, theme: &Theme) -> anyhow::Result<()
         let palette = OutputPalette::for_stdout(theme);
         println!(
             "{} {}",
-            palette.paint(ComponentRole::Muted, "Agentlog-owned home:"),
+            palette.paint(ComponentRole::Muted, "Taiwalog-owned home:"),
             palette.paint(
                 ComponentRole::Body,
-                &visible_text(&report.agentlog_home.display().to_string())
+                &visible_text(&report.taiwalog_home.display().to_string())
             )
         );
         println!(
             "{} {}",
-            palette.paint(ComponentRole::Muted, "Agentlog-owned config:"),
+            palette.paint(ComponentRole::Muted, "Taiwalog-owned config:"),
             palette.paint(
                 ComponentRole::Body,
                 &visible_text(&report.config_file.display().to_string())
@@ -500,7 +500,7 @@ fn print_paths(paths: &AppPaths, json: bool, theme: &Theme) -> anyhow::Result<()
         );
         println!(
             "{} {}",
-            palette.paint(ComponentRole::Muted, "Agentlog-owned data:"),
+            palette.paint(ComponentRole::Muted, "Taiwalog-owned data:"),
             palette.paint(
                 ComponentRole::Body,
                 &visible_text(&report.data_directory.display().to_string())
@@ -508,7 +508,7 @@ fn print_paths(paths: &AppPaths, json: bool, theme: &Theme) -> anyhow::Result<()
         );
         println!(
             "{} {}",
-            palette.paint(ComponentRole::Muted, "Agentlog-owned database:"),
+            palette.paint(ComponentRole::Muted, "Taiwalog-owned database:"),
             palette.paint(
                 ComponentRole::Body,
                 &visible_text(&report.database.display().to_string())
@@ -725,7 +725,7 @@ async fn print_list(paths: &AppPaths, limit: u32, json: bool, theme: &Theme) -> 
             "{}",
             palette.paint(
                 ComponentRole::Muted,
-                "No cataloged sessions. Run `agentlog sync` to synchronize sources."
+                "No cataloged sessions. Run `taiwalog sync` to synchronize sources."
             )
         );
     } else {
@@ -939,14 +939,14 @@ mod tests {
 
     #[test]
     fn purge_accepts_preview_and_explicit_confirmation() {
-        let preview = Cli::try_parse_from(["agentlog", "purge"]).expect("parse purge preview");
+        let preview = Cli::try_parse_from(["taiwalog", "purge"]).expect("parse purge preview");
         assert!(matches!(
             preview.command,
             Some(Command::Purge { yes: false })
         ));
 
         let confirmed =
-            Cli::try_parse_from(["agentlog", "purge", "--yes"]).expect("parse confirmed purge");
+            Cli::try_parse_from(["taiwalog", "purge", "--yes"]).expect("parse confirmed purge");
         assert!(matches!(
             confirmed.command,
             Some(Command::Purge { yes: true })
@@ -955,14 +955,14 @@ mod tests {
 
     #[test]
     fn purge_rejects_legacy_data_clear_and_dry_run_forms() {
-        assert!(Cli::try_parse_from(["agentlog", "data", "clear"]).is_err());
-        assert!(Cli::try_parse_from(["agentlog", "purge", "--dry-run"]).is_err());
+        assert!(Cli::try_parse_from(["taiwalog", "data", "clear"]).is_err());
+        assert!(Cli::try_parse_from(["taiwalog", "purge", "--dry-run"]).is_err());
     }
 
     #[test]
     fn purge_confirmation_message_names_the_previewed_blast_radius() {
         let summary = crate::app::PurgeSummary {
-            database: std::path::PathBuf::from("/tmp/agentlog.sqlite3"),
+            database: std::path::PathBuf::from("/tmp/taiwalog.sqlite3"),
             sources: 2,
             sessions: 3,
             transcript_items: 5,
@@ -1006,14 +1006,14 @@ mod tests {
 
     #[test]
     fn bare_root_keeps_the_command_empty_for_help_without_running_sync() {
-        let cli = Cli::try_parse_from(["agentlog"]).expect("parse bare root command");
+        let cli = Cli::try_parse_from(["taiwalog"]).expect("parse bare root command");
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn sync_is_accepted_and_scan_is_rejected() {
-        let sync = Cli::try_parse_from(["agentlog", "sync"]).expect("parse explicit sync command");
+        let sync = Cli::try_parse_from(["taiwalog", "sync"]).expect("parse explicit sync command");
         assert!(matches!(sync.command, Some(Command::Sync { json: false })));
-        assert!(Cli::try_parse_from(["agentlog", "scan"]).is_err());
+        assert!(Cli::try_parse_from(["taiwalog", "scan"]).is_err());
     }
 }

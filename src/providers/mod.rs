@@ -1,4 +1,4 @@
-//! Provider-native models and their Agentlog scanning adapters.
+//! Provider-native models and their Taiwalog scanning adapters.
 
 use std::{future::Future, path::PathBuf, pin::Pin};
 
@@ -16,7 +16,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 
-/// Iterates the provider scanners installed in this Agentlog release.
+/// Iterates the provider scanners installed in this Taiwalog release.
 #[must_use]
 pub fn installed(roots: &ProviderRoots) -> InstalledProviders<'_> {
     InstalledProviders { roots, next: 0 }
@@ -100,7 +100,7 @@ pub fn source_descriptions(roots: &ProviderRoots) -> String {
     descriptions.join("; ")
 }
 
-/// Stable identity of a provider supported by this Agentlog release.
+/// Stable identity of a provider supported by this Taiwalog release.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProviderId {
     Codex,
@@ -145,7 +145,7 @@ pub struct ProviderScanReport {
     pub missing_sources: u64,
 }
 
-/// A provider-specific adapter that starts one Agentlog scan.
+/// A provider-specific adapter that starts one Taiwalog scan.
 pub trait ProviderScanner {
     /// Stable provider identity stored in the catalog.
     fn provider_id(&self) -> ProviderId;

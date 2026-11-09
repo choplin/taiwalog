@@ -1,6 +1,6 @@
 # Provider reference
 
-Agentlog supports Codex, Claude Code, OpenCode, Gemini CLI, Cursor, and Kimi
+Taiwalog supports Codex, Claude Code, OpenCode, Gemini CLI, Cursor, and Kimi
 Code. All collectors emit the catalog model defined in
 [Data architecture](data-architecture.md#stored-catalog-data).
 
@@ -8,9 +8,9 @@ Code. All collectors emit the catalog model defined in
 
 | Rule | Behavior |
 | --- | --- |
-| Ownership | Provider sources are read only; normalized results go only to Agentlog's catalog. |
+| Ownership | Provider sources are read only; normalized results go only to Taiwalog's catalog. |
 | Override | An absolute `providers.*_root` in `config.toml` has highest precedence. Relative roots are rejected. |
-| Agentlog home | `--home` and `AGENTLOG_HOME` never redirect provider discovery. |
+| Taiwalog home | `--home` and `TAIWALOG_HOME` never redirect provider discovery. |
 | Discovery error | Fails only that provider and does not mark its retained sources missing. |
 | Source error | Records `error`, preserves last-good sessions, and continues with other sources. |
 | Missing source | After completed discovery, records `missing` and preserves last-good sessions. |

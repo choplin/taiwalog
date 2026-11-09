@@ -29,7 +29,7 @@ if [ ! -d "$dist_dir" ]; then
   exit 1
 fi
 
-staging_root=$(mktemp -d "$dist_dir/.agentlog-release.XXXXXX")
+staging_root=$(mktemp -d "$dist_dir/.taiwalog-release.XXXXXX")
 trap 'rm -rf -- "$staging_root"' EXIT HUP INT TERM
 target_dir="$staging_root/cargo-target"
 
@@ -39,7 +39,7 @@ CARGO_TARGET_DIR="$target_dir" cargo build \
   --locked \
   --target "$host"
 
-binary="$target_dir/$host/release/agentlog"
+binary="$target_dir/$host/release/taiwalog"
 binary_description=$(file -b "$binary")
 case "$binary_description" in
   *"$expected_arch"*) ;;
@@ -51,17 +51,17 @@ esac
 
 version=$("$binary" --version | awk 'NR == 1 { print $2 }')
 if [ -z "$version" ]; then
-  echo "Could not determine the Agentlog version." >&2
+  echo "Could not determine the Taiwalog version." >&2
   exit 1
 fi
 
-bundle_name="agentlog-$version-$host"
+bundle_name="taiwalog-$version-$host"
 bundle_dir="$staging_root/$bundle_name"
 staged_archive="$staging_root/$bundle_name.tar.gz"
 archive="$dist_dir/$bundle_name.tar.gz"
 
 mkdir -p "$bundle_dir"
-install -m 0755 "$binary" "$bundle_dir/agentlog"
+install -m 0755 "$binary" "$bundle_dir/taiwalog"
 install -m 0755 "$repo_root/scripts/install-macos-release.sh" "$bundle_dir/install.sh"
 install -m 0644 "$repo_root/README.md" "$bundle_dir/README.md"
 COPYFILE_DISABLE=1 tar -czf "$staged_archive" -C "$staging_root" "$bundle_name"

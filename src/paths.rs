@@ -1,4 +1,4 @@
-//! Agentlog-owned paths and the deliberately small local configuration file.
+//! Taiwalog-owned paths and the deliberately small local configuration file.
 
 use std::{
     env,
@@ -15,11 +15,11 @@ use crate::providers::{
     gemini::GeminiProvider, kimi::KimiProvider, opencode::OpenCodeProvider,
 };
 
-const DEFAULT_DATA_HOME: &str = ".local/share/agentlog";
+const DEFAULT_DATA_HOME: &str = ".local/share/taiwalog";
 const CONFIG_FILE: &str = "config.toml";
-const DATABASE_FILE: &str = "agentlog.sqlite3";
+const DATABASE_FILE: &str = "taiwalog.sqlite3";
 
-/// Locations that Agentlog owns and may create or modify.
+/// Locations that Taiwalog owns and may create or modify.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppPaths {
     home: PathBuf,
@@ -31,16 +31,16 @@ pub struct AppPaths {
 
 impl AppPaths {
     /// Resolves the platform-owned data location, or an explicit override.
-    /// `AGENTLOG_HOME` has the same meaning as `--home`.
+    /// `TAIWALOG_HOME` has the same meaning as `--home`.
     ///
     /// # Errors
     ///
     /// Returns an error when no home directory is available, config is invalid,
     /// or a configured provider root is relative.
     pub fn resolve(home_override: Option<PathBuf>) -> Result<Self, PathError> {
-        let home = resolve_agentlog_home(
+        let home = resolve_taiwalog_home(
             home_override,
-            env::var_os("AGENTLOG_HOME"),
+            env::var_os("TAIWALOG_HOME"),
             env::var_os("XDG_DATA_HOME"),
             env::var_os("HOME"),
         )?;
@@ -61,12 +61,12 @@ impl AppPaths {
         })
     }
 
-    /// Creates only directories owned by Agentlog. Provider sources are never
+    /// Creates only directories owned by Taiwalog. Provider sources are never
     /// created, inspected, or changed here.
     ///
     /// # Errors
     ///
-    /// Returns an error when the Agentlog-owned directory cannot be created.
+    /// Returns an error when the Taiwalog-owned directory cannot be created.
     pub fn ensure_data_dir(&self) -> Result<(), PathError> {
         fs::create_dir_all(&self.data_dir).map_err(|source| PathError::CreateDirectory {
             path: self.data_dir.clone(),
@@ -74,7 +74,7 @@ impl AppPaths {
         })
     }
 
-    /// The root that contains Agentlog config and data. Exposed for diagnostics.
+    /// The root that contains Taiwalog config and data. Exposed for diagnostics.
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
@@ -87,7 +87,7 @@ impl AppPaths {
         &self.provider_roots
     }
 
-    /// Returns the read-only Codex root. Agentlog's `--home` setting never
+    /// Returns the read-only Codex root. Taiwalog's `--home` setting never
     /// changes this provider-owned location.
     ///
     /// The precedence is explicit config, `CODEX_HOME`, then `~/.codex`.
@@ -109,7 +109,7 @@ impl AppPaths {
     /// Claude Code stores project transcripts below `~/.claude/projects` by
     /// default. `CLAUDE_CONFIG_DIR` follows the CLI's configuration-root
     /// convention, so it is used before the operating-system default.
-    /// Agentlog's `--home` setting never changes this provider-owned location.
+    /// Taiwalog's `--home` setting never changes this provider-owned location.
     ///
     /// # Errors
     ///
@@ -126,11 +126,11 @@ impl AppPaths {
     /// Returns the read-only `OpenCode` data roots.
     ///
     /// `OpenCode` keeps its local catalog below the XDG data directory by
-    /// default. Agentlog's `--home` setting never changes this
+    /// default. Taiwalog's `--home` setting never changes this
     /// provider-owned location.
     ///
     /// An explicit config root or a valid absolute
-    /// `XDG_DATA_HOME/opencode` is authoritative. Without either, Agentlog uses
+    /// `XDG_DATA_HOME/opencode` is authoritative. Without either, Taiwalog uses
     /// the native default for the current OS: Application Support on macOS or
     /// the XDG HOME fallback on Linux.
     ///
@@ -149,7 +149,7 @@ impl AppPaths {
     /// Returns the read-only `Gemini` CLI configuration root.
     ///
     /// The precedence is explicit config, `GEMINI_CLI_HOME/.gemini`, then
-    /// `~/.gemini`. Agentlog's `--home` setting never changes this
+    /// `~/.gemini`. Taiwalog's `--home` setting never changes this
     /// provider-owned location.
     ///
     /// # Errors
@@ -166,7 +166,7 @@ impl AppPaths {
 
     /// Returns the read-only `Cursor` configuration root.
     ///
-    /// The precedence is explicit config, then `~/.cursor`. Agentlog's
+    /// The precedence is explicit config, then `~/.cursor`. Taiwalog's
     /// `--home` setting never changes this provider-owned location.
     ///
     /// # Errors
@@ -180,7 +180,7 @@ impl AppPaths {
     /// Returns the read-only Kimi Code configuration root.
     ///
     /// The precedence is explicit config, `KIMI_CODE_HOME`, then
-    /// `~/.kimi-code`. Agentlog's `--home` setting never changes this
+    /// `~/.kimi-code`. Taiwalog's `--home` setting never changes this
     /// provider-owned location.
     ///
     /// # Errors
@@ -254,15 +254,15 @@ fn resolve_kimi_root(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-compile_error!("Agentlog supports only macOS and Linux");
+compile_error!("Taiwalog supports only macOS and Linux");
 
-fn resolve_agentlog_home(
+fn resolve_taiwalog_home(
     home_override: Option<PathBuf>,
-    agentlog_home: Option<OsString>,
+    taiwalog_home: Option<OsString>,
     xdg_data_home: Option<OsString>,
     os_home: Option<OsString>,
 ) -> Result<PathBuf, PathError> {
-    if let Some(home) = home_override.or_else(|| agentlog_home.map(PathBuf::from)) {
+    if let Some(home) = home_override.or_else(|| taiwalog_home.map(PathBuf::from)) {
         return if home.as_os_str().is_empty() {
             Err(PathError::EmptyHome)
         } else {
@@ -274,7 +274,7 @@ fn resolve_agentlog_home(
         && !data_home.as_os_str().is_empty()
         && data_home.is_absolute()
     {
-        return Ok(data_home.join("agentlog"));
+        return Ok(data_home.join("taiwalog"));
     }
 
     let os_home = os_home
@@ -383,12 +383,12 @@ impl ProviderRoots {
     }
 }
 
-/// Errors while resolving Agentlog-owned local state.
+/// Errors while resolving Taiwalog-owned local state.
 #[derive(Debug, Error)]
 pub enum PathError {
-    #[error("Agentlog home cannot be empty")]
+    #[error("Taiwalog home cannot be empty")]
     EmptyHome,
-    #[error("cannot resolve the default Agentlog home because HOME is unavailable")]
+    #[error("cannot resolve the default Taiwalog home because HOME is unavailable")]
     HomeUnavailable,
     #[error(
         "cannot resolve the default Codex root because neither CODEX_HOME nor HOME is available"
@@ -422,12 +422,12 @@ pub enum PathError {
     KimiHomeUnavailable,
     #[error("Kimi root must be a nonempty absolute path, got {path}")]
     InvalidKimiRoot { path: PathBuf },
-    #[error("cannot read Agentlog config at {path}: {source}")]
+    #[error("cannot read Taiwalog config at {path}: {source}")]
     ReadConfig {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("Agentlog config at {path} is invalid: {source}")]
+    #[error("Taiwalog config at {path} is invalid: {source}")]
     InvalidConfig {
         path: PathBuf,
         source: toml::de::Error,
@@ -437,7 +437,7 @@ pub enum PathError {
         provider: &'static str,
         path: PathBuf,
     },
-    #[error("cannot create Agentlog data directory {path}: {source}")]
+    #[error("cannot create Taiwalog data directory {path}: {source}")]
     CreateDirectory {
         path: PathBuf,
         source: std::io::Error,
@@ -474,12 +474,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AppPaths, resolve_agentlog_home, resolve_claude_root, resolve_codex_root,
-        resolve_cursor_root, resolve_gemini_root, resolve_kimi_root, resolve_opencode_roots,
+        AppPaths, resolve_claude_root, resolve_codex_root, resolve_cursor_root,
+        resolve_gemini_root, resolve_kimi_root, resolve_opencode_roots, resolve_taiwalog_home,
     };
 
     #[test]
-    fn agentlog_home_precedence_and_xdg_defaults_are_table_driven() {
+    fn taiwalog_home_precedence_and_xdg_defaults_are_table_driven() {
         struct Case {
             name: &'static str,
             explicit: Option<&'static str>,
@@ -512,7 +512,7 @@ mod tests {
                 environment: None,
                 xdg: Some("/Users/example/.xdg/data"),
                 home: Some("/Users/example"),
-                expected: Ok("/Users/example/.xdg/data/agentlog"),
+                expected: Ok("/Users/example/.xdg/data/taiwalog"),
             },
             Case {
                 name: "Linux uses absolute XDG data home",
@@ -520,7 +520,7 @@ mod tests {
                 environment: None,
                 xdg: Some("/xdg/data"),
                 home: Some("/home/example"),
-                expected: Ok("/xdg/data/agentlog"),
+                expected: Ok("/xdg/data/taiwalog"),
             },
             Case {
                 name: "empty XDG data home uses the XDG HOME fallback",
@@ -528,7 +528,7 @@ mod tests {
                 environment: None,
                 xdg: Some(""),
                 home: Some("/home/example"),
-                expected: Ok("/home/example/.local/share/agentlog"),
+                expected: Ok("/home/example/.local/share/taiwalog"),
             },
             Case {
                 name: "relative XDG data home uses the XDG HOME fallback",
@@ -536,7 +536,7 @@ mod tests {
                 environment: None,
                 xdg: Some("relative/data"),
                 home: Some("/home/example"),
-                expected: Ok("/home/example/.local/share/agentlog"),
+                expected: Ok("/home/example/.local/share/taiwalog"),
             },
             Case {
                 name: "missing operating-system home fails",
@@ -549,7 +549,7 @@ mod tests {
         ];
 
         for case in cases {
-            let result = resolve_agentlog_home(
+            let result = resolve_taiwalog_home(
                 case.explicit.map(PathBuf::from),
                 case.environment.map(OsString::from),
                 case.xdg.map(OsString::from),
@@ -572,20 +572,44 @@ mod tests {
     }
 
     #[test]
-    fn explicit_home_keeps_database_inside_agentlog_owned_directory() {
+    fn default_home_does_not_discover_or_modify_agentlog_data() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let legacy_home = temporary.path().join(".local/share/agentlog");
+        fs::create_dir_all(&legacy_home).expect("create legacy home");
+        let legacy_catalog = legacy_home.join("agentlog.sqlite3");
+        fs::write(&legacy_catalog, b"legacy catalog").expect("write legacy catalog");
+
+        let home = resolve_taiwalog_home(
+            None,
+            None,
+            None,
+            Some(temporary.path().as_os_str().to_os_string()),
+        )
+        .expect("resolve Taiwalog home");
+
+        assert_eq!(home, temporary.path().join(".local/share/taiwalog"));
+        assert_eq!(
+            fs::read(&legacy_catalog).expect("read legacy catalog"),
+            b"legacy catalog"
+        );
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn explicit_home_keeps_database_inside_taiwalog_owned_directory() {
         let temporary = TempDir::new().expect("temporary directory");
         let paths =
-            AppPaths::resolve(Some(temporary.path().join("agentlog"))).expect("paths resolve");
+            AppPaths::resolve(Some(temporary.path().join("taiwalog"))).expect("paths resolve");
 
         assert_eq!(paths.home(), paths.data_dir);
-        assert_eq!(paths.database_path, paths.data_dir.join("agentlog.sqlite3"));
+        assert_eq!(paths.database_path, paths.data_dir.join("taiwalog.sqlite3"));
         assert_eq!(paths.config_path, paths.data_dir.join("config.toml"));
     }
 
     #[test]
     fn config_accepts_explicit_provider_roots_without_changing_owned_database_path() {
         let temporary = TempDir::new().expect("temporary directory");
-        let home = temporary.path().join("agentlog");
+        let home = temporary.path().join("taiwalog");
         fs::create_dir(&home).expect("create home");
         fs::write(
             home.join("config.toml"),
@@ -595,7 +619,7 @@ mod tests {
 
         let paths = AppPaths::resolve(Some(home.clone())).expect("paths resolve");
 
-        assert_eq!(paths.database_path, home.join("agentlog.sqlite3"));
+        assert_eq!(paths.database_path, home.join("taiwalog.sqlite3"));
         assert_eq!(
             paths.provider_roots().codex_root(),
             Some(Path::new("/private/tmp/codex"))
@@ -605,7 +629,7 @@ mod tests {
     #[test]
     fn config_rejects_unrelated_configuration() {
         let temporary = TempDir::new().expect("temporary directory");
-        let home = temporary.path().join("agentlog");
+        let home = temporary.path().join("taiwalog");
         fs::create_dir(&home).expect("create home");
         fs::write(home.join("config.toml"), "[enrichment]\nenabled = true\n")
             .expect("write config");
@@ -618,7 +642,7 @@ mod tests {
     #[test]
     fn config_rejects_relative_provider_roots() {
         let temporary = TempDir::new().expect("temporary directory");
-        let home = temporary.path().join("agentlog");
+        let home = temporary.path().join("taiwalog");
         fs::create_dir(&home).expect("create home");
         fs::write(
             home.join("config.toml"),
@@ -632,9 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn configured_codex_root_is_independent_from_agentlog_home() {
+    fn configured_codex_root_is_independent_from_taiwalog_home() {
         let temporary = TempDir::new().expect("temporary directory");
-        let home = temporary.path().join("agentlog");
+        let home = temporary.path().join("taiwalog");
         fs::create_dir(&home).expect("create home");
         fs::write(
             home.join("config.toml"),

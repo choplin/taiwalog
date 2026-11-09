@@ -3,14 +3,14 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 archive=$("$repo_root/scripts/build-macos-release.sh")
-smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/agentlog-install-smoke.XXXXXX")
+smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/taiwalog-install-smoke.XXXXXX")
 trap 'rm -rf -- "$smoke_root"' EXIT HUP INT TERM
 
 COPYFILE_DISABLE=1 tar -xzf "$archive" -C "$smoke_root"
 bundle_name=$(basename "$archive" .tar.gz)
 bundle_dir="$smoke_root/$bundle_name"
 prefix="$smoke_root/prefix"
-binary_description=$(file -b "$bundle_dir/agentlog")
+binary_description=$(file -b "$bundle_dir/taiwalog")
 host=$(rustc -vV | sed -n 's/^host: //p')
 
 case "$host" in
@@ -37,7 +37,7 @@ case "$binary_description" in
 esac
 
 "$bundle_dir/install.sh" "$prefix"
-"$prefix/bin/agentlog" --help >/dev/null
-"$prefix/bin/agentlog" --home "$smoke_root/home" paths --json >/dev/null
+"$prefix/bin/taiwalog" --help >/dev/null
+"$prefix/bin/taiwalog" --home "$smoke_root/home" paths --json >/dev/null
 
 printf 'Install smoke passed for %s\n' "$(basename "$archive")"

@@ -1,18 +1,18 @@
 # Data architecture
 
-Agentlog builds a local, derived catalog from coding-agent session history.
+Taiwalog builds a local, derived catalog from coding-agent session history.
 This is the current technical contract, not a privacy policy.
 
 ## At a glance
 
 | Question | Current behavior |
 | --- | --- |
-| What does Agentlog read? | Local session sources listed in [Source discovery and root precedence](providers.md#source-discovery-and-root-precedence). |
-| Does Agentlog modify provider logs? | No. Collectors read provider-owned sources; only Agentlog-owned storage is written. |
+| What does Taiwalog read? | Local session sources listed in [Source discovery and root precedence](providers.md#source-discovery-and-root-precedence). |
+| Does Taiwalog modify provider logs? | No. Collectors read provider-owned sources; only Taiwalog-owned storage is written. |
 | What enters the catalog? | Source/session metadata, visible user and assistant text, and bounded tool names/statuses. |
 | What is omitted? | Provider-native reasoning, structured tool payloads, structured diffs, images, attachments, and raw records. |
-| Does Agentlog send catalog data elsewhere? | No. The current runtime has no server, account, telemetry, AI service, or remote synchronization path. |
-| What does `purge` remove? | Rows in Agentlog's SQLite catalog. It keeps provider logs, configuration, database files, and schema. |
+| Does Taiwalog send catalog data elsewhere? | No. The current runtime has no server, account, telemetry, AI service, or remote synchronization path. |
+| What does `purge` remove? | Rows in Taiwalog's SQLite catalog. It keeps provider logs, configuration, database files, and schema. |
 
 ## Data ownership and flow
 
@@ -23,7 +23,7 @@ provider-owned sources (read only)
 provider-specific bounded projection
         |
         v
-Agentlog-owned SQLite catalog
+Taiwalog-owned SQLite catalog
         |
         +--> list / show / filters / diagnostics / TUI
 ```
@@ -34,26 +34,29 @@ Rules:
 2. File collectors use metadata and byte reads. OpenCode copies its bounded
    database and WAL to a private temporary directory; SQLite opens only the copy.
 3. Each accepted source becomes a bounded normalized snapshot.
-4. Agentlog writes snapshots only to its own SQLite catalog.
+4. Taiwalog writes snapshots only to its own SQLite catalog.
 5. `list`, `show`, and the TUI read the catalog and never trigger provider sync.
 
-`--home` and `AGENTLOG_HOME` change only Agentlog-owned storage. Provider roots
+`--home` and `TAIWALOG_HOME` change only Taiwalog-owned storage. Provider roots
 use separate settings; see
 [Source discovery and root precedence](providers.md#source-discovery-and-root-precedence).
 
-## Agentlog-owned storage
+## Taiwalog-owned storage
 
-Agentlog keeps `config.toml` and `agentlog.sqlite3` in one data directory.
+Taiwalog keeps `config.toml` and `taiwalog.sqlite3` in one data directory.
 
 | Precedence | Data directory |
 | ---: | --- |
 | 1 | `--home DIR` |
-| 2 | `AGENTLOG_HOME` |
-| 3 | absolute, non-empty `XDG_DATA_HOME` + `/agentlog` |
-| 4 | `$HOME/.local/share/agentlog` |
+| 2 | `TAIWALOG_HOME` |
+| 3 | absolute, non-empty `XDG_DATA_HOME` + `/taiwalog` |
+| 4 | `$HOME/.local/share/taiwalog` |
 
-Agentlog may create this directory and update its catalog. It does not create
+Taiwalog may create this directory and update its catalog. It does not create
 provider roots or write into them.
+
+Agentlog 0.1.x data is not discovered or migrated. Taiwalog starts with its own
+catalog, and does not remove the old Agentlog data directory.
 
 ## Stored catalog data
 
@@ -67,7 +70,7 @@ Schema v1 has three tables.
 
 Notes:
 
-- Missing provider metadata remains absent; Agentlog does not invent values.
+- Missing provider metadata remains absent; Taiwalog does not invent values.
 - A valid source with no supported visible conversation can produce no session.
 - Interactive diagnostics show source locators. Serialized list and preview
   results omit them.
@@ -118,9 +121,9 @@ The current runtime reads local provider sources and writes or reads the local
 SQLite catalog. It has no outbound data client or remote catalog path. Build and
 installation distribution are outside this runtime boundary.
 
-## Purging Agentlog data
+## Purging Taiwalog data
 
-`agentlog purge` previews the target path, row counts, and approximate SQLite
+`taiwalog purge` previews the target path, row counts, and approximate SQLite
 main/WAL/SHM size using a short read-only transaction and file metadata. After
 confirmation, purge acquires SQLite's writer lock without waiting, validates the
 schema, recounts the rows, and deletes them in one transaction. The completion
@@ -132,7 +135,7 @@ size, or writer-lock checks.
 | --- | --- |
 | All `sources` rows | Provider-owned logs and roots |
 | Cascaded `sessions` rows | `config.toml` |
-| Cascaded `transcript_items` rows | Agentlog data directory |
+| Cascaded `transcript_items` rows | Taiwalog data directory |
 |  | SQLite files and schema |
 
 Purge refuses an external, unknown-version, lookalike, symlinked, or otherwise

@@ -157,7 +157,7 @@ impl OpenCodeProvider {
     }
 }
 
-/// Agentlog projection of OpenCode-native sources.
+/// Taiwalog projection of OpenCode-native sources.
 #[derive(Clone, Debug)]
 pub struct OpenCodeScanner {
     provider: OpenCodeProvider,
@@ -257,7 +257,7 @@ impl PartialReason {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog cannot record source outcomes.
+/// Returns an error when Taiwalog cannot record source outcomes.
 pub async fn collect_opencode(
     roots: &[PathBuf],
     catalog: &SqlitePool,

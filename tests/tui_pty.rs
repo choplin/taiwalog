@@ -23,31 +23,31 @@ const PREVIEW_MARKER: &[u8] = b"PgUp/PgDn";
 const REFINE_MARKER: &[u8] = b"Refine:";
 const HELP_MARKER: &[u8] = b"Help";
 const DIAGNOSTICS_MARKER: &[u8] = b"PgUp";
-const TERMIOS_RESTORED: &[u8] = b"__AGENTLOG_TERMIOS_RESTORED:1__";
-const APP_SUCCEEDED: &[u8] = b"__AGENTLOG_STATUS:0__";
+const TERMIOS_RESTORED: &[u8] = b"__TAIWALOG_TERMIOS_RESTORED:1__";
+const APP_SUCCEEDED: &[u8] = b"__TAIWALOG_STATUS:0__";
 
 const BROWSE_WITH_TERMIOS_CHECK: &str = r#"
 "$1" --home "$2" browse
 status=$?
 termios=$(stty -a | tr ';\n' '  ')
-printf '__AGENTLOG_TERMIOS:%s__\n' "$termios"
+printf '__TAIWALOG_TERMIOS:%s__\n' "$termios"
 case " $termios " in
   *" -icanon "*|*" -echo "*)
-    printf '__AGENTLOG_TERMIOS_RESTORED:0__\n'
+    printf '__TAIWALOG_TERMIOS_RESTORED:0__\n'
     exit 1
     ;;
   *" icanon "*)
     case " $termios " in
-      *" echo "*) printf '__AGENTLOG_TERMIOS_RESTORED:1__\n' ;;
-      *) printf '__AGENTLOG_TERMIOS_RESTORED:0__\n'; exit 1 ;;
+      *" echo "*) printf '__TAIWALOG_TERMIOS_RESTORED:1__\n' ;;
+      *) printf '__TAIWALOG_TERMIOS_RESTORED:0__\n'; exit 1 ;;
     esac
     ;;
   *)
-    printf '__AGENTLOG_TERMIOS_RESTORED:0__\n'
+    printf '__TAIWALOG_TERMIOS_RESTORED:0__\n'
     exit 1
     ;;
 esac
-printf '__AGENTLOG_STATUS:%s__\n' "$status"
+printf '__TAIWALOG_STATUS:%s__\n' "$status"
 exit "$status"
 "#;
 
@@ -161,7 +161,7 @@ impl RunningBrowse {
             (LEAVE_ALTERNATE_SCREEN, "leave the alternate screen"),
             (SHOW_CURSOR, "show the cursor"),
             (TERMIOS_RESTORED, "restore canonical mode and echo"),
-            (APP_SUCCEEDED, "report the successful Agentlog exit"),
+            (APP_SUCCEEDED, "report the successful Taiwalog exit"),
         ] {
             assert!(
                 captured
@@ -212,7 +212,7 @@ fn write_provider_fixture(temporary: &TempDir, home: &Path) {
 }
 
 fn seed_catalog(home: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_agentlog"))
+    let output = Command::new(env!("CARGO_BIN_EXE_taiwalog"))
         .arg("--home")
         .arg(home)
         .arg("sync")
@@ -232,8 +232,8 @@ fn start_browse(home: &Path, size: PtySize) -> RunningBrowse {
     command.args([
         "-c",
         BROWSE_WITH_TERMIOS_CHECK,
-        "agentlog-pty-shell",
-        env!("CARGO_BIN_EXE_agentlog"),
+        "taiwalog-pty-shell",
+        env!("CARGO_BIN_EXE_taiwalog"),
         home.to_str().expect("UTF-8 home"),
     ]);
     command.env("TERM", "xterm-256color");
@@ -308,8 +308,8 @@ fn verify_control_c_from(surface: Surface, home: &Path) {
 #[test]
 fn control_c_exits_every_accepted_surface_and_restores_terminal_mode() {
     let temporary = temporary_directory();
-    let home = temporary.path().join("agentlog");
-    fs::create_dir(&home).expect("create Agentlog home");
+    let home = temporary.path().join("taiwalog");
+    fs::create_dir(&home).expect("create Taiwalog home");
     write_provider_fixture(&temporary, &home);
     seed_catalog(&home);
 

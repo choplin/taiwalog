@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use agentlog::full_scan::{Config, render_report, run};
+use taiwalog::full_scan::{Config, render_report, run};
 use clap::Parser;
 
 /// Measure one sequential, read-only pass over the six MVP provider roots.

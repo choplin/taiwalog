@@ -1,4 +1,4 @@
-//! Fresh `SQLite` schema v1 for Agentlog's normalized local catalog.
+//! Fresh `SQLite` schema v1 for Taiwalog's normalized local catalog.
 //!
 //! The schema deliberately has no migration path. It accepts only a new empty
 //! database or an existing v1 database, and refuses every other state without
@@ -35,7 +35,7 @@ const CREATE_SESSIONS_RECENT_INDEX: &str =
 /// compatible and project this exact marker as `missing` at read boundaries.
 const MISSING_SOURCE_DIAGNOSTIC: &str = "source was absent from a completed provider discovery";
 
-/// Agentlog's durable catalog and the use cases that preserve its invariants.
+/// Taiwalog's durable catalog and the use cases that preserve its invariants.
 pub struct Catalog {
     pool: SqlitePool,
 }
@@ -56,7 +56,7 @@ pub enum CatalogScanProgress {
     },
 }
 
-/// Counts retained in an existing, validated Agentlog catalog.
+/// Counts retained in an existing, validated Taiwalog catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogCounts {
     pub sources: u64,
@@ -79,7 +79,7 @@ pub(crate) struct CatalogFileState {
     pub modified: SystemTime,
 }
 
-/// Operating-system identity for the exact regular file inspected by Agentlog.
+/// Operating-system identity for the exact regular file inspected by Taiwalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogFileIdentity {
     #[cfg(unix)]
@@ -140,7 +140,7 @@ struct SchemaObject {
 }
 
 impl Catalog {
-    /// Opens the Agentlog-owned catalog.
+    /// Opens the Taiwalog-owned catalog.
     ///
     /// # Errors
     ///
@@ -370,7 +370,7 @@ pub struct SourceIdentity {
     pub canonical_locator: String,
 }
 
-/// A normalized transcript entry that is safe to persist in Agentlog.
+/// A normalized transcript entry that is safe to persist in Taiwalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogItem {
     UserText(String),
@@ -461,7 +461,7 @@ pub enum CatalogItemView {
     },
 }
 
-/// Opens an Agentlog-owned database and ensures fresh schema v1 exists.
+/// Opens a Taiwalog-owned database and ensures fresh schema v1 exists.
 ///
 /// The rebuildable catalog uses WAL with `synchronous=NORMAL`: a sudden power
 /// loss can lose recent derived catalog updates, but does not corrupt the
@@ -499,7 +499,7 @@ pub async fn open_database(path: &Path) -> Result<SqlitePool, StorageError> {
 /// # Errors
 ///
 /// Returns an error when the database cannot be opened, does not contain the
-/// current Agentlog schema, or its counts cannot be represented.
+/// current Taiwalog schema, or its counts cannot be represented.
 pub(crate) async fn inspect_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
@@ -647,7 +647,7 @@ fn verify_catalog_file_identity(
 /// # Errors
 ///
 /// Returns an error when another writer is active, the database is not the
-/// exact Agentlog v1 schema, or the transaction cannot be committed.
+/// exact Taiwalog v1 schema, or the transaction cannot be committed.
 pub(crate) async fn purge_existing_catalog(
     path: &Path,
     expected_identity: CatalogFileIdentity,
@@ -749,7 +749,7 @@ fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 /// # Errors
 ///
 /// Returns an error when the schema version is unsupported, a nonempty database
-/// has no Agentlog version, or required v1 tables are missing.
+/// has no Taiwalog version, or required v1 tables are missing.
 pub async fn ensure_schema(pool: &SqlitePool) -> Result<(), StorageError> {
     let version = scalar_i64(pool, "PRAGMA user_version").await?;
 
@@ -1487,30 +1487,30 @@ async fn create_v1_schema(pool: &SqlitePool) -> Result<(), StorageError> {
     transaction.commit().await.map_err(StorageError::Query)
 }
 
-/// Failures while opening or validating Agentlog's `SQLite` catalog.
+/// Failures while opening or validating Taiwalog's `SQLite` catalog.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("cannot open Agentlog SQLite database: {0}")]
+    #[error("cannot open Taiwalog SQLite database: {0}")]
     Connect(sqlx::Error),
     #[error("SQLite operation failed: {0}")]
     Query(sqlx::Error),
-    #[error("database has tables but no Agentlog schema version; refusing to modify it")]
+    #[error("database has tables but no Taiwalog schema version; refusing to modify it")]
     UnversionedDatabase,
-    #[error("unsupported Agentlog schema version {found}; refusing to modify it")]
+    #[error("unsupported Taiwalog schema version {found}; refusing to modify it")]
     UnsupportedSchemaVersion { found: i64 },
-    #[error("database does not match the complete Agentlog schema v1 fingerprint")]
+    #[error("database does not match the complete Taiwalog schema v1 fingerprint")]
     SchemaFingerprintMismatch,
-    #[error("cannot inspect Agentlog catalog path {path}: {source}")]
+    #[error("cannot inspect Taiwalog catalog path {path}: {source}")]
     CatalogPathIo {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("refusing to purge; Agentlog catalog path {path} {reason}")]
+    #[error("refusing to purge; Taiwalog catalog path {path} {reason}")]
     UnsafeCatalogPath { path: PathBuf, reason: &'static str },
-    #[error("Agentlog catalog file identity changed while opening {path}; refusing to purge")]
+    #[error("Taiwalog catalog file identity changed while opening {path}; refusing to purge")]
     CatalogFileIdentityChanged { path: PathBuf },
-    #[error("Agentlog catalog file-set size exceeds the supported range at {path}")]
+    #[error("Taiwalog catalog file-set size exceeds the supported range at {path}")]
     CatalogFileSetSizeOverflow { path: PathBuf },
     #[error("catalog transcript ordinal exceeds SQLite integer range")]
     OrdinalOverflow,
@@ -1668,7 +1668,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_database_creates_only_v1_catalog_tables() {
         let temporary = temporary_directory();
-        let database = open_temporary_database(&temporary, "agentlog.sqlite3").await;
+        let database = open_temporary_database(&temporary, "taiwalog.sqlite3").await;
 
         let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&database)
@@ -1690,7 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn purge_rejects_a_database_identity_replaced_after_sqlite_open() {
         let temporary = temporary_directory();
-        let database_path = temporary.path().join("agentlog.sqlite3");
+        let database_path = temporary.path().join("taiwalog.sqlite3");
         let original = open_database(&database_path)
             .await
             .expect("open original database");

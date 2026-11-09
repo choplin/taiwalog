@@ -92,7 +92,7 @@ impl CursorProvider {
     }
 }
 
-/// Agentlog projection of Cursor-native sources.
+/// Taiwalog projection of Cursor-native sources.
 #[derive(Clone, Debug)]
 pub struct CursorScanner {
     provider: CursorProvider,
@@ -171,7 +171,7 @@ impl PartialReason {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog cannot record source outcomes.
+/// Returns an error when Taiwalog cannot record source outcomes.
 pub async fn collect_cursor(
     root: &Path,
     pool: &SqlitePool,

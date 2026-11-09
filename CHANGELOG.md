@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the product, package, command, owned data paths, and distribution
+  artifacts from Agentlog to Taiwalog.
+
 ### Fixed
 
 - Made `purge` preview the catalog promptly, confirm once, and report progress
@@ -24,5 +29,5 @@ This is the first release of the Rust implementation of Agentlog.
 - Installation on ARM64 and x86-64 macOS and Linux through GitHub Releases, the
   `choplin/tap` Homebrew tap, or a Nix flake.
 
-[Unreleased]: https://github.com/choplin/agentlog/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/choplin/taiwalog/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/choplin/agentlog/releases/tag/v0.1.0

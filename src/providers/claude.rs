@@ -111,7 +111,7 @@ impl ClaudeProvider {
     }
 }
 
-/// Agentlog projection of Claude-native sources.
+/// Taiwalog projection of Claude-native sources.
 #[derive(Clone, Debug)]
 pub struct ClaudeScanner {
     provider: ClaudeProvider,
@@ -231,7 +231,7 @@ impl PartialReason {
 /// # Errors
 ///
 /// Returns an error when source discovery cannot inspect the configured root
-/// or Agentlog cannot record a source result.
+/// or Taiwalog cannot record a source result.
 pub async fn collect_claude(
     root: &Path,
     pool: &SqlitePool,

@@ -1,6 +1,6 @@
-//! Local catalog and read-only provider synchronization for Agentlog.
+//! Local catalog and read-only provider synchronization for Taiwalog.
 //!
-//! This package owns Agentlog's configuration and `SQLite` catalog. It reads
+//! This package owns Taiwalog's configuration and `SQLite` catalog. It reads
 //! Codex, Claude Code, `OpenCode`, Gemini CLI, Cursor, and Kimi Code histories
 //! without writing to provider-owned paths.
 

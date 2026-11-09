@@ -1554,7 +1554,7 @@ mod tests {
 
     fn test_tempdir() -> TempDir {
         tempfile::Builder::new()
-            .prefix("agentlog-m0-test-")
+            .prefix("taiwalog-m0-test-")
             .tempdir_in(env::current_dir().expect("test current directory"))
             .expect("temporary fixture directory")
     }

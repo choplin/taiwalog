@@ -1,4 +1,4 @@
-//! Read-only Codex history collection for the first Agentlog provider slice.
+//! Read-only Codex history collection for the first Taiwalog provider slice.
 //!
 //! This module deliberately recognizes only the current session JSONL shape and
 //! Codex's legacy `history.jsonl`. It reads provider-owned files without
@@ -106,7 +106,7 @@ impl CodexProvider {
     }
 }
 
-/// Agentlog projection of Codex-native sources.
+/// Taiwalog projection of Codex-native sources.
 #[derive(Clone, Debug)]
 pub struct CodexScanner {
     provider: CodexProvider,
@@ -228,12 +228,12 @@ fn note_partial(reason: &mut Option<PartialReason>, new_reason: PartialReason) {
 /// Discovers and imports the current Codex session logs and legacy history.
 ///
 /// An individual source failure is diagnosed in the catalog and does not stop
-/// the remaining source files. Only Agentlog's `SQLite` catalog is modified.
+/// the remaining source files. Only Taiwalog's `SQLite` catalog is modified.
 ///
 /// # Errors
 ///
 /// Returns an error when discovery itself cannot inspect the configured root or
-/// when Agentlog cannot persist a source result.
+/// when Taiwalog cannot persist a source result.
 pub async fn collect_codex(
     root: &Path,
     pool: &SqlitePool,

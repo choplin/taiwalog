@@ -128,7 +128,7 @@ impl SyncLoader {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (progress_sender, progress_receiver) = mpsc::sync_channel(64);
         let spawned = thread::Builder::new()
-            .name("agentlog-sync".to_owned())
+            .name("taiwalog-sync".to_owned())
             .spawn(move || {
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -2080,7 +2080,7 @@ fn acquire_terminal_session_lock() -> anyhow::Result<MutexGuard<'static, ()>> {
     match TERMINAL_SESSION_LOCK.try_lock() {
         Ok(lock) => Ok(lock),
         Err(TryLockError::WouldBlock) => Err(anyhow::anyhow!(
-            "an Agentlog interactive terminal session is already active"
+            "a Taiwalog interactive terminal session is already active"
         )),
         Err(TryLockError::Poisoned(error)) => Ok(error.into_inner()),
     }
@@ -2159,7 +2159,7 @@ impl Drop for PanicHookRestorer {
         if thread::panicking() {
             let previous = Arc::clone(&self.previous);
             if let Ok(handle) = thread::Builder::new()
-                .name("agentlog-panic-hook-restore".to_owned())
+                .name("taiwalog-panic-hook-restore".to_owned())
                 .spawn(move || restore_panic_hook(&previous))
             {
                 match handle.join() {
@@ -2396,7 +2396,7 @@ mod tests {
             BrowseEffect::Sync
         ));
         let temporary = tempfile::TempDir::new().expect("temporary directory");
-        let paths = AppPaths::resolve(Some(temporary.path().join("agentlog"))).expect("paths");
+        let paths = AppPaths::resolve(Some(temporary.path().join("taiwalog"))).expect("paths");
         assert!(
             !loader.request(&paths, &mut state),
             "a repeated request must not start a second sync"

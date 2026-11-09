@@ -101,7 +101,7 @@ impl GeminiProvider {
     }
 }
 
-/// Agentlog projection of Gemini-native sources.
+/// Taiwalog projection of Gemini-native sources.
 #[derive(Clone, Debug)]
 pub struct GeminiScanner {
     provider: GeminiProvider,
@@ -183,7 +183,7 @@ impl PartialReason {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog cannot record source outcomes.
+/// Returns an error when Taiwalog cannot record source outcomes.
 pub async fn collect_gemini(
     root: &Path,
     pool: &SqlitePool,

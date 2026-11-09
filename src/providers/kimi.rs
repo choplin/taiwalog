@@ -101,7 +101,7 @@ impl KimiProvider {
     }
 }
 
-/// Agentlog projection of Kimi-native sources.
+/// Taiwalog projection of Kimi-native sources.
 #[derive(Clone, Debug)]
 pub struct KimiScanner {
     provider: KimiProvider,
@@ -211,7 +211,7 @@ impl PartialReason {
 ///
 /// # Errors
 ///
-/// Returns an error when Agentlog cannot record source outcomes.
+/// Returns an error when Taiwalog cannot record source outcomes.
 pub async fn collect_kimi(root: &Path, pool: &SqlitePool) -> Result<KimiScanReport, StorageError> {
     let scanner = KimiScanner::new(KimiProvider::at_root(root.to_path_buf()));
     let report = scan_provider_with_pool(pool, &scanner).await?;

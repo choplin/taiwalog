@@ -1,10 +1,10 @@
 [package]
-name = "agentlog"
+name = "taiwalog"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
-description = "M0 read-only full-scan feasibility harness for Agentlog"
+description = "M0 read-only full-scan feasibility harness for Taiwalog"
 
 [[bin]]
 name = "full-scan-feasibility"

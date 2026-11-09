@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agentlog"
+name = "taiwalog"
 version = "0.0.0"
 dependencies = [
  "clap",
@@ -1305,3 +1305,15 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "urushi"
+version = "0.1.1"
+
+[[patch.unused]]
+name = "urushi-prompt"
+version = "0.1.1"
+
+[[patch.unused]]
+name = "urushi-tui"
+version = "0.1.1"

@@ -1,4 +1,4 @@
-//! Shared application theme for every human-facing Agentlog surface.
+//! Shared application theme for every human-facing Taiwalog surface.
 
 use urushi::{Color, ColorScheme, SemanticTokens, Theme, ThemeSet};
 

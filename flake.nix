@@ -1,5 +1,5 @@
 {
-  description = "Agentlog — local browser for AI coding-agent session history";
+  description = "Taiwalog — local browser for AI coding-agent session history";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0";
@@ -56,8 +56,8 @@
             "rustfmt"
           ];
           packagePkgs = if pkgs.stdenv.hostPlatform.isLinux then pkgs.pkgsStatic else pkgs;
-          agentlog = packagePkgs.rustPlatform.buildRustPackage {
-            pname = "agentlog";
+          taiwalog = packagePkgs.rustPlatform.buildRustPackage {
+            pname = "taiwalog";
             version = "0.1.0";
             src = ./.;
 
@@ -66,9 +66,9 @@
 
             meta = {
               description = "A local browser for AI coding-agent session history";
-              homepage = "https://github.com/choplin/agentlog";
+              homepage = "https://github.com/choplin/taiwalog";
               license = pkgs.lib.licenses.mit;
-              mainProgram = "agentlog";
+              mainProgram = "taiwalog";
               platforms = supportedSystems;
             };
           };
@@ -88,17 +88,17 @@
           };
 
           packages = {
-            inherit agentlog;
-            default = agentlog;
+            inherit taiwalog;
+            default = taiwalog;
           };
 
           apps.default = {
             type = "app";
-            program = "${agentlog}/bin/agentlog";
+            program = "${taiwalog}/bin/taiwalog";
             meta.description = "Browse local AI coding-agent session history";
           };
 
-          checks.agentlog = agentlog;
+          checks.taiwalog = taiwalog;
         };
     };
 }
